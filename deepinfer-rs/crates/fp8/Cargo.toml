@@ -1,0 +1,13 @@
+[package]
+name = "deepinfer-fp8"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FP8/FP4 quantization recipes for DeepInfer-rs: DeepGEMM activation (1x128 UE8M0) and weight (128x128) casting, SM100 packed scales, and FlashMLA V4.1 KV-cache row formats"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }

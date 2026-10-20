@@ -1,0 +1,13 @@
+[package]
+name = "deepinfer-sampler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic, batch-invariant token sampling for DeepInfer-rs (temperature/top-k/top-p/min-p pipeline with per-sequence Philox streams)"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }

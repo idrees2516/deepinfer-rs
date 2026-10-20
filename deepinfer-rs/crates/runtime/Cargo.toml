@@ -1,0 +1,25 @@
+[package]
+name = "deepinfer-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "deepinfer-runtime (implementation pending)"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }
+deepinfer-fp8 = { workspace = true }
+deepinfer-gemm = { workspace = true }
+deepinfer-mla = { workspace = true }
+deepinfer-dsa = { workspace = true }
+deepinfer-swa = { workspace = true }
+deepinfer-moe = { workspace = true }
+deepinfer-eplb = { workspace = true }
+deepinfer-ep = { workspace = true }
+deepinfer-mtp = { workspace = true }
+deepinfer-sampler = { workspace = true }
+deepinfer-grammar = { workspace = true }
+deepinfer-scheduler = { workspace = true }

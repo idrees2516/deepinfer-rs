@@ -1,0 +1,14 @@
+[package]
+name = "deepinfer-mtp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "DSpark speculative decoding for DeepInfer-rs: V3-paper MTP (NEXTN) draft module, confidence-scheduled verification and backtracking"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }
+deepinfer-sampler = { workspace = true }

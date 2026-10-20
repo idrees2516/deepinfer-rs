@@ -1,0 +1,15 @@
+[package]
+name = "deepinfer-mla"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FlashMLA-equivalent Multi-head Latent Attention (absorbed MQA, paged KV cache, sparse decode/prefill) for DeepSeek-V4.1"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }
+deepinfer-fp8 = { workspace = true }
+deepinfer-gemm = { workspace = true }
