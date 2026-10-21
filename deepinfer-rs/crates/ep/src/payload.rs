@@ -154,7 +154,7 @@ mod tests {
         // Malformed payloads are rejected, never panic.
         let mut bad = p.clone();
         if let DispatchPayload::Fp8 { sf, .. } = &mut bad {
-            sf.truncate(0);
+            sf.clear();
         }
         assert!(decode_payload(&bad, &c).is_err());
         let bad = DispatchPayload::Fp8 {

@@ -98,7 +98,7 @@ impl LightningIndexerWeights {
 /// features. The SPEC-mandated [`LightningIndexerWeights`] struct has no such
 /// field, so this port derives a deterministic per-dim gain from the key
 /// projection rows — the very features the conv branch normalizes.
-pub(crate) fn conv_norm_gain_from_wk(wk: &[f32], index_dim: usize, hidden: usize) -> Vec<f32> {
+pub fn conv_norm_gain_from_wk(wk: &[f32], index_dim: usize, hidden: usize) -> Vec<f32> {
     debug_assert_eq!(wk.len(), index_dim * hidden);
     let mut gain = vec![0.0f32; index_dim];
     for r in 0..index_dim {

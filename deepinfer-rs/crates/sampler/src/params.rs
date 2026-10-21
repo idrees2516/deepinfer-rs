@@ -119,7 +119,7 @@ impl SamplingParams {
         );
         let m = self.min_p;
         ensure!(
-            m.is_finite() && m >= 0.0 && m <= 1.0,
+            m.is_finite() && (0.0..=1.0).contains(&m),
             OutOfRange,
             "validate: min_p must lie in [0, 1] (got {m})"
         );

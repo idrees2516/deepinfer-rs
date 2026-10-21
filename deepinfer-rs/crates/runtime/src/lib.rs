@@ -20,11 +20,13 @@
 #![warn(missing_docs)]
 
 pub mod config;
+pub mod device_model;
 pub mod generate;
 pub mod loader;
 pub mod model;
 pub mod weights;
 
 pub use config::ModelConfig;
+pub use device_model::{DeviceModel, Precision, DEVICE_MAX_PREFILL_TOKENS, MOE_CHUNK_TOKENS};
 pub use generate::{generate, GenerateOutput, GenerateRequest};
 pub use model::DeepSeekModel;

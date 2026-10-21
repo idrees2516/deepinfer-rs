@@ -68,7 +68,7 @@ fn cls_hex() -> ClassSet {
 
 fn cls_ws() -> ClassSet {
     let mut c = ClassSet::empty();
-    for byte in [b' ', b'\t', b'\n', b'\r'] {
+    for byte in *b" \t\n\r" {
         c.add(byte);
     }
     c
@@ -167,7 +167,7 @@ fn unicode_escape_ast() -> Ast {
     second_07.add_range(b'0', b'7');
     let single = alt(vec![
         seq(vec![class(not_d), hex.clone(), hex.clone()]),
-        seq(vec![class(d.clone()), class(second_07), hex.clone(), hex.clone()]),
+        seq(vec![class(d), class(second_07), hex.clone(), hex.clone()]),
     ]);
     // Surrogate pair: \uD8..DB.. \uDC..DF..
     let mut second_hi = ClassSet::empty();
@@ -331,7 +331,7 @@ fn same_len_range(lo: &[u8], hi: &[u8]) -> Ast {
         // Digit strictly between lo[j] and hi[j]: rest free.
         let tail = (l - j - 1) as u32;
         let mut mid = ClassSet::empty();
-        if lo[j] + 1 <= hi[j] - 1 {
+        if lo[j] < hi[j] - 1 {
             mid.add_range(lo[j] + 1, hi[j] - 1);
         }
         if !mid.is_empty() {

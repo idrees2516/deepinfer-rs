@@ -60,7 +60,7 @@ pub use conv::conv_scores;
 pub use gate::gate_and_combine;
 pub use select::{mscale, select_top_k};
 pub use thunder::thunder_scores;
-pub use weights::LightningIndexerWeights;
+pub use weights::{conv_norm_gain_from_wk, LightningIndexerWeights};
 
 use deepinfer_core::math::dot;
 use deepinfer_core::{ensure, Error, Result};

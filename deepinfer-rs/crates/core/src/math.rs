@@ -20,11 +20,7 @@ pub fn softmax_inplace(x: &mut [f32]) {
             return;
         }
         for v in x.iter_mut() {
-            if v.is_finite() {
-                *v = 0.0;
-            } else {
-                *v = 0.0;
-            }
+            *v = 0.0;
         }
         return;
     }
@@ -117,7 +113,7 @@ pub fn top_k_desc(x: &[f32], k: usize) -> TopK {
 /// `u * total` is chosen. Zero-mass prefixes are skipped exactly.
 pub fn sample_categorical(probs: &[f32], u: f32) -> Option<usize> {
     let total: f32 = probs.iter().sum();
-    if !(total > 0.0) || !u.is_finite() || !(0.0..1.0).contains(&u) {
+    if total.is_nan() || total <= 0.0 || !u.is_finite() || !(0.0..1.0).contains(&u) {
         return None;
     }
     let target = u * total;

@@ -105,3 +105,13 @@ MoE, FlashMLA decode split-KV with FP8/FP4 KV caches, DSA lightning indexer
 Numerics are golden-tested against the CPU crates on-device. Targets:
 sm_100 (B200), sm_103 (B300), gfx942/gfx950 (Instinct). Details, safety
 model and upgrade paths: [docs/GPU.md](docs/GPU.md).
+
+### GPU execution (deepinfer-gpu / deepinfer-kernels / DeviceModel)
+
+`deepinfer-runtime::DeviceModel` runs the full V4.1-Flash forward pass on
+CUDA (GB200 NVL72 `sm_100`, GB300 `sm_103`) or HIP (MI335X-class) with
+runtime-JIT-compiled kernels, per-GEMM F32/FP8/BF16 precision, FP8/FP4 KV
+caches (including the dedicated FP4 decode kernel), CUDA-graph decode
+capture/replay, and single-process NVLink peer collectives for expert
+parallelism. Binaries build and test on GPU-less machines (device tests
+auto-skip). See `docs/GPU.md` for the architecture and operator inventory.

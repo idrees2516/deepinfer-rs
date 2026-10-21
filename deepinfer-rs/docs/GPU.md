@@ -20,11 +20,15 @@ automatically falls back to `compute_XXX` PTX and lets the driver JIT it.
 ## Architecture
 
 ```
-deepinfer-runtime (model loop, scheduler, sampling)      [host, unchanged]
+deepinfer-runtime  (DeepSeekModel = CPU golden · DeviceModel = GPU forward,
+                    decode graphs, sampling, scheduler)        [host]
         |
-deepinfer-kernels  (typed launchers + embedded CUDA/HIP C++ sources)
+deepinfer-kernels  (typed launchers + embedded CUDA/HIP C++ sources:
+                    GEMMs, attention, DSA, MoE, the _dev decode family,
+                    peer-collective EP)
         |
-deepinfer-gpu      (dlopen + CUDA driver / HIP + NVRTC / hipRTC + JIT cache)
+deepinfer-gpu      (dlopen + CUDA driver / HIP + NVRTC / hipRTC + JIT cache
+                    + events + stream-capture graphs + peer access)
         |
 libcuda.so.1 / libnvrtc.so  ·  libamdhip64.so / libhiprtc.so   [runtime only]
 ```
@@ -74,6 +78,15 @@ Rust port, and the `kern` runtime, which all use the same model):
 | MoE routing (sigmoid + noaux-tc) | `di_moe_route_kernel` | `deepinfer-moe::route_batch` (exact idx match) |
 | MoE dispatch/combine (aligned segments) | `di_moe_count/prefix/scatter/combine_kernel` | `deepinfer-ep` layout contract |
 | Peer copy / multi-GPU | `Device::enable_peer_access`, `memcpy_peer_async` | NVL72 / Infinity Fabric EP primitives |
+| F32 reference NT GEMM | `di_gemm_f32_nt_kernel` (scalar core, both vendors) | `deepinfer-gemm::f32_gemm_nt` association order |
+| Masked grouped GEMM (graph MoE / low-latency EP) | `di_gemm_grouped_masked_nt_kernel` (f32/bf16/fp8, `masked_m` on device) | DeepGEMM `m_grouped_nt_masked` semantics |
+| **Dedicated FP4-cache decode** | `di_mla_decode_fp4_partial_kernel` (scale-decode per 16-dim group, unrolled nibble unpack, ILP=2 — bit-identical to the generic fmt-2 path) | `flash_mla_decode` over an FP4 cache |
+| Device-scalar dense prefill | `di_mla_prefill_dense_dev_kernel` (q_offset / nkeys from device memory) | moving cross-attention windows in graphs |
+| Sliding-window attention (D = hidden) | `di_swa_attention_dev_kernel` (CTA-per-query, shared-memory accumulator) | `deepinfer_swa::swa_attention` |
+| Ring / window gather | `di_gather_rows_kernel` (wrap-aware, device-read start/count) | cross-attn window staging in graphs |
+| Graph-replayable decode family | `di_step_params`, `di_pos_fill`, `di_kv_encode_*_dev`, `di_append_*`, `di_lightning_*_dev`, `di_thunder_logits_dev`, `di_dot_scores_dev`, `di_gate_blend_dev`, `di_causal_window_clip_dev`, `di_block_preselect_dev`, `di_conv_*_dev` | the CPU crates' semantics with every varying scalar device-resident |
+| Masked MoE dispatch / combine | `di_moe_scatter_masked_kernel`, `di_silu_mul_masked_kernel` (fused gate/up layout) | DeepEP low-latency capacity semantics |
+| Indexed row gather | `di_gather_rows_indexed_kernel` | embedding lookup, EP send packing |
 
 ## Precision and determinism policy
 
@@ -141,35 +154,97 @@ cut below is isolated in one place and has a concrete upgrade:
    MQA-logits (split-KV, online rescale, deterministic merges) without
    claiming FlashMLA's occupancy tuning. TMA/tcgen05-style SMEM pipelines
    are the follow-up.
-4. **NVLink / Infinity Fabric EP** exposes P2P copy primitives
-   (`enable_peer_access`, `memcpy_peer_async`). Production NVL72 serving
-   would layer NVSHMEM-style symmetric buffers (DeepEP / DeepGEMM Mega-MoE
-   style) on top; the Rust primitives here are the substrate.
+4. **NVLink / Infinity Fabric EP** ships the single-process peer
+   collectives (see "NVLink peer collectives for EP" above): send plans,
+   packed peer copies with event-mesh ordering, and combine-back through
+   the standard kernel. The remaining upgrade is NVSHMEM-style symmetric
+   buffers with sender-side writes directly into the aligned layout
+   (DeepEP / DeepGEMM Mega-MoE style), which removes the receive-side
+   repack and the per-step `topk_idx` read-back.
 
-## Model-loop integration blueprint (next mechanical step)
+## The DeviceModel (runtime integration — implemented)
 
-The operator set above is complete for the V4.1-Flash forward pass. Wiring
-it into `deepinfer-runtime` as a `DeviceModel` is mechanical:
+`deepinfer-runtime::DeviceModel` wires the operator layer above into the
+model loop per the original blueprint, plus the three tracked follow-ups:
 
-1. Load weights (safetensors, unchanged), quantize on host with
-   `deepinfer-fp8` (weights 128x128, per-layer), upload bytes + scales.
-2. Per decode step, per layer (all on-device, one stream):
-   `rmsnorm` -> `quant_per_token_group` -> `gemm_fp8_nt` (q_a|kv_a fused
-   rows) -> `rmsnorm` (q slice) -> `gemm_fp8_nt` (q_b) -> `rope` (q/k
-   slices, host cos/sin table uploaded once) -> `kv_encode_*` append ->
-   DSA layers: `gemm_fp8_nt` (indexer wq/wk) ->
-   `indexer_rmsnorm_per_head` -> `lightning_quant` -> `thunder_logits` ->
-   `conv_feat` (new rows only) -> `conv_gated_norm` -> `dot_scores` ->
-   `qmean`/`gate_logits`/`gate_blend` -> `causal_clip` -> `select_top_k` ->
-   `mla_decode_partial` + `mla_decode_combine` -> `rope` (conjugate) ->
-   `gemm_fp8_nt` (wv|wo) -> `add` -> `rmsnorm` -> `gemm_bf16_nt` (router)
-   -> `moe_route` -> `moe_dispatch` -> `gemm_fp8_grouped_nt` (gate_up) ->
-   `silu_mul` -> `gemm_fp8_grouped_nt` (down) -> `moe_combine` -> `add`.
-3. Head GEMM + D2H of the final logits row; sampling stays on host
-   (`deepinfer-sampler` is latency-trivial and batch-invariant by design).
-4. Multi-GPU: expert-parallel placement with `deepinfer-eplb` maps,
-   `memcpy_peer_async` for dispatch/combine (single-process simulation
-   first, matching the CPU EP crate's model).
+1. **Weights**: loaded once (safetensors, unchanged loader), quantized on
+   the host with `deepinfer-fp8` (weights 128x128, per expert for grouped
+   matrices) and uploaded. [`Precision::F32`] keeps every GEMM in f32 (the
+   CPU-golden test mode); [`Precision::Auto`] selects FP8 whenever
+   `k % 128 == 0` (all GEMMs at V4.1 dims) and BF16 otherwise. The
+   `q_a|kv_a` projection is fused into one GEMM (rows `[q_lora | kv_a]`).
+2. **Caches**: per self-decoder layer, flat append-only arenas — MLA KV
+   rows in the config's cache format (f32 / 528 B FP8 / 288 B FP4), the
+   DSA indexer's raw k rows (conv branch), the per-head-normed k rows with
+   their block-quantized FP8 copy (thunder branch, quantized incrementally
+   as blocks complete), and the cascade conv features. The arenas hold one
+   max-length sequence — the same total budget as the CPU paged caches —
+   so the device model serves one sequence at a time (`reset()` between
+   sequences; a paged device cache is the multi-sequence upgrade).
+   Rollback is exact: rows are position-keyed, so truncating the logical
+   length leaves surviving rows intact and re-appended rows overwrite
+   their slots (bit-identical to never having appended — tested).
+3. **Prefill** (multi-token, eager kernels): rmsnorm -> fused q_a|kv_a ->
+   latent norm -> RoPE -> cache encode -> DSA (projections from the raw
+   residual, per-head norm, lightning quant, thunder + conv + gating +
+   selection) -> sparse MLA prefill -> O-RoPE -> wv/wo -> MoE
+   (aligned-contiguous dispatch, `MOE_CHUNK_TOKENS`-chunked, shared
+   experts dense) -> residual. Cross layers add the SWA ring (device
+   rings, wrapped appends) and dense cross-attention over the last self
+   layer's KV window.
+4. **Decode** (the uniform `_dev` path): one host upload per step
+   (the embedded row + a `{pos, start}` i32 pair); everything else is
+   kernel launches reading the device-resident parameter block — so the
+   identical function serves eager execution and graph capture.
+5. **Sampling** stays host-side (`deepinfer-sampler`); `generate()` is a
+   thin prefill/decode loop. MTP drafting stays host-side; verification
+   re-enters through the multi-token prefill path.
+
+## CUDA-graph decode capture (implemented)
+
+`DeviceModel::enable_decode_graph(true)` captures the whole decode step
+into a CUDA/HIP graph on the first decode of a sequence and replays it
+for every subsequent token — one launch instead of hundreds. The design
+rule that makes this work: **no scalar that changes between steps may be
+a kernel argument**. The `decode.cu` family reads the sequence length,
+cache write rows, quant-block completion, attention window starts and
+ring slots from a device parameter cell that `di_step_params_kernel`
+fans out from the single host-written `{pos, start}` pair; all launch
+grids derive from fixed maxima. The MoE runs the masked capacity layout
+(`masked_m` on device, capacity 1 per expert — a token's top-k experts
+are distinct, so nothing drops), which needs no host readback. Graphs are
+per-sequence (cache-window pointers are baked at capture) and survive
+rollback (the graph re-reads the position cell every replay). Replay is
+**bit-identical** to the eager launches — same kernels, same grids, same
+device cells — and the test suite asserts exactly that. The substrate
+lives in `deepinfer-gpu::sync` (`CaptureGuard` / `GraphExec`, RELAXED
+capture mode, `cuGraphInstantiateWithFlags` / `hipGraphInstantiateWithFlags`,
+optionally resolved so older drivers still load).
+
+## NVLink peer collectives for EP (implemented)
+
+`deepinfer-kernels::peer` provides the single-process multi-GPU expert
+parallelism layer for the NVL72 / Infinity Fabric domain:
+
+* `PeerMesh::new` enables all-pairs peer access and owns one EP stream +
+  barrier event per rank;
+* `build_send_plan` (pure, host-side, unit-tested) computes each rank's
+  sends in the DeepEP-documented `(destination, token asc, k asc)` order
+  with block-contiguous expert ownership `owner(e) = e * world / E`;
+* senders pack per-destination buffers with the indexed row gather
+  (device-resident index lists);
+* `all_to_all_dispatch_fp8` moves the FP8 payloads + scales with one
+  contiguous peer copy per (destination, sender) pair, ordered by the
+  event mesh and closed by a full barrier;
+* `all_to_all_combine_f32` reverses it, feeding the standard
+  `moe_combine` (fixed k-ascending accumulation).
+
+The receive side keeps the deterministic `(sender, token, k)` row order
+with per-row expert metadata; NVSHMEM-style symmetric buffers with
+sender-side writes directly into the aligned layout remain the documented
+upgrade (the upgrade table below tracks it).
+
+## Running on hardware
 
 ## Running on hardware
 

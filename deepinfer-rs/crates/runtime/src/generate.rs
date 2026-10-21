@@ -4,7 +4,7 @@
 //! Mirrors the offline-inference entry point of DeepSeek's DeepInfer
 //! release (upstream `examples/offline_inference.py`; README: "DSpark MTP
 //! + confidence-scheduled verification", "deterministic sampling",
-//! "batch-invariant inference", "structured outputs").
+//!   "batch-invariant inference", "structured outputs").
 //!
 //! Layering note: this path is deliberately **simple and sequential** —
 //! one request at a time, each on a freshly reset cache, in arrival

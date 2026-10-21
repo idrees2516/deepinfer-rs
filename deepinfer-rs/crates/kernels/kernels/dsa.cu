@@ -358,3 +358,19 @@ di_lightning_finalize_kernel(const u32* __restrict__ sf_bits, u8* __restrict__ s
     float ratio = amax / 448.0f;
     sf[b] = (ratio > 0.0f) ? di_f32_to_e8m0_ceil(ratio) : (u8)0x00;
 }
+
+// Causal + extrapolation-window clip (baked sizes — the prefill twin of
+// the _dev variant): scores[i][j] = -inf for j > i, j >= s_kv, or
+// (window > 0 and j < i + 1 - window).
+extern "C" __global__ void __launch_bounds__(256)
+di_causal_window_clip_kernel(float* __restrict__ scores,
+                             int s_q, int s_kv, int window) {
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < s_q * s_kv;
+         idx += gridDim.x * blockDim.x) {
+        int i = idx / s_kv;
+        int j = idx - i * s_kv;
+        if (j > i || (window > 0 && j < i + 1 - window)) {
+            scores[idx] = -INFINITY;
+        }
+    }
+}

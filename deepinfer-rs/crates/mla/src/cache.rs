@@ -380,9 +380,9 @@ mod tests {
     #[test]
     fn row_width_and_format_validation() {
         let mut cache = MlaPagedCache::new(CacheFormat::Bf16, 64, 4);
-        cache.append(0, &vec![0.1; 32]).unwrap();
+        cache.append(0, &[0.1; 32]).unwrap();
         assert!(matches!(
-            cache.append(0, &vec![0.1; 33]).unwrap_err(),
+            cache.append(0, &[0.1; 33]).unwrap_err(),
             Error::DimensionMismatch(_)
         ));
         assert!(cache.append(0, &[]).is_err());
@@ -394,18 +394,18 @@ mod tests {
         ));
         // FP8 needs width % 32 == 0; FP4 needs % 16 == 0.
         let mut fp8 = MlaPagedCache::new(CacheFormat::Fp8Group32, 64, 4);
-        assert!(fp8.append(0, &vec![0.1; 33]).is_err());
-        fp8.append(0, &vec![0.1; 32]).unwrap();
+        assert!(fp8.append(0, &[0.1; 33]).is_err());
+        fp8.append(0, &[0.1; 32]).unwrap();
         let mut fp4 = MlaPagedCache::new(CacheFormat::Fp4Group16, 64, 4);
-        assert!(fp4.append(0, &vec![0.1; 40]).is_err());
-        fp4.append(0, &vec![0.1; 48]).unwrap();
+        assert!(fp4.append(0, &[0.1; 40]).is_err());
+        fp4.append(0, &[0.1; 48]).unwrap();
     }
 
     #[test]
     fn row_f32_bounds_and_empty_cache() {
         let mut cache = MlaPagedCache::new(CacheFormat::Bf16, 64, 4);
         assert!(cache.row_f32(0).is_err()); // empty cache
-        cache.append(0, &vec![0.25; 16]).unwrap();
+        cache.append(0, &[0.25; 16]).unwrap();
         assert!(cache.row_f32(-1).is_err());
         assert!(cache.row_f32(64).is_err()); // unallocated page
         assert!(cache.row_f32(1).is_err()); // allocated page, unwritten row

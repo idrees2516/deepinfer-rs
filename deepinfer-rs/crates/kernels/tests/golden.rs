@@ -75,11 +75,11 @@ fn golden_rmsnorm() {
         }
     }
     let dx = upload_f32(&k, &x);
-    let dg = upload_f32(&k, &gain);
-    let dOut = k.device().alloc(rows * cols * 4).unwrap();
-    k.rmsnorm(&dx, &dg, &dOut, rows, cols, 1e-4, &s).unwrap();
+    let d_g = upload_f32(&k, &gain);
+    let d_out = k.device().alloc(rows * cols * 4).unwrap();
+    k.rmsnorm(&dx, &d_g, &d_out, rows, cols, 1e-4, &s).unwrap();
     s.synchronize().unwrap();
-    let out = download_f32(&k, &dOut, rows * cols);
+    let out = download_f32(&k, &d_out, rows * cols);
     let e = rel_err(&out, &ref_out);
     assert!(e < 1e-4, "rmsnorm rel err {e}");
 }
@@ -212,11 +212,11 @@ fn golden_kv_encode() {
         let row = quantize_kv_cache_v41_fp8(&x[t * 512..(t + 1) * 512]).unwrap();
         ref8[t * 528..(t + 1) * 528].copy_from_slice(&row);
     }
-    let dOut8 = k.device().alloc(tokens * 528).unwrap();
-    k.kv_encode_fp8(&dx, &dOut8, tokens, 512, &s).unwrap();
+    let d_out8 = k.device().alloc(tokens * 528).unwrap();
+    k.kv_encode_fp8(&dx, &d_out8, tokens, 512, &s).unwrap();
     let mut got8 = vec![0u8; tokens * 528];
     s.synchronize().unwrap();
-    k.device().read(&dOut8, &mut got8).unwrap();
+    k.device().read(&d_out8, &mut got8).unwrap();
     let mut worst = 0.0f32;
     for t in 0..tokens {
         let r = dequantize_kv_cache_v41_fp8(got8[t * 528..(t + 1) * 528].try_into().unwrap());
@@ -230,11 +230,11 @@ fn golden_kv_encode() {
         let row = quantize_kv_cache_v41_fp4(&x[t * 512..(t + 1) * 512]).unwrap();
         ref4[t * 288..(t + 1) * 288].copy_from_slice(&row);
     }
-    let dOut4 = k.device().alloc(tokens * 288).unwrap();
-    k.kv_encode_fp4(&dx, &dOut4, tokens, 512, &s).unwrap();
+    let d_out4 = k.device().alloc(tokens * 288).unwrap();
+    k.kv_encode_fp4(&dx, &d_out4, tokens, 512, &s).unwrap();
     let mut got4 = vec![0u8; tokens * 288];
     s.synchronize().unwrap();
-    k.device().read(&dOut4, &mut got4).unwrap();
+    k.device().read(&d_out4, &mut got4).unwrap();
     let mut worst = 0.0f32;
     for t in 0..tokens {
         let r = dequantize_kv_cache_v41_fp4(got4[t * 288..(t + 1) * 288].try_into().unwrap());
@@ -380,23 +380,23 @@ fn golden_mla_decode_all_formats() {
         let dq = upload_f32(&k, &q);
         let dcache = k.device().alloc_from(&dev_bytes).unwrap();
         let dsink = upload_f32(&k, &sink);
-        let dIdx = k.device().alloc_from(&indices).unwrap();
+        let d_idx = k.device().alloc_from(&indices).unwrap();
         let nq = b * s_q * h;
         let splits_max = 16;
         let dpm = k.device().alloc(nq * splits_max * 4).unwrap();
         let dpl = k.device().alloc(nq * splits_max * 4).unwrap();
         let dpo = k.device().alloc(nq * splits_max * d * 4).unwrap();
-        let dOut = k.device().alloc(q.len() * 4).unwrap();
+        let d_out = k.device().alloc(q.len() * 4).unwrap();
         let dlse = k.device().alloc(b * h * s_q * 4).unwrap();
         let splits = k
             .mla_decode_partial(
-                &dq, &dcache, &dIdx, &dpm, &dpl, &dpo, b, s_q, h, d, topk, sm, fmt, s_kv, &s,
+                &dq, &dcache, &d_idx, &dpm, &dpl, &dpo, b, s_q, h, d, topk, sm, fmt, s_kv, &s,
             )
             .unwrap();
-        k.mla_decode_combine(&dpm, &dpl, &dpo, Some(&dsink), &dOut, &dlse, b, s_q, h, d, splits, &s)
+        k.mla_decode_combine(&dpm, &dpl, &dpo, Some(&dsink), &d_out, &dlse, b, s_q, h, d, splits, &s)
             .unwrap();
         s.synchronize().unwrap();
-        let out = download_f32(&k, &dOut, q.len());
+        let out = download_f32(&k, &d_out, q.len());
         let e = rel_err(&out, &ref_out);
         assert!(e < 5e-3, "decode {fmt:?} rel err {e}");
         let mut lse = vec![0.0f32; b * h * s_q];
@@ -434,15 +434,15 @@ fn golden_moe_route_exact() {
     }
     let dz = upload_f32(&k, &logits);
     let dbias = upload_f32(&k, &w.gate_bias);
-    let dW = k.device().alloc(tokens * 8 * 4).unwrap();
-    let dI = k.device().alloc(tokens * 8 * 4).unwrap();
-    k.moe_route(&dz, Some(&dbias), &dW, &dI, tokens, 256, 8, &s)
+    let d_w = k.device().alloc(tokens * 8 * 4).unwrap();
+    let d_i = k.device().alloc(tokens * 8 * 4).unwrap();
+    k.moe_route(&dz, Some(&dbias), &d_w, &d_i, tokens, 256, 8, &s)
         .unwrap();
     let mut gw = vec![0.0f32; tokens * 8];
     let mut gi = vec![0i32; tokens * 8];
     s.synchronize().unwrap();
-    k.device().read(&dW, &mut gw).unwrap();
-    k.device().read(&dI, &mut gi).unwrap();
+    k.device().read(&d_w, &mut gw).unwrap();
+    k.device().read(&d_i, &mut gi).unwrap();
     for t in 0..tokens {
         for kk in 0..8 {
             assert_eq!(
@@ -474,16 +474,16 @@ fn golden_select_top_k_exact() {
     };
     let ref_sel = select_top_k(&scores, s_q, s_kv, &cfg).unwrap();
     let ds = upload_f32(&k, &scores);
-    let num_blocks = (s_kv + 63) / 64;
+    let num_blocks = s_kv.div_ceil(64);
     let cap = num_blocks * 8;
     let dca = k.device().alloc(s_q * cap * 8).unwrap();
     let dcb = k.device().alloc(s_q * cap * 8).unwrap();
-    let dOut = k.device().alloc(s_q * 512 * 4).unwrap();
-    k.select_top_k(&ds, &dca, &dcb, cap, &dOut, s_q, s_kv, 64, 8, 512, &s)
+    let d_out = k.device().alloc(s_q * 512 * 4).unwrap();
+    k.select_top_k(&ds, &dca, &dcb, cap, &d_out, s_q, s_kv, 64, 8, 512, &s)
         .unwrap();
     let mut got = vec![0i32; s_q * 512];
     s.synchronize().unwrap();
-    k.device().read(&dOut, &mut got).unwrap();
+    k.device().read(&d_out, &mut got).unwrap();
     assert_eq!(got, ref_sel, "top-k selection must match the CPU exactly");
 }
 
@@ -510,8 +510,8 @@ fn golden_moe_dispatch_combine_roundtrip() {
         }
     }
     let dx = upload_f32(&k, &x);
-    let dIdx = k.device().alloc_from(&topk_idx).unwrap();
-    let dW = upload_f32(&k, &topk_w);
+    let d_idx = k.device().alloc_from(&topk_idx).unwrap();
+    let d_w = upload_f32(&k, &topk_w);
     let counts = k.device().alloc(e * 4).unwrap();
     let offsets = k.device().alloc((e + 1) * 4).unwrap();
     let rankc = k.device().alloc(e * 4).unwrap();
@@ -521,7 +521,7 @@ fn golden_moe_dispatch_combine_roundtrip() {
     let cap_rows = tokens * kk + e * 128;
     let perm = k.device().alloc(cap_rows * hidden * 4).unwrap();
     let m_total = k
-        .moe_dispatch(&dx, &dIdx, &counts, &offsets, &rankc, &perm, &map, tokens, hidden, kk, e, 128, &s)
+        .moe_dispatch(&dx, &d_idx, &counts, &offsets, &rankc, &perm, &map, tokens, hidden, kk, e, 128, &s)
         .unwrap();
     // "Expert compute" stand-in: double every permuted row (host round trip
     // keeps the test self-contained).
@@ -531,9 +531,9 @@ fn golden_moe_dispatch_combine_roundtrip() {
     for v in perm_host.iter_mut() {
         *v *= 2.0;
     }
-    let dPermOut = k.device().alloc_from(&perm_host).unwrap();
+    let d_perm_out = k.device().alloc_from(&perm_host).unwrap();
     let dy = k.device().alloc(tokens * hidden * 4).unwrap();
-    k.moe_combine(&dPermOut, &map, &dW, &dy, tokens, hidden, kk, &s)
+    k.moe_combine(&d_perm_out, &map, &d_w, &dy, tokens, hidden, kk, &s)
         .unwrap();
     s.synchronize().unwrap();
     let y = download_f32(&k, &dy, tokens * hidden);

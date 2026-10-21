@@ -778,8 +778,8 @@ mod tests {
         pub fn parse(pat: &str) -> Na {
             let b = pat.as_bytes();
             let mut pos = 0usize;
-            let ast = alt(b, &mut pos);
-            ast
+            
+            alt(b, &mut pos)
         }
 
         fn alt(b: &[u8], pos: &mut usize) -> Na {
@@ -1031,11 +1031,10 @@ mod tests {
                 // allowed; the `k` fuel plus the `done` counter keep the
                 // recursion finite.
                 for split in 0..=s.len() {
-                    if m(inner, &s[..split], k.min(k.saturating_sub(1))) {
-                        if rep_match(inner, lo, hi, &s[split..], done + 1, k) {
+                    if m(inner, &s[..split], k.min(k.saturating_sub(1)))
+                        && rep_match(inner, lo, hi, &s[split..], done + 1, k) {
                             return true;
                         }
-                    }
                 }
                 false
             }

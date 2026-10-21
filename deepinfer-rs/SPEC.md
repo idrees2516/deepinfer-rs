@@ -858,6 +858,8 @@ property tests.
 
 ## deepinfer-runtime  (deps: ALL above; wave 2)
 
+The GPU counterpart `DeviceModel` (see `docs/GPU.md`) mirrors the DeepSeekModel surface on the `deepinfer-kernels` operator layer: F32/Auto per-GEMM precision, flat append-only cache arenas, the uniform `_dev` decode path with CUDA/HIP-graph capture/replay, masked-capacity decode MoE, exact rollback, and host-side sampling.
+
 Model config (HF-style JSON), checkpoint loading, the YOCO-layered DeepSeek-V4.1-Flash model,
 generate() API, offline_inference example. Exact API to be defined by the wave-2 agent in its
 own doc; REQUIRED surface:

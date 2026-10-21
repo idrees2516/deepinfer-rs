@@ -766,7 +766,7 @@ mod tests {
                     };
                     // EOS at round 3 for every request.
                     let tok: u32 = if r == 3 { eos } else { ((id + r as u64) % 7 + 1) as u32 };
-                    out.push((id, tok as u32));
+                    out.push((id, tok));
                 }
                 Ok(out)
             }

@@ -17,6 +17,14 @@ unsafe_code = "forbid"
 rust_2018_idioms = { level = "warn", priority = -1 }
 missing_docs = "warn"
 
+[workspace.lints.clippy]
+# Kernel launchers and reference kernels intentionally mirror the vendor C
+# signatures (one parameter per kernel argument) — readability over arity.
+too_many_arguments = "allow"
+# Index loops document the exact iteration order that the determinism
+# contracts rely on; rewriting them into iterators hides that.
+needless_range_loop = "allow"
+
 [workspace.dependencies]
 deepinfer-core = { path = "crates/core" }
 deepinfer-fp8 = { path = "crates/fp8" }

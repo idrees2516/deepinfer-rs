@@ -153,7 +153,7 @@ impl Env {
         }
         if let Some(v) = lookup("DEEPINFER_USE_NEXTN_DECODE") {
             match v.trim().parse::<usize>() {
-                Ok(n) if n >= 1 && n <= 64 => env.use_nextn_decode = n,
+                Ok(n) if (1..=64).contains(&n) => env.use_nextn_decode = n,
                 Ok(n) => warnings.push(format!(
                     "DEEPINFER_USE_NEXTN_DECODE={n} outside [1, 64]; keeping default {}",
                     env.use_nextn_decode
@@ -173,7 +173,7 @@ impl Env {
         }
         if let Some(v) = lookup("DEEPINFER_YOCO_PREFILL_KEEP_TOKENS") {
             match v.trim().parse::<usize>() {
-                Ok(n) if n >= 1 && n <= 1 << 20 => env.yoco_prefill_keep_tokens = n,
+                Ok(n) if (1..=1 << 20).contains(&n) => env.yoco_prefill_keep_tokens = n,
                 other => warnings.push(format!(
                     "ignoring invalid DEEPINFER_YOCO_PREFILL_KEEP_TOKENS (got {other:?}); keeping default {}",
                     env.yoco_prefill_keep_tokens

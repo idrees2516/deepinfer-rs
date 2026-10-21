@@ -70,6 +70,35 @@ pub(crate) type FnCuLaunchKernel = unsafe extern "C" fn(
     *mut c_void,
 ) -> CuResult;
 
+// ---- Events (cross-stream / cross-device ordering) -------------------------
+pub(crate) type FnCuEventCreate = unsafe extern "C" fn(*mut Handle, u32) -> CuResult;
+pub(crate) type FnCuEventRecord = unsafe extern "C" fn(Handle, Handle) -> CuResult;
+pub(crate) type FnCuEventSynchronize = unsafe extern "C" fn(Handle) -> CuResult;
+pub(crate) type FnCuEventDestroy = unsafe extern "C" fn(Handle) -> CuResult;
+pub(crate) type FnCuStreamWaitEvent = unsafe extern "C" fn(Handle, Handle, u32) -> CuResult;
+
+// ---- Async device-to-device copy -------------------------------------------
+pub(crate) type FnCuMemcpyDtoDAsync =
+    unsafe extern "C" fn(DevicePtr, DevicePtr, usize, Handle) -> CuResult;
+
+// ---- CUDA Graphs (stream capture) ------------------------------------------
+pub(crate) type FnCuGraphDestroy = unsafe extern "C" fn(Handle) -> CuResult;
+/// `CUstreamCaptureMode`: 0 = GLOBAL, 1 = THREAD_LOCAL, 2 = RELAXED.
+pub(crate) type FnCuStreamBeginCapture = unsafe extern "C" fn(Handle, i32) -> CuResult;
+pub(crate) type FnCuStreamEndCapture = unsafe extern "C" fn(Handle, *mut Handle) -> CuResult;
+/// Present since CUDA 11.4; the arity-stable instantiation entry point
+/// (the plain `cuGraphInstantiate` symbol changed arity across versions).
+pub(crate) type FnCuGraphInstantiateWithFlags =
+    unsafe extern "C" fn(*mut Handle, Handle, u64) -> CuResult;
+pub(crate) type FnCuGraphLaunch = unsafe extern "C" fn(Handle, Handle) -> CuResult;
+pub(crate) type FnCuGraphExecDestroy = unsafe extern "C" fn(Handle) -> CuResult;
+
+/// `CU_EVENT_DEFAULT`.
+pub(crate) const CU_EVENT_DEFAULT: u32 = 0;
+/// `CU_STREAM_CAPTURE_MODE_RELAXED` — other threads may use the driver
+/// while this thread captures (the mode vLLM-class runtimes use).
+pub(crate) const CU_STREAM_CAPTURE_MODE_RELAXED: i32 = 2;
+
 /// All CUDA driver entry points we need, bound to one open `libcuda`.
 pub struct Cuda {
     #[allow(dead_code)]
@@ -102,6 +131,21 @@ pub struct Cuda {
     pub(crate) module_unload: FnCuModuleUnload,
     pub(crate) module_get_function: FnCuModuleGetFunction,
     pub(crate) launch_kernel: FnCuLaunchKernel,
+    // Optional entries: events (driver >= 8-ish, always present in practice)
+    // and graphs (CUDA >= 11.4). Resolved with sym_opt so older stacks still
+    // load; the safe wrappers report a clean error when absent.
+    pub(crate) event_create: Option<FnCuEventCreate>,
+    pub(crate) event_record: Option<FnCuEventRecord>,
+    pub(crate) event_synchronize: Option<FnCuEventSynchronize>,
+    pub(crate) event_destroy: Option<FnCuEventDestroy>,
+    pub(crate) stream_wait_event: Option<FnCuStreamWaitEvent>,
+    pub(crate) memcpy_dtod_async: Option<FnCuMemcpyDtoDAsync>,
+    pub(crate) graph_destroy: Option<FnCuGraphDestroy>,
+    pub(crate) stream_begin_capture: Option<FnCuStreamBeginCapture>,
+    pub(crate) stream_end_capture: Option<FnCuStreamEndCapture>,
+    pub(crate) graph_instantiate: Option<FnCuGraphInstantiateWithFlags>,
+    pub(crate) graph_launch: Option<FnCuGraphLaunch>,
+    pub(crate) graph_exec_destroy: Option<FnCuGraphExecDestroy>,
 }
 
 impl Cuda {
@@ -138,6 +182,18 @@ impl Cuda {
                 module_unload: lib.sym("cuModuleUnload")?,
                 module_get_function: lib.sym("cuModuleGetFunction")?,
                 launch_kernel: lib.sym("cuLaunchKernel")?,
+                event_create: lib.sym_opt("cuEventCreate")?,
+                event_record: lib.sym_opt("cuEventRecord")?,
+                event_synchronize: lib.sym_opt("cuEventSynchronize")?,
+                event_destroy: lib.sym_opt("cuEventDestroy")?,
+                stream_wait_event: lib.sym_opt("cuStreamWaitEvent")?,
+                memcpy_dtod_async: lib.sym_opt("cuMemcpyDtoDAsync_v2")?,
+                graph_destroy: lib.sym_opt("cuGraphDestroy")?,
+                stream_begin_capture: lib.sym_opt("cuStreamBeginCapture")?,
+                stream_end_capture: lib.sym_opt("cuStreamEndCapture")?,
+                graph_instantiate: lib.sym_opt("cuGraphInstantiateWithFlags")?,
+                graph_launch: lib.sym_opt("cuGraphLaunch")?,
+                graph_exec_destroy: lib.sym_opt("cuGraphExecDestroy")?,
                 lib,
             })
         }

@@ -356,6 +356,9 @@ fn random_indexer(rng: &mut Philox, cfg: &ModelConfig) -> Result<LightningIndexe
     })
 }
 
+/// RMSNorm epsilon of the MLA latent norms (V4.1).
+pub(crate) const V41_RMS_EPS: f32 = 1e-4;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,7 +447,7 @@ mod tests {
         let w = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let x = vec![0.5f32, -1.0];
         let out = matvec(&w, &x, 3, 2).unwrap();
-        assert_eq!(out, vec![1.0 * 0.5 + 2.0 * -1.0, 3.0 * 0.5 - 4.0, 2.5 - 6.0]);
+        assert_eq!(out, vec![1.0 * 0.5 + -2.0, 3.0 * 0.5 - 4.0, 2.5 - 6.0]);
         assert!(matvec(&w, &x, 2, 2).is_err());
         let mut buf = vec![0.0f32; 3];
         matvec_into(&w, &x, 3, 2, &mut buf).unwrap();

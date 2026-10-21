@@ -71,7 +71,7 @@ pub fn f32_to_f16_rne(x: f32) -> u16 {
     }
     let a = x.abs();
     // f16 subnormal / small-normal boundary handling via f64 (exact for f32 inputs).
-    if a < 6.103515625e-5 {
+    if a < 6.103_515_6e-5 {
         // 2^-14: subnormal region. Step = 2^-24.
         let q = (a as f64) * 2f64.powi(24);
         let m = q.round_ties_even();
@@ -212,7 +212,7 @@ pub fn f32_to_e5m2_rne(x: f32, saturate: bool) -> u8 {
             (sign << 7) | 0x7C
         };
     }
-    if a < 6.103515625e-5 {
+    if a < 6.103_515_6e-5 {
         // 2^-14: subnormal region, step 2^-16 (2-bit mantissa).
         let q = (a as f64) * 2f64.powi(16);
         let m = q.round_ties_even();
@@ -391,9 +391,9 @@ mod tests {
         assert_eq!(f32_to_f16_rne(65504.0), 0x7BFF);
         assert_eq!(f32_to_f16_rne(65520.0), 0x7C00); // overflow -> inf
         assert_eq!(f32_to_f16_rne(65519.0), 0x7BFF);
-        assert_eq!(f32_to_f16_rne(5.960464477539063e-08), 0x0001); // min subnormal
+        assert_eq!(f32_to_f16_rne(5.960_464_5e-8), 0x0001); // min subnormal
         assert_eq!(f32_to_f16_rne(2.9802322e-08), 0x0000); // below half of min subnormal
-        assert_eq!(f16_to_f32(0x0001), 5.960464477539063e-08);
+        assert_eq!(f16_to_f32(0x0001), 5.960_464_5e-8);
         assert!(f16_to_f32(f32_to_f16_rne(f32::NAN)).is_nan());
     }
 

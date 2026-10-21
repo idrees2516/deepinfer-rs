@@ -165,3 +165,115 @@ di_sigmoid_kernel(const float* __restrict__ z, float* __restrict__ s, int n) {
         s[i] = di_sigmoid(z[i]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Masked (capacity) dispatch — the CUDA-graph / DeepEP-low-latency-style
+// MoE path. `perm` is [E * cap, hidden] (fixed capacity per expert);
+// `counters` [E] doubles as the rank counter AND the post-pass masked_m
+// (atomicAdd order is irrelevant: per-token outputs are independent of the
+// row order within an expert, exactly like the aligned path). Over-capacity
+// pairs are dropped (map = -1, combine skips) and counted in `drops` [1].
+// ---------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(256)
+di_moe_scatter_masked_kernel(const float* __restrict__ x,
+                             const int* __restrict__ topk_idx,
+                             int* __restrict__ counters,
+                             float* __restrict__ perm,
+                             int* __restrict__ map, // [tokens, K]
+                             int* __restrict__ drops,
+                             int tokens, int hidden, int K, int cap) {
+    int tk = blockIdx.x;
+    if (tk >= tokens * K) return;
+    int t = tk / K;
+    int k = tk - t * K;
+    int e = topk_idx[tk];
+    if (e < 0) {
+        if (threadIdx.x == 0) map[tk] = -1;
+        return;
+    }
+    int rank = 0;
+    if (threadIdx.x == 0) rank = atomicAdd(&counters[e], 1);
+    __shared__ int srank;
+    if (threadIdx.x == 0) srank = rank;
+    __syncthreads();
+    if (srank < cap) {
+        int row = e * cap + srank;
+        if (threadIdx.x == 0) map[tk] = row;
+        const float* src = x + (u64)t * hidden;
+        float* dst = perm + (u64)row * hidden;
+        for (int d = threadIdx.x; d < hidden; d += blockDim.x) dst[d] = src[d];
+    } else {
+        if (threadIdx.x == 0) {
+            map[tk] = -1;
+            atomicAdd(drops, 1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused-layout SiLU-mul for the grouped GEMM outputs: the gate/up branches
+// live in ONE buffer x [rows, 2*row_elems] (gate cols [0, W), up cols
+// [W, 2W)), out is [rows, W]. The masked variant computes only rows
+// r < masked_m[g] of group g (rows [g*cap + r]); invalid rows are never
+// read by the combine.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(256)
+di_silu_mul_masked_kernel(const float* __restrict__ x,
+                          float* __restrict__ out,
+                          const int* __restrict__ masked_m,
+                          int cap,
+                          int groups,
+                          long long row_elems) {
+    long long total = (long long)groups * cap * row_elems;
+    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += (long long)gridDim.x * blockDim.x) {
+        long long r_global = idx / row_elems; // out row in [0, groups*cap)
+        int c = (int)(idx - r_global * row_elems);
+        int grp = (int)(r_global / cap);
+        int r = (int)(r_global - (long long)grp * cap);
+        if (r >= masked_m[grp]) continue;
+        const float* xr = x + r_global * (2 * row_elems); // fused input row
+        float z = xr[c];
+        out[idx] = (z / (1.0f + expf(-z))) * xr[row_elems + c];
+    }
+}
+
+// Unmasked twin for the eager contiguous path and the shared experts.
+extern "C" __global__ void __launch_bounds__(256)
+di_silu_mul_fused_kernel(const float* __restrict__ x,
+                         float* __restrict__ out,
+                         long long rows,
+                         int row_elems) {
+    long long total = rows * (long long)row_elems;
+    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += (long long)gridDim.x * blockDim.x) {
+        long long r = idx / row_elems;
+        int c = (int)(idx - r * row_elems);
+        const float* xr = x + r * (2 * (long long)row_elems); // fused input row
+        float z = xr[c];
+        out[idx] = (z / (1.0f + expf(-z))) * xr[row_elems + c];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Indexed row gather: dst[i] = src[idx[i]] for i in [0, n), whole rows of
+// `row_bytes`. The index list is device-resident (host-built send plans are
+// uploaded once per step). Used by the peer-collective EP layer to pack
+// per-destination send buffers before the NVLink peer copies.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(256)
+di_gather_rows_indexed_kernel(const u8* __restrict__ src,
+                              u8* __restrict__ dst,
+                              const u32* __restrict__ idx,
+                              int row_bytes,
+                              long long n) {
+    long long total = n * row_bytes;
+    for (long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x; e < total;
+         e += (long long)gridDim.x * blockDim.x) {
+        int r = (int)(e / row_bytes);
+        int b = (int)(e - (long long)r * row_bytes);
+        dst[e] = src[(long long)idx[r] * row_bytes + b];
+    }
+}

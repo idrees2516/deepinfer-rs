@@ -23,8 +23,8 @@ use std::sync::Arc;
 ///
 /// `out\[i\]\[j\] = c\[i\]\[j\] + sum over k-blocks of sf_a(i,kb) * sf_b(j/128,kb)
 /// * sum_{kk in block} deq(a)\[i,kk\] * deq(b)\[j,kk\]`,
-/// accumulated in f32 with fixed ascending order. Rows are computed on
-/// the global thread pool over disjoint output rows (bit-deterministic).
+///   accumulated in f32 with fixed ascending order. Rows are computed on
+///   the global thread pool over disjoint output rows (bit-deterministic).
 ///
 /// # Errors
 ///
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn fp8_gemm_nt_deterministic_bitwise() -> Result<()> {
-        let mut rng = Philox::new(0xDe7, 9);
+        let mut rng = Philox::new(0xDE7, 9);
         let (m, n, k) = (130usize, 16usize, 256usize);
         let a = random_matrix(&mut rng, m, k, 1.0);
         let b = random_matrix(&mut rng, n, k, 1.0);

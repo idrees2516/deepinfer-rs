@@ -219,7 +219,7 @@ mod tests {
         // 2^20 DFA states (the classic blowup example).
         let pat = "[ab]*a[ab]{20}";
         assert!(matches!(
-            Grammar::compile_regex(&pat),
+            Grammar::compile_regex(pat),
             Err(Error::CapacityExceeded { .. })
         ));
         // Huge counted repetition is rejected by the count cap.

@@ -6,7 +6,44 @@ use deepinfer_gpu::{Buffer, KernelArgs, Launch, Stream};
 use crate::gemm::ceil_div;
 use crate::Kernels;
 
-const MERGE_CHUNK: usize = 2048; // bitonic entries per merge CTA
+pub(crate) const MERGE_CHUNK: usize = 2048; // bitonic entries per merge CTA
+
+/// DSA kernel entry points defined in `kernels/dsa.cu` (used by the
+/// source-name sanity test).
+#[cfg(test)]
+pub(crate) const KERNEL_NAMES: &[&str] = &[
+    "di_indexer_rmsnorm_per_head_kernel",
+    "di_lightning_amax_kernel",
+    "di_lightning_finalize_kernel",
+    "di_lightning_quant_kernel",
+    "di_thunder_logits_kernel",
+    "di_conv_feat_kernel",
+    "di_conv_gated_norm_kernel",
+    "di_dot_scores_kernel",
+    "di_qmean_kernel",
+    "di_gate_logits_kernel",
+    "di_gate_blend_kernel",
+    "di_causal_clip_kernel",
+    "di_causal_window_clip_kernel",
+    "di_block_preselect_kernel",
+    "di_topk_merge_kernel",
+    "di_topk_scatter_kernel",
+];
+
+/// MoE kernel entry points defined in `kernels/moe.cu`.
+#[cfg(test)]
+pub(crate) const MOE_KERNEL_NAMES: &[&str] = &[
+    "di_moe_route_kernel",
+    "di_moe_count_kernel",
+    "di_moe_prefix_kernel",
+    "di_moe_scatter_kernel",
+    "di_moe_scatter_masked_kernel",
+    "di_moe_combine_kernel",
+    "di_fill_zero_kernel",
+    "di_sigmoid_kernel",
+    "di_silu_mul_masked_kernel",
+    "di_silu_mul_fused_kernel",
+];
 
 impl Kernels {
     // ------------------------------------------------------------------
@@ -329,6 +366,31 @@ impl Kernels {
         )
     }
 
+    /// Causal + extrapolation-window clip (baked sizes — the prefill path;
+    /// `window == 0` disables the window restriction and this equals
+    /// [`Kernels::causal_clip`]).
+    pub fn causal_window_clip(
+        &self,
+        scores: &Buffer,
+        s_q: usize,
+        s_kv: usize,
+        window: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.launch1d(
+            "di_causal_window_clip_kernel",
+            s_q * s_kv,
+            256,
+            0,
+            KernelArgs::new()
+                .ptr(scores)
+                .i32(s_q as i32)
+                .i32(s_kv as i32)
+                .i32(window as i32),
+            stream,
+        )
+    }
+
     /// Causal clip: `scores[i][j] = -inf` for `j > i`.
     pub fn causal_clip(
         &self,
@@ -514,6 +576,7 @@ impl Kernels {
     /// * `offsets`: `[E + 1]` i32
     /// * `perm`: `[m_total_padded, hidden]` f32 (zeroed here)
     /// * `map`: `[tokens, K]` i32
+    ///
     /// Returns `m_total_padded` (the grouped GEMM M).
     pub fn moe_dispatch(
         &self,
@@ -641,6 +704,119 @@ impl Kernels {
             256,
             0,
             KernelArgs::new().ptr(z).ptr(s).i32(n as i32),
+            stream,
+        )
+    }
+
+    /// **Masked (capacity) dispatch** — the CUDA-graph / DeepEP
+    /// low-latency-style MoE path. `perm`: `[e * cap, hidden]` f32;
+    /// `counters`: `[e]` i32 (zeroed here; after the scatter it holds the
+    /// per-expert row counts = the `masked_m` of the masked GEMM);
+    /// `map`: `[tokens, k]` i32 (row index or -1); `drops`: `[1]` i32
+    /// (zeroed here; counts over-capacity pairs).
+    ///
+    /// No host readback — the whole sequence is graph-capturable. Row order
+    /// within an expert comes from atomics, which does not affect any
+    /// per-token output (same argument as the aligned path).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_dispatch_masked(
+        &self,
+        x: &Buffer,
+        topk_idx: &Buffer,
+        counters: &Buffer,
+        perm: &Buffer,
+        map: &Buffer,
+        drops: &Buffer,
+        tokens: usize,
+        hidden: usize,
+        k: usize,
+        e: usize,
+        cap: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure!(tokens > 0 && hidden > 0 && k > 0 && e > 0 && cap > 0, InvalidArgument, "masked dispatch needs positive dims");
+        self.fill_zero(counters, e * 4, stream)?;
+        self.fill_zero(drops, 4, stream)?;
+        let f = self.f("di_moe_scatter_masked_kernel")?;
+        f.launch(
+            self.device(),
+            Launch {
+                grid: ((tokens * k) as u32, 1, 1),
+                block: (256, 1, 1),
+                shared: 0,
+            },
+            &KernelArgs::new()
+                .ptr(x)
+                .ptr(topk_idx)
+                .ptr(counters)
+                .ptr(perm)
+                .ptr(map)
+                .ptr(drops)
+                .i32(tokens as i32)
+                .i32(hidden as i32)
+                .i32(k as i32)
+                .i32(cap as i32),
+            stream,
+        )
+    }
+
+    /// Masked fused-layout SiLU-mul: `x` is `[groups * cap, 2 * row_elems]`
+    /// (gate cols `[0, W)`, up cols `[W, 2W)`), `out` is
+    /// `[groups * cap, row_elems]`; only rows `r < masked_m[g]` of group
+    /// `g` are computed (invalid rows are never read downstream).
+    pub fn silu_mul_masked(
+        &self,
+        x: &Buffer,
+        out: &Buffer,
+        masked_m: &Buffer,
+        cap: usize,
+        groups: usize,
+        row_elems: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure!(cap > 0 && groups > 0 && row_elems > 0, InvalidArgument, "masked silu needs positive dims");
+        let total = groups
+            .checked_mul(cap)
+            .and_then(|v| v.checked_mul(row_elems))
+            .ok_or_else(|| deepinfer_core::Error::CapacityExceeded("silu total overflows".into()))?;
+        self.launch1d(
+            "di_silu_mul_masked_kernel",
+            total,
+            256,
+            0,
+            KernelArgs::new()
+                .ptr(x)
+                .ptr(out)
+                .ptr(masked_m)
+                .i32(cap as i32)
+                .i32(groups as i32)
+                .u64(row_elems as u64),
+            stream,
+        )
+    }
+
+    /// Unmasked fused-layout SiLU-mul (`x` `[rows, 2 * row_elems]` ->
+    /// `out` `[rows, row_elems]`) — the eager contiguous MoE path and the
+    /// shared experts.
+    pub fn silu_mul_fused(
+        &self,
+        x: &Buffer,
+        out: &Buffer,
+        rows: usize,
+        row_elems: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure!(rows > 0 && row_elems > 0, InvalidArgument, "silu needs rows/row_elems > 0");
+        self.launch1d(
+            "di_silu_mul_fused_kernel",
+            rows * row_elems,
+            256,
+            0,
+            KernelArgs::new()
+                .ptr(x)
+                .ptr(out)
+                .u64(rows as u64)
+                .i32(row_elems as i32),
             stream,
         )
     }

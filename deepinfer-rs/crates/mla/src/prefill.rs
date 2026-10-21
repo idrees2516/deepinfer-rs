@@ -385,9 +385,9 @@ mod tests {
         assert_close_slice(&lse, &nlse, 1e-4, "topk_length lse");
         // tl[1] = 0: query 1 has no valid index -> edge values.
         for hi in 0..h {
-            assert!(max_l[1 * h + hi] == f32::NEG_INFINITY);
-            assert!(lse[1 * h + hi] == f32::INFINITY);
-            assert!(out[(1 * h + hi) * d..][..d].iter().all(|&v| v == 0.0));
+            assert!(max_l[h + hi] == f32::NEG_INFINITY);
+            assert!(lse[h + hi] == f32::INFINITY);
+            assert!(out[(h + hi) * d..][..d].iter().all(|&v| v == 0.0));
         }    }
 
     #[test]

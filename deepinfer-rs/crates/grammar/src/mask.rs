@@ -148,17 +148,7 @@ mod tests {
             out
         }
         let accepted = accepted_prefixes(&g, 6);
-        for state in 0..g.num_states() as u32 {
-            let _ = mc.compute_mask(&g, state);
-            for (_id, _bytes) in words.iter().enumerate() {
-                // Reach the state first (only start is directly reachable
-                // in this test): we check the start state and states
-                // reachable via allowed prefixes.
-                let _ = state;
-                break;
-            }
-            break;
-        }
+        assert!(!accepted.is_empty(), "the DFA must accept some prefixes");
         // Check the start state against brute force.
         let s0 = g.initial_state();
         let mask = mc.compute_mask(&g, s0);

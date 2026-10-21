@@ -221,12 +221,12 @@ mod tests {
 
     #[test]
     fn expert_forward_matches_manual_swiglu() {
-        prop("expert SwiGLU", 0xE11, 100, |i, mut rng| {
+        prop("expert SwiGLU", 0xE11, 100, |i, rng| {
             let h = rng.uniform_usize(1, 7);
             let it = rng.uniform_usize(1, 6);
             let tokens = rng.uniform_usize(1, 5);
             let w = weights_with_experts(h, it, 3);
-            let x = random_vec(&mut rng, tokens * h, 1.0);
+            let x = random_vec(rng, tokens * h, 1.0);
             let e = rng.uniform_usize(0, 3);
             let y = w.expert_forward(e, &x, tokens)?;
             let expect = manual_swiglu(&w.routed[e], &x, tokens, h, it);
@@ -238,12 +238,12 @@ mod tests {
 
     #[test]
     fn expert_forward_batch_equals_rows() {
-        prop("expert batch == rows", 0xE12, 50, |i, mut rng| {
+        prop("expert batch == rows", 0xE12, 50, |i, rng| {
             let h = rng.uniform_usize(1, 6);
             let it = rng.uniform_usize(1, 5);
             let tokens = rng.uniform_usize(1, 5);
             let w = weights_with_experts(h, it, 2);
-            let x = random_vec(&mut rng, tokens * h, 1.5);
+            let x = random_vec(rng, tokens * h, 1.5);
             let batch = w.expert_forward(1, &x, tokens)?;
             for t in 0..tokens {
                 let row = w.expert_forward(1, &x[t * h..(t + 1) * h], 1)?;

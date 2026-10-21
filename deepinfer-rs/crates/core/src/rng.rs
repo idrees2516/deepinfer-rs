@@ -5,8 +5,8 @@
 //! CUDA/PyTorch. All arithmetic is wrapping `u32` math, so streams are
 //! bit-identical on every platform, which is the foundation of
 //! DeepInfer's *deterministic sampling* and *batch-invariant inference*:
-/// a sequence's samples depend only on its own `(seed, stream)` pair,
-/// never on batch composition or scheduling order.
+//!   a sequence's samples depend only on its own `(seed, stream)` pair,
+//!   never on batch composition or scheduling order.
 
 const PHILOX_M0: u32 = 0xD251_1F53;
 const PHILOX_M1: u32 = 0xCD9E_8D57;

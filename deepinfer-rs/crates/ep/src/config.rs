@@ -34,11 +34,7 @@ impl EpConfig {
     /// (`world_size == 0`) instead of dividing by zero; call
     /// [`EpConfig::validate`] to reject them up front.
     pub fn num_local_experts(&self) -> usize {
-        if self.world_size == 0 {
-            0
-        } else {
-            self.num_experts / self.world_size
-        }
+        self.num_experts.checked_div(self.world_size).unwrap_or(0)
     }
 
     /// Owner rank of `expert`: `expert * world_size / num_experts`

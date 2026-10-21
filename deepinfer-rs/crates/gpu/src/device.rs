@@ -187,6 +187,16 @@ impl Gpu {
         self.inner.backend
     }
 
+    /// The loaded CUDA driver bindings, when this is a CUDA instance.
+    pub(crate) fn cuda(&self) -> Option<&cuda::Cuda> {
+        self.inner.cuda.as_ref()
+    }
+
+    /// The loaded HIP runtime bindings, when this is a HIP instance.
+    pub(crate) fn hip(&self) -> Option<&hip::Hip> {
+        self.inner.hip.as_ref()
+    }
+
     /// NVRTC version when the CUDA RTC is available.
     pub fn nvrtc_version(&self) -> Option<(i32, i32)> {
         self.inner.nvrtc.as_ref().map(|n| n.version())
@@ -256,7 +266,7 @@ impl Gpu {
                 };
                 Ok(Device {
                     gpu: self.clone(),
-                    id: dev as i32,
+                    id: dev,
                     ctx,
                     props,
                 })
@@ -277,15 +287,12 @@ impl Gpu {
                 ensure!(r == 0, Internal, "hipMemGetInfo: {}", h.error_string(r));
                 // SM/CU count: attribute query mirrors CUDA numbering; fall
                 // back to a conservative default if the runtime declines.
-                let sm = match {
-                    let mut v: i32 = 0;
-                    // SAFETY: valid out-pointer.
-                    let r = unsafe { (h.device_get_attribute)(&mut v, hip::ATTR_MULTIPROCESSOR_COUNT, ordinal as i32) };
-                    if r == 0 { Some(v) } else { None }
-                } {
-                    Some(v) => v.max(1) as u32,
-                    None => 120,
-                };
+                let mut sm_attr: i32 = 0;
+                // SAFETY: valid out-pointer.
+                let sm_ok = unsafe {
+                    (h.device_get_attribute)(&mut sm_attr, hip::ATTR_MULTIPROCESSOR_COUNT, ordinal as i32)
+                } == 0;
+                let sm = if sm_ok { sm_attr.max(1) as u32 } else { 120 };
                 let arch = amd_arch_from_env_or_scan(h, ordinal as i32);
                 let props = DeviceProps {
                     backend: Backend::Hip,
@@ -390,6 +397,16 @@ impl Device {
         &self.props
     }
 
+    /// The GPU instance this device belongs to.
+    pub(crate) fn gpu(&self) -> &Gpu {
+        &self.gpu
+    }
+
+    /// This device's ordinal within its backend.
+    pub fn ordinal(&self) -> usize {
+        self.id.max(0) as usize
+    }
+
     /// Backend of this device.
     pub fn backend(&self) -> Backend {
         self.props.backend
@@ -407,7 +424,7 @@ impl Device {
 
     /// Make this device's context current on the calling thread (CUDA) or
     /// select the device (HIP). Called internally before driver calls.
-    fn make_current(&self) -> Result<()> {
+    pub(crate) fn make_current(&self) -> Result<()> {
         match (&self.gpu.inner.cuda, &self.gpu.inner.hip) {
             (Some(c), _) => {
                 // SAFETY: ctx was retained at Device creation and is never released.
@@ -466,6 +483,7 @@ impl Device {
                     gpu: self.gpu.clone(),
                     ptr: p,
                     len: bytes,
+                    owns: true,
                 })
             }
             (_, Some(h)) => {
@@ -477,6 +495,7 @@ impl Device {
                     gpu: self.gpu.clone(),
                     ptr: p as u64,
                     len: bytes,
+                    owns: true,
                 })
             }
             _ => unreachable!(),
@@ -485,7 +504,7 @@ impl Device {
 
     /// Allocate and fill device memory from a host slice.
     pub fn alloc_from<T: Copy>(&self, data: &[T]) -> Result<Buffer> {
-        let bytes = data.len() * std::mem::size_of::<T>();
+        let bytes = std::mem::size_of_val(data);
         let buf = self.alloc(bytes)?;
         self.write(&buf, data)?;
         Ok(buf)
@@ -493,7 +512,7 @@ impl Device {
 
     /// Upload a host slice into an existing buffer (synchronous).
     pub fn write<T: Copy>(&self, buf: &Buffer, data: &[T]) -> Result<()> {
-        let bytes = data.len() * std::mem::size_of::<T>();
+        let bytes = std::mem::size_of_val(data);
         ensure!(bytes <= buf.len, InvalidArgument, "host slice larger than buffer");
         self.make_current()?;
         // SAFETY: data is a valid host buffer of `bytes` readable bytes; the
@@ -513,7 +532,7 @@ impl Device {
 
     /// Download a buffer into a host slice (synchronous).
     pub fn read<T: Copy>(&self, buf: &Buffer, out: &mut [T]) -> Result<()> {
-        let bytes = out.len() * std::mem::size_of::<T>();
+        let bytes = std::mem::size_of_val(out);
         ensure!(bytes <= buf.len, InvalidArgument, "host slice larger than buffer");
         self.make_current()?;
         // SAFETY: out is a valid writable host buffer; device pointer valid.
@@ -672,6 +691,61 @@ impl Device {
             _ => unreachable!(),
         }
     }
+
+    /// Asynchronous device-to-device copy `dst <- src` on `stream` (same
+    /// device). Used by the decode path to stage fixed-window caches inside
+    /// captured graphs (a kernel-free alternative to gather kernels).
+    pub fn memcpy_dtod_async(&self, dst: &Buffer, src: &Buffer, stream: &Stream) -> Result<()> {
+        let bytes = dst.len.min(src.len);
+        ensure!(bytes > 0, InvalidArgument, "empty copy");
+        self.make_current()?;
+        // SAFETY: both pointers valid for `bytes` on the current device.
+        let r = match (&self.gpu.inner.cuda, &self.gpu.inner.hip) {
+            (Some(c), _) => match c.memcpy_dtod_async {
+                Some(f) => unsafe { (f)(dst.ptr, src.ptr, bytes, stream.handle) },
+                None => return Err(no_async_copy_error()),
+            },
+            (_, Some(h)) => match h.memcpy_dtod_async {
+                Some(f) => unsafe {
+                    (f)(
+                        dst.ptr as *mut c_void,
+                        src.ptr as *const c_void,
+                        bytes,
+                        stream.handle,
+                    )
+                },
+                None => return Err(no_async_copy_error()),
+            },
+            _ => unreachable!(),
+        };
+        ensure!(r == 0, Internal, "memcpy DtoDAsync: {}", self.err_str(r));
+        Ok(())
+    }
+}
+
+/// The error returned when the optional event entry points are missing
+/// (kept for the HIP matrix where `sym_opt` may legitimately come up empty
+/// on old ROCm builds).
+pub(crate) fn no_events_error() -> deepinfer_core::Error {
+    deepinfer_core::Error::internal(
+        "driver does not expose the event entry points required for this operation",
+    )
+}
+
+/// The error returned when the optional async DtoD entry point is missing.
+pub(crate) fn no_async_copy_error() -> deepinfer_core::Error {
+    deepinfer_core::Error::internal(
+        "driver does not expose the async device-to-device copy entry point",
+    )
+}
+
+/// The error returned when the optional graph entry points are missing
+/// (CUDA < 11.4 or ROCm < 5.7).
+pub(crate) fn no_graphs_error() -> deepinfer_core::Error {
+    deepinfer_core::Error::internal(
+        "driver does not expose CUDA/HIP graph capture (needs CUDA >= 11.4 or ROCm >= 5.7); \
+         fall back to eager launches",
+    )
 }
 
 /// An execution stream. Destroyed on drop.
@@ -686,6 +760,11 @@ unsafe impl Send for Stream {}
 unsafe impl Sync for Stream {}
 
 impl Stream {
+    /// The raw stream handle (CUstream / hipStream_t).
+    pub(crate) fn raw(&self) -> cuda::Handle {
+        self.handle
+    }
+
     /// Block until all work queued on this stream completes.
     pub fn synchronize(&self) -> Result<()> {
         match (&self.gpu.inner.cuda, &self.gpu.inner.hip) {
@@ -706,7 +785,7 @@ impl Stream {
 
     /// Asynchronous H2D upload on this stream.
     pub fn write_async<T: Copy>(&self, dev: &Device, buf: &Buffer, data: &[T]) -> Result<()> {
-        let bytes = data.len() * std::mem::size_of::<T>();
+        let bytes = std::mem::size_of_val(data);
         ensure!(bytes <= buf.len, InvalidArgument, "host slice larger than buffer");
         dev.make_current()?;
         // SAFETY: host slice readable for `bytes`; device pointer valid.
@@ -730,7 +809,7 @@ impl Stream {
 
     /// Asynchronous D2H download on this stream.
     pub fn read_async<T: Copy>(&self, dev: &Device, buf: &Buffer, out: &mut [T]) -> Result<()> {
-        let bytes = out.len() * std::mem::size_of::<T>();
+        let bytes = std::mem::size_of_val(out);
         ensure!(bytes <= buf.len, InvalidArgument, "host slice larger than buffer");
         dev.make_current()?;
         // SAFETY: host slice writable for `bytes`; device pointer valid.
@@ -780,11 +859,15 @@ impl Drop for Stream {
     }
 }
 
-/// Device memory allocation. Freed on drop.
+/// Device memory allocation. Freed on drop unless it is a non-owning
+/// view created via [`Buffer::slice`].
 pub struct Buffer {
     gpu: Gpu,
     ptr: u64,
     len: usize,
+    /// Whether dropping this buffer frees the allocation; `false` for
+    /// `slice` views.
+    owns: bool,
 }
 
 // SAFETY: device pointers are plain addresses, valid process-wide once
@@ -808,10 +891,44 @@ impl Buffer {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// A non-owning view of the bytes `[offset, offset + len)` of this
+    /// buffer.
+    ///
+    /// Views share the parent's device address space and are how the
+    /// arena caches hand "slice at row r" pointers to kernels without
+    /// extra copies (and how graph capture bakes row-window pointers).
+    /// **The view must be dropped before the parent buffer** — a
+    /// usage-discipline invariant; all call sites in this workspace keep
+    /// the parent alive in the same structure.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] when the range is out of bounds or empty.
+    pub fn slice(&self, offset: usize, len: usize) -> Result<Buffer> {
+        ensure!(len > 0, InvalidArgument, "slice length must be > 0");
+        let end = offset.checked_add(len).ok_or_else(|| {
+            deepinfer_core::Error::invalid("slice range overflows usize")
+        })?;
+        ensure!(
+            end <= self.len,
+            InvalidArgument,
+            "slice [{offset}, {end}) is outside the {}-byte buffer",
+            self.len
+        );
+        Ok(Buffer {
+            gpu: self.gpu.clone(),
+            ptr: self.ptr + offset as u64,
+            len,
+            owns: false,
+        })
+    }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
+        if !self.owns {
+            return; // non-owning view; the parent frees
+        }
         // Best-effort free (see Stream::drop note).
         match (&self.gpu.inner.cuda, &self.gpu.inner.hip) {
             (Some(c), _) => {

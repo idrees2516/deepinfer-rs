@@ -46,12 +46,15 @@ pub mod ffi;
 pub mod hash;
 #[allow(unsafe_code)]
 pub mod jit;
+#[allow(unsafe_code)]
+pub mod sync;
 
 pub use device::{
     Backend, Buffer, Device, DeviceProps, Function, Gpu, GpuArch, KernelArgs, Launch, Module,
     Stream,
 };
 pub use jit::{compile, compile_and_load, KernelImage};
+pub use sync::{graph_supported, CaptureGuard, Event, GraphExec};
 
 #[cfg(test)]
 mod tests {

@@ -195,15 +195,15 @@ mod tests {
 
     #[test]
     fn moe_forward_matches_manual_loop() {
-        prop("moe_forward == manual", 0xB0E1, 100, |i, mut rng| {
-            let cfg = small_cfg(&mut rng);
+        prop("moe_forward == manual", 0xB0E1, 100, |i, rng| {
+            let cfg = small_cfg(rng);
             let tokens = rng.uniform_usize(1, 5);
-            let mut w = MoeWeights::from_config(&cfg, &mut rng);
+            let mut w = MoeWeights::from_config(&cfg, rng);
             // Deterministic bias strong enough to actually re-rank selections.
             for e in 0..cfg.num_routed {
                 w.gate_bias[e] = rng.uniform_f32(-0.5, 0.5);
             }
-            let x = random_vec(&mut rng, tokens * cfg.hidden, 1.0);
+            let x = random_vec(rng, tokens * cfg.hidden, 1.0);
             let y = moe_forward(&w, &cfg, &x, tokens)?;
             let h = cfg.hidden;
             let mut y_ref = w.shared_forward(&cfg, &x, tokens)?;
@@ -230,11 +230,11 @@ mod tests {
 
     #[test]
     fn moe_forward_is_deterministic() {
-        prop("moe_forward determinism", 0xB0E2, 50, |i, mut rng| {
-            let cfg = small_cfg(&mut rng);
+        prop("moe_forward determinism", 0xB0E2, 50, |i, rng| {
+            let cfg = small_cfg(rng);
             let tokens = rng.uniform_usize(1, 4);
-            let w = MoeWeights::from_config(&cfg, &mut rng);
-            let x = random_vec(&mut rng, tokens * cfg.hidden, 1.0);
+            let w = MoeWeights::from_config(&cfg, rng);
+            let x = random_vec(rng, tokens * cfg.hidden, 1.0);
             let a = moe_forward(&w, &cfg, &x, tokens)?;
             let b = moe_forward(&w, &cfg, &x, tokens)?;
             assert_eq!(a, b, "moe_forward must be bit-deterministic");

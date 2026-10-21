@@ -189,7 +189,7 @@ impl Tensor {
     /// 2-D tensor (`[rows, cols]`), sharing the underlying bytes where
     /// possible (contiguous copy for simplicity and safety).
     pub fn rows(&self, row_start: usize, row_end: usize) -> Result<Tensor> {
-        ensure!(self.shape.len() >= 1, InvalidArgument, "rows() needs >= 1 dim");
+        ensure!(!self.shape.is_empty(), InvalidArgument, "rows() needs >= 1 dim");
         if self.shape.len() == 1 {
             // Treat a 1-D tensor as a column of rows of length 1.
             ensure!(row_end <= self.shape[0], OutOfRange, "row range");

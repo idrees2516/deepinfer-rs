@@ -211,3 +211,82 @@ di_bf16_to_f32_kernel(const u16* __restrict__ x, float* __restrict__ out, int n)
         out[i] = di_bf16_to_f32(x[i]);
     }
 }
+
+// Norm the latent prefix [0, latent) of each hd-wide row in place (the MLA
+// KV latent RMSNorm; the rope tail is left raw). One CTA per row.
+extern "C" __global__ void __launch_bounds__(256)
+di_latent_norm_kernel(float* __restrict__ kv,
+                      const float* __restrict__ gain,
+                      int rows, int hd, int latent, float eps) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    float* row = kv + (u64)r * hd;
+    __shared__ float red[256];
+    float part = 0.0f;
+    for (int i = threadIdx.x; i < latent; i += blockDim.x) part += row[i] * row[i];
+    red[threadIdx.x] = part;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(red[0] / (float)latent + eps);
+    for (int i = threadIdx.x; i < latent; i += blockDim.x) row[i] *= inv * gain[i];
+}
+
+// Batched row append: dst[row0 + i] = src[i] for i in [0, rows)
+// (row stride `floats`; baked row0 — the prefill twin of the _dev append).
+extern "C" __global__ void __launch_bounds__(256)
+di_append_rows_kernel(const float* __restrict__ src,
+                      float* __restrict__ dst,
+                      int row0, int rows, int floats) {
+    long long total = (long long)rows * floats;
+    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += (long long)gridDim.x * blockDim.x) {
+        int r = (int)(idx / floats);
+        int c = (int)(idx - (long long)r * floats);
+        dst[(long long)(row0 + r) * floats + c] = src[idx];
+    }
+}
+
+// Batched per-(token, head) RMSNormed row append (the thunder-side indexer
+// k cache; prefill twin of the _dev variant).
+extern "C" __global__ void __launch_bounds__(256)
+di_append_norm_rows_kernel(const float* __restrict__ src,
+                           float* __restrict__ dst,
+                           int row0, int rows, int nh, int hd) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * nh) return;
+    int r = idx / nh;
+    int h = idx - r * nh;
+    const float* s = src + (u64)r * nh * hd + (u64)h * hd;
+    float* d = dst + (u64)(row0 + r) * nh * hd + (u64)h * hd;
+    float ms = 0.0f;
+    for (int i = 0; i < hd; ++i) ms += s[i] * s[i];
+    ms /= (float)hd;
+    float inv = rsqrtf(ms + 1e-6f);
+    for (int i = 0; i < hd; ++i) d[i] = s[i] * inv;
+}
+
+// Strided column-block copy: dst[i][dst_col0 + c] = src[i][src_col0 + c]
+// for i in [0, rows), c in [0, cols); strides in FLOATS. Used to slice
+// per-group Wv inputs / assemble Wo inputs when rows > 1 (with one row the
+// slices are contiguous and no copy is needed).
+extern "C" __global__ void __launch_bounds__(256)
+di_copy_cols_kernel(const float* __restrict__ src,
+                    float* __restrict__ dst,
+                    int rows,
+                    long long src_stride,
+                    long long dst_stride,
+                    long long src_col0,
+                    long long dst_col0,
+                    int cols) {
+    long long total = (long long)rows * cols;
+    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += (long long)gridDim.x * blockDim.x) {
+        int r = (int)(idx / cols);
+        int c = (int)(idx - (long long)r * cols);
+        dst[(long long)r * dst_stride + dst_col0 + c] =
+            src[(long long)r * src_stride + src_col0 + c];
+    }
+}

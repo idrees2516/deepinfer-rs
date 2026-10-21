@@ -457,6 +457,9 @@ mod tests {
         }
     }
 
+    // The branch-per-policy-rule transcription intentionally repeats
+    // `VerifyNow` bodies (the policy table's exact shape).
+    #[allow(clippy::if_same_then_else)]
     #[test]
     fn prop_scheduler_matches_reference_rules() {
         prop("mtp-scheduler-rules", 0x5C5C, 200, |_, rng| {

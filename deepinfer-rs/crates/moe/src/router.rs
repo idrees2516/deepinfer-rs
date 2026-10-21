@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn weights_renormalize_to_one() {
-        prop("routing renormalization", 0x1207, 100, |i, mut rng| {
+        prop("routing renormalization", 0x1207, 100, |i, rng| {
             let cfg = MoeConfig {
                 hidden: rng.uniform_usize(1, 8),
                 intermediate: 2,
@@ -395,11 +395,11 @@ mod tests {
                 num_activated: rng.uniform_usize(1, cfg.num_routed + 1),
                 ..cfg
             };
-            let mut w = MoeWeights::from_config(&cfg, &mut rng);
+            let mut w = MoeWeights::from_config(&cfg, rng);
             for b in w.gate_bias.iter_mut() {
                 *b = rng.uniform_f32(-1.0, 1.0);
             }
-            let x = random_vec(&mut rng, cfg.hidden, 2.0);
+            let x = random_vec(rng, cfg.hidden, 2.0);
             let r = w.route(&cfg, &x)?;
             assert_eq!(r.topk_idx.len(), cfg.num_activated);
             assert_eq!(r.topk_weights.len(), cfg.num_activated);
@@ -445,7 +445,7 @@ mod tests {
         };
         // Group scores are the max member score: make group 1 win.
         w.gate[4 * 2] = 3.0; // expert 4 → sigmoid(3) ≈ 0.953
-        w.gate[0 * 2] = 1.0; // expert 0 → sigmoid(1) ≈ 0.731
+        w.gate[0] = 1.0; // expert 0 (gate row 0, col 0) → sigmoid(1) ≈ 0.731
         let x = vec![1.0, 0.0];
         let r = w.route(&cfg, &x).unwrap();
         assert_eq!(r.topk_idx, vec![4, 5, 6, 7], "all of group 1 selected");
@@ -487,7 +487,7 @@ mod tests {
     fn route_is_deterministic_and_ties_break_low() {
         let (cfg, mut w) = hand_router();
         // Equal scores for experts 0 and 1 → tie broken by lower id.
-        w.gate[0 * 4] = 1.5;
+        w.gate[0] = 1.5; // expert 0, hidden dim 0
         let x = vec![1.0, 0.0, 0.0, 0.0];
         let cfg_no_bias = MoeConfig {
             use_noaux_tc_bias: false,
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn route_batch_matches_route() {
-        prop("route_batch == route", 0x1208, 100, |i, mut rng| {
+        prop("route_batch == route", 0x1208, 100, |i, rng| {
             let cfg = MoeConfig {
                 hidden: rng.uniform_usize(1, 6),
                 intermediate: 2,
@@ -526,12 +526,12 @@ mod tests {
                 num_activated: rng.uniform_usize(1, cfg.num_routed + 1),
                 ..cfg
             };
-            let mut w = MoeWeights::from_config(&cfg, &mut rng);
+            let mut w = MoeWeights::from_config(&cfg, rng);
             for b in w.gate_bias.iter_mut() {
                 *b = rng.uniform_f32(-1.0, 1.0);
             }
             let tokens = rng.uniform_usize(1, 6);
-            let xs = random_vec(&mut rng, tokens * cfg.hidden, 2.0);
+            let xs = random_vec(rng, tokens * cfg.hidden, 2.0);
             let batch = w.route_batch(&cfg, &xs, tokens)?;
             for t in 0..tokens {
                 let one = w.route(&cfg, &xs[t * cfg.hidden..(t + 1) * cfg.hidden])?;

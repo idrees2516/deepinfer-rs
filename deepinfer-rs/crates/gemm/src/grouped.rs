@@ -296,7 +296,7 @@ mod tests {
         let (aq, asf) = quantize_per_token_group(&a, k, 128)?;
         let mut m_indices = Vec::with_capacity(m);
         for &g in layout {
-            m_indices.extend(std::iter::repeat(g).take(128));
+            m_indices.extend(std::iter::repeat_n(g, 128));
         }
         let out = m_grouped_fp8_gemm_nt_contiguous(
             &aq, &asf, &bq_all, &bsf_all, &m_indices, m, n, k, num_groups,
@@ -361,7 +361,7 @@ mod tests {
         // Non-contiguous rows: group 0, then 1, then 0, then 1.
         let mut mi = Vec::new();
         for &g in &[0u32, 1, 0, 1] {
-            mi.extend(std::iter::repeat(g).take(128));
+            mi.extend(std::iter::repeat_n(g, 128));
         }
         assert!(m_grouped_fp8_gemm_nt_contiguous(&aq, &asf, &bq, &bsf, &mi, 256, n, k, num_groups).is_err());
         // k not a multiple of 128.

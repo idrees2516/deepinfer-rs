@@ -38,6 +38,12 @@ pub struct Dfa {
 
 impl Dfa {
     /// Number of states.
+    /// Whether the DFA has no states.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of DFA states.
     pub fn len(&self) -> usize {
         self.trans.len()
     }

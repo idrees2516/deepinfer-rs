@@ -93,7 +93,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[macro_export]
 macro_rules! ensure {
     ($cond:expr, $variant:ident, $($fmt:tt)*) => {
-        if !($cond) {
+        // The empty-then form (rather than `if !($cond)`) keeps the
+        // negated-comparison lint quiet at the macro definition.
+        if ($cond) {
+            // condition holds
+        } else {
             return Err($crate::Error::$variant(format!($($fmt)*)));
         }
     };

@@ -8,20 +8,20 @@ use crate::hook::EpHook;
 /// receive counts, completion hook).
 ///
 /// * [`dispatch`](crate::dispatch) returns the **sender-side** handle:
-///     `token_slots` lists **all** `(token, k)` pairs of the sender's batch
-///     in the sender's row order (`(t asc, k asc)` — row-major over
-///     `[tokens, k]`), so slot `i` corresponds to `topk_idx[i]` /
-///     `topk_weights[i]`, and `recv_counts_per_expert[e]` counts the
-///     sender's slots routed to expert `e` (length `num_experts`).
+///   `token_slots` lists **all** `(token, k)` pairs of the sender's batch
+///   in the sender's row order (`(t asc, k asc)` — row-major over
+///   `[tokens, k]`), so slot `i` corresponds to `topk_idx[i]` /
+///   `topk_weights[i]`, and `recv_counts_per_expert[e]` counts the
+///   sender's slots routed to expert `e` (length `num_experts`).
 /// * [`recv`](crate::recv) returns a **receiver-side mirror** inside
-///     [`DispatchResult`](crate::DispatchResult): `src_rank` is the
-///     receiving rank, the slots are the true (unpadded) received rows in
-///     receive order, and `recv_counts_per_expert` holds the true
-///     per-expert receive counts.
+///   [`DispatchResult`](crate::DispatchResult): `src_rank` is the
+///   receiving rank, the slots are the true (unpadded) received rows in
+///   receive order, and `recv_counts_per_expert` holds the true
+///   per-expert receive counts.
 /// * [`low_latency_dispatch`](crate::low_latency_dispatch) returns the
-///     receiver-side mirror for the masked layout:
-///     `recv_counts_per_expert` has `num_local_experts` entries (the
-///     `masked_m` counts).
+///   receiver-side mirror for the masked layout:
+///   `recv_counts_per_expert` has `num_local_experts` entries (the
+///   `masked_m` counts).
 ///
 /// `token_slots` is `Vec<(u32, u32)>` — `(token index in the sender batch,
 /// k index)` per row — which is the pair encoding the SPEC's field comment

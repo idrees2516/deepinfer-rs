@@ -8,13 +8,24 @@
 //!   residual add, f32↔bf16 casts
 //! * quantization: per-token-group E4M3+UE8M0 (DeepGEMM activation recipe),
 //!   FlashMLA V4.1 FP8 (528 B) and FP4 (288 B) KV-cache row encoders
-//! * GEMM: BF16 NT and FP8 block-scaled NT (dense + grouped-contiguous),
+//! * GEMM: BF16 / **F32 reference** / FP8 block-scaled NT (dense +
+//!   grouped-contiguous + **grouped-masked** for CUDA-graph MoE),
 //!   DeepGEMM semantics (activations 1×128, weights 128×128)
 //! * attention: FlashMLA decode (split-KV online softmax + combine, all
-//!   three KV cache formats, attn_sink) and prefill (dense causal / sparse)
+//!   three KV cache formats, attn_sink, and a **dedicated FP4-cache decode
+//!   kernel**), prefill (dense causal / sparse / device-scalar dense)
 //! * DSA: lightning indexer (per-head RMSNorm, lightning quant, thunder
 //!   logits), cascade conv branch, gating, deterministic block top-K
-//! * MoE: sigmoid + noaux-tc routing, aligned dispatch (permute), combine
+//! * MoE: sigmoid + noaux-tc routing, aligned dispatch (permute) and
+//!   masked capacity dispatch (graph-safe), combine
+//! * decode: the **`_dev` kernel family** — every scalar that changes
+//!   between decode steps (sequence length, cache write rows, attention
+//!   window starts) is read from device memory, so a whole decode step can
+//!   be captured into a CUDA/HIP graph and replayed across sequence growth
+//!   (bit-identical to the eager launches)
+//! * peer: NVLink / Infinity Fabric **peer collectives for expert
+//!   parallelism** — all-to-all FP8 dispatch and weighted combine over
+//!   `memcpy_peer_async` with event barriers
 //!
 //! Numerics are ports of the CPU reference crates (`deepinfer-core`
 //! bit-exact codecs; `deepinfer-gemm` / `-mla` / `-dsa` / `-moe` semantics)
@@ -31,8 +42,14 @@ mod elementwise;
 mod gemm;
 mod attention;
 mod dsamoe;
+mod decode;
+mod peer;
 
+pub use attention::DECODE_CHUNK;
+pub use decode::{fanout_params, DecodeParams, StepGeometry};
 pub use elementwise::CacheFormat;
+pub use gemm::GemmDType;
+pub use peer::{build_send_plan, PeerMesh, SendPlan};
 
 /// Embedded kernel sources (one translation unit per group).
 pub mod source {
@@ -40,14 +57,21 @@ pub mod source {
     pub const COMMON: &str = include_str!("../kernels/common.cuh");
     /// Norms, RoPE, activations, quantization, KV-cache encode.
     pub const ELEMENTWISE: &str = include_str!("../kernels/elementwise.cu");
-    /// Dense / grouped FP8 + BF16 NT GEMMs.
+    /// Dense / grouped FP8 + BF16 + F32 NT GEMMs (incl. the masked
+    /// graph-safe grouped GEMM).
     pub const GEMM: &str = include_str!("../kernels/gemm.cu");
-    /// MLA decode (split-KV + combine) and prefill.
+    /// MLA decode (split-KV + combine, dedicated FP4 path, device-scalar
+    /// dense) and prefill (dense causal / sparse).
     pub const ATTENTION: &str = include_str!("../kernels/attention.cu");
     /// DSA lightning indexer, conv branch, gate, top-K.
     pub const DSA: &str = include_str!("../kernels/dsa.cu");
-    /// MoE routing, dispatch, combine, fills.
+    /// MoE routing, dispatch (aligned + masked), combine, fills.
     pub const MOE: &str = include_str!("../kernels/moe.cu");
+    /// Device-resident decode parameter block layout (ABI with the Rust
+    /// mirror in `decode.rs`).
+    pub const DECODE_PARAMS: &str = include_str!("../kernels/decode_params.h");
+    /// The graph-replayable `_dev` decode kernel family.
+    pub const DECODE: &str = include_str!("../kernels/decode.cu");
 }
 
 /// Compile a module group for `device` (goes through the JIT disk cache).
@@ -73,6 +97,7 @@ pub struct Kernels {
     m_att: Module,
     m_dsa: Module,
     m_moe: Module,
+    m_dec: Module,
     cache: Mutex<HashMap<&'static str, Function>>,
 }
 
@@ -86,19 +111,21 @@ impl std::fmt::Debug for Kernels {
 }
 
 impl Kernels {
-    /// JIT-compile (or cache-load) all five module groups.
+    /// JIT-compile (or cache-load) all six module groups.
     pub fn new(device: &Device) -> Result<Kernels> {
         let cu = format!("{}\n{}", source::COMMON, source::ELEMENTWISE);
         let cg = format!("{}\n{}", source::COMMON, source::GEMM);
         let ca = format!("{}\n{}", source::COMMON, source::ATTENTION);
         let cd = format!("{}\n{}", source::COMMON, source::DSA);
         let cm = format!("{}\n{}", source::COMMON, source::MOE);
+        let ck = format!("{}\n{}\n{}", source::COMMON, source::DECODE_PARAMS, source::DECODE);
         let k = Kernels {
             m_elem: build_module(device, "elementwise", &cu)?,
             m_gemm: build_module(device, "gemm", &cg)?,
             m_att: build_module(device, "attention", &ca)?,
             m_dsa: build_module(device, "dsa", &cd)?,
             m_moe: build_module(device, "moe", &cm)?,
+            m_dec: build_module(device, "decode", &ck)?,
             device: device.clone(),
             cache: Mutex::new(HashMap::new()),
         };
@@ -117,6 +144,18 @@ impl Kernels {
             return Ok(f.clone());
         }
         let module = match name {
+            // The graph-replayable decode family lives in its own module.
+            // Matched FIRST: several of its names share prefixes with the
+            // prefill kernels (di_kv_encode_*, di_lightning_*, di_conv_*).
+            n if n.starts_with("di_step_params")
+                || n.starts_with("di_pos_fill")
+                || n.starts_with("di_append")
+                || n.ends_with("_dev_kernel") =>
+            {
+                &self.m_dec
+            }
+            n if n.starts_with("di_gather_rows") => &self.m_att,
+            n if n.starts_with("di_silu_mul_masked") => &self.m_moe,
             n if n.starts_with("di_rmsnorm")
                 || n.starts_with("di_rope")
                 || n.starts_with("di_silu")
@@ -198,10 +237,12 @@ mod tests {
             ("attention", source::ATTENTION),
             ("dsa", source::DSA),
             ("moe", source::MOE),
+            ("decode", source::DECODE),
         ] {
             assert!(s.len() > 1000, "{name} source suspiciously short");
             assert!(s.contains("extern \"C\" __global__"), "{name} has no kernels");
         }
+        assert!(source::DECODE_PARAMS.contains("DP_COUNT"));
     }
 
     #[test]
@@ -214,8 +255,83 @@ mod tests {
             source::ATTENTION,
             source::DSA,
             source::MOE,
+            source::DECODE_PARAMS,
+            source::DECODE,
         ] {
             assert!(!s.contains("size_t"), "size_t leaked into device source");
+        }
+    }
+
+    #[test]
+    fn decode_module_routing_is_unambiguous() {
+        // Every kernel defined in decode.cu must route to the decode module
+        // under the match rules in `Kernels::f` (suffix `_dev_kernel` or the
+        // three dev-specific prefixes); shared-name prefill kernels must
+        // keep routing to their original modules.
+        for k in [
+            "di_step_params_kernel",
+            "di_pos_fill_kernel",
+            "di_kv_encode_fp8_dev_kernel",
+            "di_kv_encode_fp4_dev_kernel",
+            "di_append_row_kernel",
+            "di_append_norm_row_kernel",
+            "di_lightning_block_zero_dev_kernel",
+            "di_lightning_amax_dev_kernel",
+            "di_lightning_finalize_dev_kernel",
+            "di_lightning_quant_dev_kernel",
+            "di_thunder_logits_dev_kernel",
+            "di_dot_scores_dev_kernel",
+            "di_gate_blend_dev_kernel",
+            "di_causal_window_clip_dev_kernel",
+            "di_block_preselect_dev_kernel",
+            "di_conv_feat_dev_kernel",
+            "di_conv_gated_norm_dev_kernel",
+        ] {
+            assert!(source::DECODE.contains(k), "decode.cu lost {k}");
+            let routed = k.starts_with("di_step_params")
+                || k.starts_with("di_pos_fill")
+                || k.starts_with("di_append")
+                || k.ends_with("_dev_kernel");
+            assert!(routed, "{k} would not route to the decode module");
+        }
+        // Prefill twins keep their original routing.
+        for (k, is_dsa) in [
+            ("di_kv_encode_fp8_kernel", false),
+            ("di_lightning_quant_kernel", true),
+            ("di_conv_feat_kernel", true),
+            ("di_causal_clip_kernel", true),
+            ("di_block_preselect_kernel", true),
+            ("di_dot_scores_kernel", true),
+        ] {
+            let routed_dev = k.starts_with("di_step_params")
+                || k.starts_with("di_pos_fill")
+                || k.starts_with("di_append")
+                || k.ends_with("_dev_kernel");
+            assert!(!routed_dev, "{k} would be misrouted to the decode module");
+            let _ = is_dsa;
+        }
+        // The masked-silu / gather kernels route where they are defined.
+        assert!(source::MOE.contains("di_silu_mul_masked_kernel"));
+        assert!(source::ATTENTION.contains("di_gather_rows_kernel"));
+    }
+
+    #[test]
+    fn all_launched_kernel_names_are_defined() {
+        // Every kernel name referenced by the launcher modules must exist
+        // in exactly one embedded source (guards against typos drifting in
+        // between the .cu files and the Rust sides).
+        let rust_sources = [
+            (elementwise::KERNEL_NAMES, source::ELEMENTWISE),
+            (gemm::KERNEL_NAMES, source::GEMM),
+            (attention::KERNEL_NAMES, source::ATTENTION),
+            (dsamoe::KERNEL_NAMES, source::DSA),
+            (dsamoe::MOE_KERNEL_NAMES, source::MOE),
+            (decode::KERNEL_NAMES, source::DECODE),
+        ];
+        for (names, src) in rust_sources {
+            for k in names {
+                assert!(src.contains(k), "{k} missing from its module source");
+            }
         }
     }
 }

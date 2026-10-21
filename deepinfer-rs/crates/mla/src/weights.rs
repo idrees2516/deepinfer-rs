@@ -593,19 +593,19 @@ mod tests {
         // Empty kv_norm -> no derivable head_dim.
         let mut bad = w.clone();
         bad.kv_norm = Vec::new();
-        assert!(bad.project_q(&vec![0.0; 32], 1, &mut vec![0.0; 4 * 64]).is_err());
+        assert!(bad.project_q(&[0.0; 32], 1, &mut vec![0.0; 4 * 64]).is_err());
         // kv_a_proj not divisible by head_dim.
         let mut bad = w.clone();
         bad.kv_a_proj.push(0.1);
-        assert!(bad.project_kv(&vec![0.0; 32], 1, &mut vec![0.0; 64]).is_err());
+        assert!(bad.project_kv(&[0.0; 32], 1, &mut vec![0.0; 64]).is_err());
         // o_groups that does not divide n_heads (wo len implies 3 groups).
         let mut bad = w.clone();
         bad.wo_proj = vec![0.01f32; cfg.hidden_size * 3 * cfg.o_lora_rank];
-        assert!(bad.project_o(&vec![0.0; 4 * 64], 1, &mut vec![0.0; 32]).is_err());
+        assert!(bad.project_o(&vec![0.0; 4 * 64], 1, &mut [0.0; 32]).is_err());
         // q_norm length mismatch.
         let mut bad = w.clone();
         bad.q_norm = Some(vec![1.0f32; cfg.q_lora_rank + 1]);
-        assert!(bad.project_q(&vec![0.0; 32], 1, &mut vec![0.0; 4 * 64]).is_err());
+        assert!(bad.project_q(&[0.0; 32], 1, &mut vec![0.0; 4 * 64]).is_err());
     }
 
     #[test]

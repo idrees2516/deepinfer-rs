@@ -60,10 +60,7 @@ fn ue8m0_scale_byte(amax: f32) -> u8 {
     }
     // amax / 448 is finite and positive for every finite amax > 0, so the
     // Err branch is unreachable; keep it as a defensive no-panic fallback.
-    match f32_to_e8m0(amax / E4M3_MAX, E8M0Round::Ceil) {
-        Ok(byte) => byte,
-        Err(_) => 0,
-    }
+    f32_to_e8m0(amax / E4M3_MAX, E8M0Round::Ceil).unwrap_or_default()
 }
 
 /// Maps `NaN` to `+0` before value quantization (documented no-panic

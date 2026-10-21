@@ -39,7 +39,7 @@ pub struct MlaConfig {
     pub n_heads: usize,
     /// Absorbed per-head query / KV-cache width (V4.1: 512 = 448 latent
     /// + 64 rope dims; `Q_b` folds `W_UK` in, so queries and cached KV
-    /// share this width).
+    ///   share this width).
     pub head_dim: usize,
     /// Rotated dims per head row (V4.1: 64, interleaved style, occupying
     /// the LAST `rope_dim` dims of each row).

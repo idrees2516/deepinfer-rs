@@ -73,6 +73,33 @@ pub(crate) type FnModuleLaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> HipResult;
 
+// ---- Events ----------------------------------------------------------------
+pub(crate) type FnEventCreate = unsafe extern "C" fn(*mut Handle) -> HipResult;
+pub(crate) type FnEventRecord = unsafe extern "C" fn(Handle, Handle) -> HipResult;
+pub(crate) type FnEventSynchronize = unsafe extern "C" fn(Handle) -> HipResult;
+pub(crate) type FnEventDestroy = unsafe extern "C" fn(Handle) -> HipResult;
+pub(crate) type FnStreamWaitEvent = unsafe extern "C" fn(Handle, Handle, u32) -> HipResult;
+
+// ---- Async device-to-device copy -------------------------------------------
+pub(crate) type FnMemcpyDtoDAsync =
+    unsafe extern "C" fn(*mut c_void, *const c_void, usize, Handle) -> HipResult;
+
+// ---- HIP Graphs (stream capture; ROCm >= 5.7) -------------------------------
+pub(crate) type FnGraphDestroy = unsafe extern "C" fn(Handle) -> HipResult;
+/// `hipStreamCaptureMode`: 0 = GLOBAL, 1 = THREAD_LOCAL, 2 = RELAXED (same
+/// numbering as CUDA).
+pub(crate) type FnStreamBeginCapture = unsafe extern "C" fn(Handle, i32) -> HipResult;
+pub(crate) type FnStreamEndCapture = unsafe extern "C" fn(Handle, *mut Handle) -> HipResult;
+/// `hipGraphInstantiateWithFlags` — the arity-stable instantiation entry
+/// point (plain `hipGraphInstantiate` changed arity across ROCm versions).
+pub(crate) type FnGraphInstantiateWithFlags =
+    unsafe extern "C" fn(*mut Handle, Handle, u64) -> HipResult;
+pub(crate) type FnGraphLaunch = unsafe extern "C" fn(Handle, Handle) -> HipResult;
+pub(crate) type FnGraphExecDestroy = unsafe extern "C" fn(Handle) -> HipResult;
+
+/// `hipStreamCaptureModeRelaxed`.
+pub(crate) const HIP_STREAM_CAPTURE_MODE_RELAXED: i32 = 2;
+
 /// HIP runtime entry points bound to one open `libamdhip64`.
 pub struct Hip {
     #[allow(dead_code)]
@@ -101,6 +128,20 @@ pub struct Hip {
     pub(crate) module_unload: FnModuleUnload,
     pub(crate) module_get_function: FnModuleGetFunction,
     pub(crate) module_launch_kernel: FnModuleLaunchKernel,
+    // Optional entries (events, async DtoD, graphs): present on ROCm 6/7;
+    // resolved with sym_opt so older stacks still load.
+    pub(crate) event_create: Option<FnEventCreate>,
+    pub(crate) event_record: Option<FnEventRecord>,
+    pub(crate) event_synchronize: Option<FnEventSynchronize>,
+    pub(crate) event_destroy: Option<FnEventDestroy>,
+    pub(crate) stream_wait_event: Option<FnStreamWaitEvent>,
+    pub(crate) memcpy_dtod_async: Option<FnMemcpyDtoDAsync>,
+    pub(crate) graph_destroy: Option<FnGraphDestroy>,
+    pub(crate) stream_begin_capture: Option<FnStreamBeginCapture>,
+    pub(crate) stream_end_capture: Option<FnStreamEndCapture>,
+    pub(crate) graph_instantiate: Option<FnGraphInstantiateWithFlags>,
+    pub(crate) graph_launch: Option<FnGraphLaunch>,
+    pub(crate) graph_exec_destroy: Option<FnGraphExecDestroy>,
 }
 
 impl Hip {
@@ -134,6 +175,18 @@ impl Hip {
                 module_unload: lib.sym("hipModuleUnload")?,
                 module_get_function: lib.sym("hipModuleGetFunction")?,
                 module_launch_kernel: lib.sym("hipModuleLaunchKernel")?,
+                event_create: lib.sym_opt("hipEventCreate")?,
+                event_record: lib.sym_opt("hipEventRecord")?,
+                event_synchronize: lib.sym_opt("hipEventSynchronize")?,
+                event_destroy: lib.sym_opt("hipEventDestroy")?,
+                stream_wait_event: lib.sym_opt("hipStreamWaitEvent")?,
+                memcpy_dtod_async: lib.sym_opt("hipMemcpyDtoDAsync")?,
+                graph_destroy: lib.sym_opt("hipGraphDestroy")?,
+                stream_begin_capture: lib.sym_opt("hipStreamBeginCapture")?,
+                stream_end_capture: lib.sym_opt("hipStreamEndCapture")?,
+                graph_instantiate: lib.sym_opt("hipGraphInstantiateWithFlags")?,
+                graph_launch: lib.sym_opt("hipGraphLaunch")?,
+                graph_exec_destroy: lib.sym_opt("hipGraphExecDestroy")?,
                 lib,
             })
         }
