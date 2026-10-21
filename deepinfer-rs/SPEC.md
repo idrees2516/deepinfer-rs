@@ -900,3 +900,36 @@ Work Log:
 Stage Summary:
 - <public API implemented, tests passing count, deviations from spec (if any)>
 ```
+
+## Appendix: GPU crates (wave 3)
+
+### deepinfer-gpu (deps: core)
+
+Runtime-loaded device layer. dlopen + typed FFI (CUDA driver, NVRTC, HIP,
+hipRTC), unified `Gpu/Device/Stream/Buffer/Module/Function/KernelArgs`,
+arch detection (NV cc -> `sm_XXX`; AMD gcnArchName buffer-scan ->
+`gfxXXXX`, `DEEPINFER_HIP_ARCH` override), PTX fallback for old-NVRTC/new-
+GPU, SHA-256 content-addressed JIT disk cache (`DEEPINFER_JIT_CACHE`,
+`DEEPINFER_JIT_DEBUG`, `DEEPINFER_CACHE_DIR`), peer access + async peer
+copy. The ONLY crate with `unsafe` (audited modules: dl, ffi/*, device,
+jit — `deny` + `#[allow(unsafe_code)]` with SAFETY proofs, since workspace
+`forbid` cannot be overridden).
+
+```rust
+pub fn probe_backends() -> Vec<Backend>;
+impl Gpu { pub fn new(Backend) -> Result<Gpu>; pub fn device_count(); pub fn device(usize) -> Result<Device>; }
+impl Device { props(); stream(); alloc(); alloc_from(); write(); read(); load_module(); enable_peer_access(); memcpy_peer_async(); }
+pub fn compile(device, source, name, arch, opts) -> Result<KernelImage>;
+```
+
+### deepinfer-kernels (deps: core, gpu; dev: fp8, gemm, mla, moe, dsa)
+
+Operator library: embedded CUDA/HIP C++ (`kernels/*.cu`, one source for
+both compilers) + typed launchers `Kernels::{rmsnorm, rope, silu_mul, add,
+quant_per_token_group, kv_encode_fp8/fp4, gemm_bf16_nt, gemm_fp8_nt,
+gemm_fp8_grouped_nt, mla_decode_partial/combine, mla_prefill,
+indexer_rmsnorm_per_head, lightning_quant, thunder_logits, conv_feat,
+conv_gated_norm, dot_scores, qmean, gate_logits, gate_blend, causal_clip,
+select_top_k, moe_route, moe_dispatch, moe_combine, fill_zero}`.
+Golden integration tests vs the CPU crates (auto-skip without a device).
+See docs/GPU.md for the full contract, precision policy and upgrade paths.

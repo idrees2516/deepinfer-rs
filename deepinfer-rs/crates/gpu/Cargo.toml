@@ -1,0 +1,25 @@
+[package]
+name = "deepinfer-gpu"
+description = "Runtime-loaded GPU device layer for DeepInfer-rs: CUDA driver + NVRTC and HIP + hipRTC via dlopen, unified Device/Stream/Buffer/Module abstraction, and a content-addressed JIT cache. No build-time CUDA/HIP requirement."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["deepseek", "cuda", "hip", "rocm", "jit"]
+categories = ["science"]
+
+[dependencies]
+deepinfer-core = { path = "../core" }
+
+# NOTE: this crate deliberately does NOT inherit the workspace lints.
+# The workspace sets `unsafe_code = "forbid"`, which cannot be overridden at
+# module level. This crate contains the ONE audited unsafe boundary of the
+# workspace: the FFI shims in `src/ffi/*` and the dlopen loader. We use
+# `deny` + per-module `#[allow(unsafe_code)]` with SAFETY proofs instead.
+# Every other crate keeps `forbid`. See docs/GPU.md "Safety model".
+[lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+missing_docs = "warn"

@@ -328,7 +328,7 @@ impl ModelConfig {
             ("quant_block", self.dsa.quant_block),
         ] {
             ensure!(
-                v >= 1 && v <= MAX_WINDOW,
+                (1..=MAX_WINDOW).contains(&v),
                 OutOfRange,
                 "dsa.{name} must be in [1, {MAX_WINDOW}] (got {v})"
             );
@@ -345,7 +345,7 @@ impl ModelConfig {
         );
         if let Some(xw) = self.dsa.extrapolation_window {
             ensure!(
-                xw >= 1 && xw <= MAX_WINDOW,
+                (1..=MAX_WINDOW).contains(&xw),
                 OutOfRange,
                 "dsa.extrapolation_window must be in [1, {MAX_WINDOW}] (got {xw})"
             );

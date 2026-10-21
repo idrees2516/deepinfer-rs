@@ -14,6 +14,7 @@
 //! occupy `0..n_self`, cross-decoder layers `n_self..n_layers`.
 
 use std::collections::HashSet;
+#[cfg(test)]
 use std::path::Path;
 
 use deepinfer_core::safetensors::CheckpointDir;

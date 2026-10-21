@@ -315,9 +315,7 @@ impl DeepSeekModel {
                 cfg.vocab_size
             );
         }
-        if !self.seqs.contains_key(&seq) {
-            self.seqs.insert(seq, SeqState::new(cfg));
-        }
+        self.seqs.entry(seq).or_insert_with(|| SeqState::new(cfg));
         let pos0 = self
             .seqs
             .get(&seq)

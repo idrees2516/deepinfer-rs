@@ -144,6 +144,14 @@ impl Rope {
         self.max_pos
     }
 
+    /// Read-only access to the flat cos/sin table
+    /// `[max_pos][dim/2][2]` (cos first). Used by GPU launchers to upload
+    /// the precomputed table to a device — the YaRN math itself never runs
+    /// on the device.
+    pub fn cos_sin_table(&self) -> &[f32] {
+        &self.cos_sin
+    }
+
     /// Attention-logit scale factor implied by YaRN (`mscale`), or 1.0.
     pub fn attention_factor(&self) -> f64 {
         match &self.scaling {

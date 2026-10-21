@@ -93,3 +93,15 @@ Apache License 2.0, matching upstream DeepInfer.
   howpublished = {\url{https://github.com/deepseek-ai/DeepInfer}},
 }
 ```
+
+## GPU inference (GB200 NVL72 / GB300 / AMD MI335X)
+
+`deepinfer-gpu` + `deepinfer-kernels` add the GPU plane on top of the CPU
+reference: runtime-dlopened CUDA/HIP (zero build-time GPU deps), NVRTC/
+hipRTC JIT with a content-addressed disk cache, and the complete operator
+inventory for V4.1-Flash inference (FP8/BF16 GEMMs incl. grouped-contiguous
+MoE, FlashMLA decode split-KV with FP8/FP4 KV caches, DSA lightning indexer
++ block top-K, MoE routing/dispatch/combine, RoPE/O-RoPE, quantization).
+Numerics are golden-tested against the CPU crates on-device. Targets:
+sm_100 (B200), sm_103 (B300), gfx942/gfx950 (Instinct). Details, safety
+model and upgrade paths: [docs/GPU.md](docs/GPU.md).
