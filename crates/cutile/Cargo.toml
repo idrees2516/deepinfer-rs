@@ -1,0 +1,47 @@
+[package]
+name = "deepinfer-cutile"
+description = "Pure-Rust GPU kernel layer for DeepInfer-rs built on NVIDIA CUDA Rust (cutile): BF16/FP8 block-scaled GEMMs (mmaf_scaled, DeepGEMM recipe), MLA prefill + paged split-KV decode (FlashMLA semantics, FP8/FP4 caches), DSA lightning indexer + exact top-K select, MoE route/dispatch/combine, RMSNorm/RoPE/quantization, KV-cache append and sampling — all kernels authored in Rust, JIT-compiled through CUDA Tile IR for GB200 NVL72 / GB300 (sm_100/sm_103) and Ampere..Blackwell consumer GPUs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["deepseek", "cuda-rust", "cutile", "gpu", "inference"]
+categories = ["science"]
+
+[features]
+default = []
+# The cutile backend requires, at *build* time only, a CUDA 13.x toolkit
+# (headers, for cuda-bindings' bindgen) and libclang. Kernels are JIT-compiled
+# to cubin at first launch on the target GPU (CUDA 13.3+ recommended for
+# block-scaled MMA). See scripts/gpu-env.sh for a hermetic toolchain prefix.
+cuda = ["dep:cutile"]
+
+[dependencies]
+deepinfer-core = { path = "../core" }
+
+[dependencies.cutile]
+version = "0.4"
+optional = true
+
+[dev-dependencies]
+deepinfer-fp8 = { path = "../fp8" }
+deepinfer-gemm = { path = "../gemm" }
+deepinfer-mla = { path = "../mla" }
+deepinfer-moe = { path = "../moe" }
+deepinfer-dsa = { path = "../dsa" }
+deepinfer-sampler = { path = "../sampler" }
+
+# NOTE: this crate deliberately does NOT inherit the workspace lints.
+# The workspace sets `unsafe_code = "forbid"`, which cannot coexist with
+# cuTile kernel entry points: `#[cutile::entry(unchecked_accesses = true)]`
+# generates `unsafe fn` kernels (the Tile-IR safety waiver) and the host
+# launchers call them through `unsafe` blocks. We mirror deepinfer-gpu's
+# policy instead: `deny` + per-module `#[allow(unsafe_code)]` with SAFETY
+# proofs, so every unsafe block in this crate is individually justified.
+# All public host APIs remain safe; see docs/GPU.md "Safety model".
+[lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+missing_docs = "warn"

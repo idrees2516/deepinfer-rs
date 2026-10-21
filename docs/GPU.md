@@ -181,3 +181,102 @@ DEEPINFER_JIT_DEBUG=1 cargo test ...            # trace JIT compiles
 Requirements: NVIDIA driver >= 550 (R580+ for B300) with `libnvrtc`
 (CUDA 12.4+; 12.9+ for `sm_103` cubins), or ROCm 6/7 with `libamdhip64` +
 `libhiprtc`. Nothing needs to be installed to *build*.
+
+---
+
+## The cuTile backend (`deepinfer-cutile`) — kernels authored in Rust
+
+**Status: primary NVIDIA path.** Since NVIDIA's CUDA Rust launch (Sep 2026),
+every operator above also exists as a *pure-Rust kernel* in
+[`crates/cutile`](../crates/cutile), built on [cuTile Rust] (`cutile` 0.4,
+stable toolchain): kernels are `#[cutile::module]` DSL functions compiled to
+CUDA Tile IR by the cuTile proc-macro and JIT-assembled to GPU code at first
+launch (`tileiras`). **No C/C++ source, no NVRTC, no `nvcc`** — the entire
+kernel stack is Rust that type-checks on the host and JITs on the device.
+The NVRTC/hipRTC crate (`deepinfer-kernels`) remains for AMD MI335X, where
+no CUDA Rust path exists.
+
+### Why cuTile
+
+* **Tile programming model** — the compiler (not the kernel author) maps
+  tiles to warps/tensor cores per architecture, so the same source targets
+  sm_80 … sm_121, tuned for **sm_100 (GB200 NVL72)** and
+  **sm_103 (GB300/B300 NVL72)**.
+* **Block-scaled MMA** — `mmaf_scaled` (E4M3 operands + UE8M0 scales at
+  32-lane granularity) is Blackwell's native tcgen05 MXFP8 path, the same
+  numeric contract as DeepGEMM's SM100 recipe: activations 1×128, weights
+  128×128, UE8M0 bytes replicated ×4 (host-side via `deepinfer_cutile::pack`
+  for weights, by `quant_fp8_block128` on device for activations).
+* **Safety model** — Rust ownership across the launch boundary: mutable
+  outputs are partitioned, inputs shared. The Tile-IR `unchecked_accesses`
+  waiver is confined to the hot kernels, and every wrapper in
+  `deepinfer_cutile::ops` re-validates shapes before launching (the same
+  `deny` + `#[allow]` + SAFETY-proof policy as the audited FFI in
+  `deepinfer-gpu`).
+
+### Kernel inventory (one-to-one with the CPU crates)
+
+| Area | Kernels |
+|---|---|
+| Elementwise/norm | `add_bf16`, `silu_mul_bf16`, `sigmoid_mul_f32`, `gather_rows_bf16`, `rms_norm_bf16`, `add_rms_norm_bf16` |
+| RoPE | `rope_interleaved` (MLA q/k, non-neox pairs, host `inv_freq` table carries YaRN), `o_rope_conjugate` |
+| Quantization | `quant_fp8_block128`, `quant_fp8_group32`, `quant_fp4_group16`, `dequant_fp8_group32` |
+| GEMM | `bf16_gemm_nt`, `fp8_scaled_gemm_nt` (`mmaf_scaled`), `fp8_grouped_gemm_nt_contiguous` (m_indices), `fp8_grouped_gemm_nt_masked` |
+| Attention | `mla_prefill_flash` (latent-512 + rope-64, causal/gathered, attn-sink ready), `gather_kv_rows`, `mla_decode_splitkv_bf16` / `_fp8` (paged/index-gathered, split-KV), `mla_split_merge` (LSE merge + sink epilogue + empty-window `lse=+inf`) |
+| DSA | `thunder_logits` (weighted-ReLU MQA), `dsa_block_preselect` (top-P per 64-block, position-sorted survivors), `dsa_topk_select` (bit-constructed k-th threshold over the order-preserving u32 key map; exact `(score desc, pos asc)` ties; ascending output, `-1` padding) |
+| MoE | `route_sigmoid_topk` (noaux-tc), `dispatch_count` (atomic histogram), `exclusive_scan`, `dispatch_permute` (BM-aligned segments + reverse map), `combine_gather` |
+| KV cache | `kv_append_bf16`, `kv_append_fp8`, `kv_append_fp4` (paged, per-sequence positions) |
+| Sampling | `argmax_blocks_bf16`, `argmax_final` (ties → lowest) |
+
+### Build & run
+
+Two-plane validation, same as the rest of the workspace:
+
+```bash
+# GPU-less plane (CI/laptop): builds + host tests, no CUDA needed
+cargo test -p deepinfer-cutile
+
+# Build with kernels (needs CUDA 13.x toolkit headers + libclang at BUILD
+# time only — cuda-bindings runs bindgen; kernels JIT at RUNTIME):
+source scripts/gpu-env.sh          # hermetic toolchain prefix recipe
+cargo test -p deepinfer-cutile --features cuda
+
+# On the GPU box (sm_80..sm_121, CUDA 13.3+ driver for block-scaled MMA):
+cargo test -p deepinfer-cutile --features cuda --test golden
+```
+
+`scripts/gpu-env.sh` documents how to assemble the build-time toolchain
+without root (libclang + CUDA headers extracted from .debs into a prefix);
+runtime needs only the driver plus a CUDA 13.3+ toolkit for `tileiras`.
+
+### Numerics & determinism
+
+* Attention accumulates in f32 with `exp2`-based online softmax; LSE is
+  emitted in natural log; empty windows produce zero outputs and
+  `lse = +inf` (CPU-identical).
+* FP8/FP4 scale recipes are bit-level ports of the CPU codecs (Ceil policy
+  with the exact-power-of-two guard; FP4 scale `amax/6` → E4M3 floored at
+  2⁻⁶).
+* DSA selection order is exactly `(score desc, position asc)`, with the
+  two-stage structure arranged so the survivor stream is position-ascending
+  — the compaction scan yields position-sorted output with exact ties.
+* MoE dispatch ranks come from device atomics, so the *intermediate* row
+  order within an expert is scheduling-dependent; the final output is
+  invariant (row-independent GEMM + reverse-map combine) — the same
+  argument as the C++ backend.
+* FP8 GEMM on sm_80/sm_90 errors unless `DEEPINFER_FORCE_BF16_GEMM=1`
+  (documented degrade path).
+
+### Not yet on the cuTile path (tracked follow-ups)
+
+* FP4 KV-cache **decode** (append/quant exist; the in-kernel E2M1 unpack
+  → MMA operand path needs on-device layout validation on Blackwell).
+* `fp8_bmm`/`fp8_einsum` for the FlashMLA fused output path (the
+  split-output `wv|wo` GEMM pair is the current substitute).
+* CUDA-graph capture of the decode step (the `CudaGraph::scope` API is
+  available in `cuda-async`; wiring belongs in the runtime integration).
+* NVLink-domain expert parallelism (peer collectives à la kern's
+  `peer_allreduce`; today's EP story is the same host-orchestrated
+  `memcpy_peer` plan as the C++ backend).
+
+[cuTile Rust]: https://nvidia.github.io/cuda-rust/cutile/

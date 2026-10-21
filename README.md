@@ -5,7 +5,7 @@
 This workspace ports the full DeepInfer release feature set to dependency-free, `unsafe`-free Rust, following the published DeepSeek ground truth (FlashMLA, DSA, DeepGEMM, DeepEP, EPLB repositories and the DeepInfer README) at algorithmic fidelity: every component implements the *exact* upstream math and protocol semantics on CPU, with deterministic numerics.
 
 ```
-cargo test --workspace     # 415 tests, all green
+cargo test --workspace     # 445 tests, all green
 cargo run -p deepinfer-runtime --example offline_inference -- --tiny
 ```
 
@@ -96,12 +96,30 @@ Apache License 2.0, matching upstream DeepInfer.
 
 ## GPU inference (GB200 NVL72 / GB300 / AMD MI335X)
 
-`deepinfer-gpu` + `deepinfer-kernels` add the GPU plane on top of the CPU
-reference: runtime-dlopened CUDA/HIP (zero build-time GPU deps), NVRTC/
-hipRTC JIT with a content-addressed disk cache, and the complete operator
-inventory for V4.1-Flash inference (FP8/BF16 GEMMs incl. grouped-contiguous
-MoE, FlashMLA decode split-KV with FP8/FP4 KV caches, DSA lightning indexer
-+ block top-K, MoE routing/dispatch/combine, RoPE/O-RoPE, quantization).
-Numerics are golden-tested against the CPU crates on-device. Targets:
-sm_100 (B200), sm_103 (B300), gfx942/gfx950 (Instinct). Details, safety
-model and upgrade paths: [docs/GPU.md](docs/GPU.md).
+### Pure-Rust kernels: `deepinfer-cutile` (primary NVIDIA path)
+
+Every inference operator is also implemented **entirely in Rust** on
+[NVIDIA CUDA Rust](https://github.com/NVIDIA/cuda-rust) / [cuTile Rust]
+(https://nvidia.github.io/cuda-rust/cutile/): kernels are `#[cutile::module]`
+DSL functions compiled to CUDA Tile IR and JIT-assembled on the target GPU —
+no C/C++, no NVRTC, no `nvcc`. Targets sm_80 … sm_121, tuned for sm_100
+(GB200 NVL72) and sm_103 (GB300/B300 NVL72). Highlights: FP8 block-scaled
+GEMMs via `mmaf_scaled` (the Blackwell tcgen05 MXFP8 path, DeepGEMM's
+1×128/128×128 UE8M0 recipe), MLA prefill flash + paged split-KV decode
+(BF16 and FP8 KV caches, attn-sink, exact LSE semantics), DSA thunder
+indexer with exact `(score desc, pos asc)` top-K, noaux-tc MoE
+route/dispatch/combine, FP4/FP8 KV appends, and ties-lowest argmax.
+Two-plane validated like everything else: `cargo test -p deepinfer-cutile`
+green without any GPU; `--features cuda` adds the kernels (build-time
+bindgen needs CUDA 13 headers + libclang — see `scripts/gpu-env.sh` for a
+rootless recipe); `--test golden` runs the CPU-reference golden tests on a
+real GPU.
+
+### C++-via-JIT fallback: `deepinfer-gpu` + `deepinfer-kernels`
+
+The earlier GPU plane — runtime-dlopened CUDA/HIP (zero build-time GPU
+deps), NVRTC/hipRTC JIT with a content-addressed disk cache, and the same
+complete operator inventory for V4.1-Flash. This remains the **AMD MI335X**
+path (HIP has no CUDA Rust story). Numerics are golden-tested against the
+CPU crates on-device; targets sm_100/sm_103 and gfx942/gfx950. Details,
+safety model and upgrade paths: [docs/GPU.md](docs/GPU.md).
