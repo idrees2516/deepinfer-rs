@@ -1,0 +1,13 @@
+[package]
+name = "deepinfer-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "deepinfer-scheduler (implementation pending)"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }

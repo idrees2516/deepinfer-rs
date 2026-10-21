@@ -1,0 +1,13 @@
+[package]
+name = "deepinfer-eplb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Expert-parallelism load balancer (EPLB) for DeepInfer-rs: redundant-expert selection, hierarchical/global expert placement and sliding-window load statistics"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }

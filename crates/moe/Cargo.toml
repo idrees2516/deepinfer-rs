@@ -1,0 +1,14 @@
+[package]
+name = "deepinfer-moe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "DeepSeekMoE router (sigmoid + noaux-tc bias, V3.2 grouped experts) and SwiGLU expert compute for DeepInfer-rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }
+deepinfer-gemm = { workspace = true }

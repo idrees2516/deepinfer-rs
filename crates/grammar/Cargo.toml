@@ -1,0 +1,13 @@
+[package]
+name = "deepinfer-grammar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "deepinfer-grammar (implementation pending)"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }

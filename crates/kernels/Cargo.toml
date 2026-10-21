@@ -1,0 +1,25 @@
+[package]
+name = "deepinfer-kernels"
+description = "GPU kernel library for DeepInfer-rs: shared CUDA/HIP C++ sources (JIT-compiled at runtime) plus typed Rust launchers — FP8/BF16 GEMMs, MLA attention, DSA indexer, MoE routing/permute/combine, quantization and elementwise ops. Golden-tested against the CPU reference crates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["deepseek", "cuda", "hip", "gemm", "attention"]
+categories = ["science"]
+
+[dependencies]
+deepinfer-core = { path = "../core" }
+deepinfer-gpu = { path = "../gpu" }
+
+[dev-dependencies]
+deepinfer-fp8 = { path = "../fp8" }
+deepinfer-gemm = { path = "../gemm" }
+deepinfer-mla = { path = "../mla" }
+deepinfer-moe = { path = "../moe" }
+deepinfer-dsa = { path = "../dsa" }
+
+[lints]
+workspace = true

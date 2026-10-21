@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/deepseek-ai/DeepInfer"
+homepage = "https://github.com/deepseek-ai/DeepInfer"
+keywords = ["deepseek", "inference", "llm", "mla", "moe"]
+categories = ["science"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+missing_docs = "warn"
+
+[workspace.dependencies]
+deepinfer-core = { path = "crates/core" }
+deepinfer-fp8 = { path = "crates/fp8" }
+deepinfer-gemm = { path = "crates/gemm" }
+deepinfer-mla = { path = "crates/mla" }
+deepinfer-dsa = { path = "crates/dsa" }
+deepinfer-swa = { path = "crates/swa" }
+deepinfer-moe = { path = "crates/moe" }
+deepinfer-eplb = { path = "crates/eplb" }
+deepinfer-ep = { path = "crates/ep" }
+deepinfer-mtp = { path = "crates/mtp" }
+deepinfer-sampler = { path = "crates/sampler" }
+deepinfer-grammar = { path = "crates/grammar" }
+deepinfer-scheduler = { path = "crates/scheduler" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"

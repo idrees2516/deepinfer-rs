@@ -1,0 +1,15 @@
+[package]
+name = "deepinfer-ep"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "deepinfer-ep (implementation pending)"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }
+deepinfer-fp8 = { workspace = true }
+deepinfer-moe = { workspace = true }

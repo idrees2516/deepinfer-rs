@@ -1,0 +1,14 @@
+[package]
+name = "deepinfer-dsa"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "DeepSeek Sparse Attention (DSA) lightning indexer, top-k selection and mscale — pure-Rust CPU-reference port of DeepInfer"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }
+deepinfer-fp8 = { workspace = true }

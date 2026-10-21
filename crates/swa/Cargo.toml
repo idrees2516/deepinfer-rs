@@ -1,0 +1,13 @@
+[package]
+name = "deepinfer-swa"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "YOCO decoder layout, sliding-window attention ring cache and bounded-replay prefill planning (DeepInfer SWA)"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "deepinfer-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core primitives for DeepInfer-rs: dtypes, tensors, low-precision codecs, deterministic RNG, RoPE/YaRN, RMSNorm, JSON, env config, safetensors, tokenizer, thread pool, property-test harness"
+
+[lints]
+workspace = true
+
+[dependencies]

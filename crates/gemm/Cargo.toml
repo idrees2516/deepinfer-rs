@@ -1,0 +1,14 @@
+[package]
+name = "deepinfer-gemm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "DeepGEMM-equivalent NT GEMM kernels for DeepInfer-rs: dense FP8 with fine-grained UE8M0 scaling, grouped-contiguous/masked MoE GEMMs, the FlashMLA bhr,hdr->bhd epilogue einsum, plus BF16 and f32 golden references"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }
+deepinfer-fp8 = { workspace = true }
