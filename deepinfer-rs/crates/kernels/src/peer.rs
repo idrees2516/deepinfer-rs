@@ -226,6 +226,24 @@ impl PeerMesh {
         &self.streams[r]
     }
 
+    /// Record rank `r`'s barrier event on its stream (the mesh's
+    /// cross-stream ordering primitive, used by the symmetric-EP reset
+    /// barrier and the collectives below).
+    ///
+    /// # Errors
+    /// [`Error::Internal`] on driver rejection.
+    pub fn record(&self, r: usize) -> Result<()> {
+        self.events[r].record(&self.streams[r])
+    }
+
+    /// Make rank `d`'s stream wait for rank `s`'s last recorded event.
+    ///
+    /// # Errors
+    /// [`Error::Internal`] on driver rejection.
+    pub fn wait(&self, d: usize, s: usize) -> Result<()> {
+        self.streams[d].wait_event(&self.devices[d], &self.events[s])
+    }
+
     /// Gathers `rows` rows of `row_bytes` from `src` into `dst` by the
     /// device-resident index list `idx` (`[rows]` u32) on rank `r`'s EP
     /// stream (the packing step of dispatch and of combine).

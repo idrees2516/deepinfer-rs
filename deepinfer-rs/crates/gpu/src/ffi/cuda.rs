@@ -93,6 +93,61 @@ pub(crate) type FnCuGraphInstantiateWithFlags =
 pub(crate) type FnCuGraphLaunch = unsafe extern "C" fn(Handle, Handle) -> CuResult;
 pub(crate) type FnCuGraphExecDestroy = unsafe extern "C" fn(Handle) -> CuResult;
 
+// ---- TMA tensor-map encoding (CUDA >= 12.0) ---------------------------------
+/// `CUtensorMap` is 128 bytes; we treat it as opaque.
+pub(crate) type FnCuTensorMapEncodeTiled = unsafe extern "C" fn(
+    *mut u8, // CUtensorMap*
+    u32,    // CUtensorMapDataType
+    u32,    // tensorRank
+    *mut c_void, // globalAddress
+    *const u64, // globalDim[rank]
+    *const u64, // globalStrides[rank-1] (bytes)
+    *const u32, // boxDim[rank]
+    *const u32, // elementStrides[rank]
+    u32,    // CUtensorMapInterleave
+    u32,    // CUtensorMapSwizzle
+    u32,    // CUtensorMapL2promotion
+    u32,    // CUtensorMapFloatOOBfill
+) -> CuResult;
+
+/// `CUtensorMapDataType` selectors (cuda.h values).
+pub(crate) const TMAP_DTYPE_UINT8: u32 = 0;
+pub(crate) const TMAP_DTYPE_UINT16: u32 = 1;
+pub(crate) const TMAP_DTYPE_UINT32: u32 = 2;
+#[allow(dead_code)] // reserved for future FP16 TMA payloads
+pub(crate) const TMAP_DTYPE_FLOAT16: u32 = 6;
+pub(crate) const TMAP_DTYPE_FLOAT32: u32 = 7;
+pub(crate) const TMAP_DTYPE_BFLOAT16: u32 = 9;
+/// `CUtensorMapInterleave` selectors.
+pub(crate) const TMAP_INTERLEAVE_NONE: u32 = 0;
+/// `CUtensorMapSwizzle` selectors.
+pub(crate) const TMAP_SWIZZLE_NONE: u32 = 0;
+pub(crate) const TMAP_SWIZZLE_32B: u32 = 1;
+pub(crate) const TMAP_SWIZZLE_64B: u32 = 2;
+pub(crate) const TMAP_SWIZZLE_128B: u32 = 3;
+/// `CUtensorMapL2promotion` selectors.
+#[allow(dead_code)] // NONE kept for documentation parity with cuda.h
+pub(crate) const TMAP_L2_NONE: u32 = 0;
+pub(crate) const TMAP_L2_128B: u32 = 2;
+/// `CUtensorMapFloatOOBfill` selectors.
+pub(crate) const TMAP_OOB_NONE: u32 = 0;
+
+// ---- Function attributes (needed for > 48 KiB dynamic shared memory) --------
+pub(crate) type FnCuFuncSetAttribute =
+    unsafe extern "C" fn(Handle, i32, i32) -> CuResult;
+/// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`.
+pub(crate) const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
+
+// ---- Inter-process memory handles -------------------------------------------
+/// `CUipcMemHandle`: 64 opaque bytes, returned by value.
+pub(crate) type IpcMemHandle = [u8; 64];
+pub(crate) type FnCuIpcGetMemHandle =
+    unsafe extern "C" fn(*mut IpcMemHandle, DevicePtr) -> CuResult;
+pub(crate) type FnCuIpcOpenMemHandle =
+    unsafe extern "C" fn(*mut DevicePtr, IpcMemHandle, u32) -> CuResult;
+/// `CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS`.
+pub(crate) const CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS: u32 = 1;
+
 /// `CU_EVENT_DEFAULT`.
 pub(crate) const CU_EVENT_DEFAULT: u32 = 0;
 /// `CU_STREAM_CAPTURE_MODE_RELAXED` — other threads may use the driver
@@ -146,6 +201,13 @@ pub struct Cuda {
     pub(crate) graph_instantiate: Option<FnCuGraphInstantiateWithFlags>,
     pub(crate) graph_launch: Option<FnCuGraphLaunch>,
     pub(crate) graph_exec_destroy: Option<FnCuGraphExecDestroy>,
+    // TMA / function attributes / IPC (optional: CUDA >= 12.0 for the map
+    // encoder; the others are ancient but kept optional so odd embedded
+    // stacks still load the driver bindings).
+    pub(crate) tensor_map_encode_tiled: Option<FnCuTensorMapEncodeTiled>,
+    pub(crate) func_set_attribute: Option<FnCuFuncSetAttribute>,
+    pub(crate) ipc_get_mem_handle: Option<FnCuIpcGetMemHandle>,
+    pub(crate) ipc_open_mem_handle: Option<FnCuIpcOpenMemHandle>,
 }
 
 impl Cuda {
@@ -194,6 +256,10 @@ impl Cuda {
                 graph_instantiate: lib.sym_opt("cuGraphInstantiateWithFlags")?,
                 graph_launch: lib.sym_opt("cuGraphLaunch")?,
                 graph_exec_destroy: lib.sym_opt("cuGraphExecDestroy")?,
+                tensor_map_encode_tiled: lib.sym_opt("cuTensorMapEncodeTiled")?,
+                func_set_attribute: lib.sym_opt("cuFuncSetAttribute")?,
+                ipc_get_mem_handle: lib.sym_opt("cuIpcGetMemHandle")?,
+                ipc_open_mem_handle: lib.sym_opt("cuIpcOpenMemHandle")?,
                 lib,
             })
         }

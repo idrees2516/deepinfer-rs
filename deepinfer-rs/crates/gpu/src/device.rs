@@ -721,6 +721,155 @@ impl Device {
         ensure!(r == 0, Internal, "memcpy DtoDAsync: {}", self.err_str(r));
         Ok(())
     }
+
+    /// Encode a rank-2 tiled TMA descriptor over `buf` (CUDA >= 12.0).
+    ///
+    /// The matrix is `rows x inner_elems` with the inner (fastest) dimension
+    /// contiguous; `box_inner`/`box_rows` select the tile the kernel copies
+    /// per `cp.async.bulk.tensor.2d`. With a swizzle mode other than `None`,
+    /// `box_inner * elem_bytes` must be <= the swizzle atom (32/64/128 B) —
+    /// use exactly the atom size for the tcgen05 fast path. `global_strides`
+    /// must be a multiple of 16 and the buffer 16-byte aligned (both are
+    /// guaranteed by `Device::alloc` and our K % 128 contracts).
+    ///
+    /// # Errors
+    /// [`Error::Internal`] on CUDA-only stacks without the entry point
+    /// (CUDA < 12.0) or driver-rejected parameters; [`Error::InvalidArgument`]
+    /// for degenerate dimensions.
+    #[allow(clippy::too_many_arguments)] // the driver API arity, mirrored
+    pub fn encode_tensor_map_2d(
+        &self,
+        buf: &Buffer,
+        dtype: TensorMapDType,
+        inner_elems: usize,
+        rows: usize,
+        box_inner: usize,
+        box_rows: usize,
+        swizzle: TensorMapSwizzle,
+    ) -> Result<TensorMap> {
+        ensure!(inner_elems > 0 && rows > 0, InvalidArgument, "tensor map dims must be > 0");
+        ensure!(box_inner > 0 && box_rows > 0, InvalidArgument, "tensor map box must be > 0");
+        ensure!(
+            inner_elems % 16 == 0,
+            InvalidArgument,
+            "tensor map inner dim ({inner_elems}) must keep the 16-byte stride alignment"
+        );
+        let c = self
+            .gpu
+            .inner
+            .cuda
+            .as_ref()
+            .ok_or_else(|| Error::internal("TMA tensor maps are CUDA-only"))?;
+        let f = c.tensor_map_encode_tiled.ok_or_else(|| {
+            Error::internal("driver does not expose cuTensorMapEncodeTiled (CUDA < 12.0)")
+        })?;
+        // Dim/stride order is reversed relative to the natural (row, col):
+        // the FIRST entry is the fastest-changing dimension.
+        let global_dim = [inner_elems as u64, rows as u64];
+        let global_strides = [inner_elems as u64 * dtype_bytes(dtype) as u64];
+        let box_dim = [box_inner as u32, box_rows as u32];
+        let elem_strides = [1u32, 1u32];
+        let mut map = TensorMap { opaque: [0u8; 128] };
+        self.make_current()?;
+        // SAFETY: out-pointer is a valid, 64-byte aligned 128-byte object;
+        // arrays are valid for rank-2 reads; the device pointer refers to a
+        // live allocation owned by `buf`.
+        let r = unsafe {
+            (f)(
+                map.opaque.as_mut_ptr(),
+                dtype.raw(),
+                2,
+                buf.ptr as *mut c_void,
+                global_dim.as_ptr(),
+                global_strides.as_ptr(),
+                box_dim.as_ptr(),
+                elem_strides.as_ptr(),
+                cuda::TMAP_INTERLEAVE_NONE,
+                swizzle.raw(),
+                cuda::TMAP_L2_128B,
+                cuda::TMAP_OOB_NONE,
+            )
+        };
+        ensure!(
+            r == 0,
+            Internal,
+            "cuTensorMapEncodeTiled: {}",
+            c.error_string(r)
+        );
+        Ok(map)
+    }
+
+    /// Export an allocation for use by other processes (CUDA IPC).
+    ///
+    /// The returned 64-byte handle is process- and machine-stable; the peer
+    /// imports it with [`Device::ipc_open`]. The buffer must stay alive for
+    /// as long as any peer has it open.
+    ///
+    /// # Errors
+    /// [`Error::Internal`] on CUDA-only stacks without IPC or on rejection.
+    pub fn ipc_export(&self, buf: &Buffer) -> Result<[u8; 64]> {
+        let c = self
+            .gpu
+            .inner
+            .cuda
+            .as_ref()
+            .ok_or_else(|| Error::internal("CUDA IPC is CUDA-only"))?;
+        let f = c
+            .ipc_get_mem_handle
+            .ok_or_else(|| Error::internal("driver does not expose cuIpcGetMemHandle"))?;
+        self.make_current()?;
+        let mut handle = [0u8; 64];
+        // SAFETY: out-pointer valid for 64 bytes; device pointer owned by buf.
+        let r = unsafe { (f)(&mut handle, buf.ptr) };
+        ensure!(r == 0, Internal, "cuIpcGetMemHandle: {}", c.error_string(r));
+        Ok(handle)
+    }
+
+    /// Import a peer process's exported allocation (CUDA IPC) as a local
+    /// [`Buffer`]. Peer access over NVLink is enabled lazily by the driver
+    /// (`CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS`).
+    ///
+    /// # Errors
+    /// [`Error::Internal`] on CUDA-only stacks without IPC or on rejection
+    /// (e.g. the exporting process exited).
+    pub fn ipc_open(&self, handle: &[u8; 64]) -> Result<Buffer> {
+        let c = self
+            .gpu
+            .inner
+            .cuda
+            .as_ref()
+            .ok_or_else(|| Error::internal("CUDA IPC is CUDA-only"))?;
+        let f = c
+            .ipc_open_mem_handle
+            .ok_or_else(|| Error::internal("driver does not expose cuIpcOpenMemHandle"))?;
+        self.make_current()?;
+        let mut ptr: cuda::DevicePtr = 0;
+        // SAFETY: out-pointer valid; handle bytes copied by value; the
+        // driver returns a pointer valid in this context until freed.
+        let r = unsafe {
+            (f)(
+                &mut ptr,
+                *handle.as_ptr().cast::<cuda::IpcMemHandle>(),
+                cuda::CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS,
+            )
+        };
+        ensure!(r == 0, Internal, "cuIpcOpenMemHandle: {}", c.error_string(r));
+        Ok(Buffer {
+            gpu: self.gpu.clone(),
+            ptr,
+            len: usize::MAX, // imported region; length tracked by the caller
+            owns: true,
+        })
+    }
+}
+
+/// Element size of a tensor-map dtype in bytes.
+fn dtype_bytes(dt: TensorMapDType) -> usize {
+    match dt {
+        TensorMapDType::U8 => 1,
+        TensorMapDType::U16 | TensorMapDType::Bf16 => 2,
+        TensorMapDType::U32 | TensorMapDType::F32 => 4,
+    }
 }
 
 /// The error returned when the optional event entry points are missing
@@ -1016,6 +1165,81 @@ unsafe impl Send for Function {}
 // SAFETY: see above.
 unsafe impl Sync for Function {}
 
+/// A host-encoded TMA descriptor (opaque 128-byte `CUtensorMap`).
+///
+/// Built with [`Device::encode_tensor_map_2d`]; passed to kernels by value
+/// as a `__grid_constant__` parameter. The type is POD — cloneable and
+/// reusable across launches as long as the underlying allocation stays
+/// alive at the same address.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+pub struct TensorMap {
+    pub(crate) opaque: [u8; 128],
+}
+
+impl std::fmt::Debug for TensorMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TensorMap")
+            .field("first_word", &u64::from_le_bytes(
+                self.opaque[0..8].try_into().unwrap_or([0; 8]),
+            ))
+            .finish()
+    }
+}
+
+/// Swizzle mode of a [`TensorMap`] (selects the shared-memory XOR pattern
+/// the TMA unit applies and that `tcgen05`/`wgmma` descriptors must agree
+/// with).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorMapSwizzle {
+    /// No swizzling (linear shared layout).
+    None,
+    /// 32-byte swizzle atom.
+    Sw32,
+    /// 64-byte swizzle atom.
+    Sw64,
+    /// 128-byte swizzle atom (the tcgen05 fast path).
+    Sw128,
+}
+
+impl TensorMapSwizzle {
+    fn raw(self) -> u32 {
+        match self {
+            TensorMapSwizzle::None => cuda::TMAP_SWIZZLE_NONE,
+            TensorMapSwizzle::Sw32 => cuda::TMAP_SWIZZLE_32B,
+            TensorMapSwizzle::Sw64 => cuda::TMAP_SWIZZLE_64B,
+            TensorMapSwizzle::Sw128 => cuda::TMAP_SWIZZLE_128B,
+        }
+    }
+}
+
+/// Element type of a [`TensorMap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorMapDType {
+    /// 1-byte unsigned (FP8 payloads).
+    U8,
+    /// 2-byte unsigned (BF16 bits).
+    U16,
+    /// 4-byte unsigned (F32 bits, packed UE8M0 scale words).
+    U32,
+    /// 4-byte float.
+    F32,
+    /// 2-byte brain float.
+    Bf16,
+}
+
+impl TensorMapDType {
+    fn raw(self) -> u32 {
+        match self {
+            TensorMapDType::U8 => cuda::TMAP_DTYPE_UINT8,
+            TensorMapDType::U16 => cuda::TMAP_DTYPE_UINT16,
+            TensorMapDType::U32 => cuda::TMAP_DTYPE_UINT32,
+            TensorMapDType::F32 => cuda::TMAP_DTYPE_FLOAT32,
+            TensorMapDType::Bf16 => cuda::TMAP_DTYPE_BFLOAT16,
+        }
+    }
+}
+
 /// Launch geometry.
 #[derive(Debug, Clone, Copy)]
 pub struct Launch {
@@ -1028,6 +1252,42 @@ pub struct Launch {
 }
 
 impl Function {
+    /// Raise the kernel's dynamic shared-memory ceiling above the 48 KiB
+    /// default (needed by the tcgen05 TMA pipelines, which request up to
+    /// ~200 KiB). Must be called before the first launch; the attribute is
+    /// sticky per `CUfunction`.
+    ///
+    /// # Errors
+    /// [`Error::Internal`] when the driver rejects the attribute or the
+    /// entry point is missing (CUDA < 11.0).
+    pub fn set_max_dynamic_smem(&self, dev: &Device, bytes: u32) -> Result<()> {
+        let c = dev
+            .gpu
+            .inner
+            .cuda
+            .as_ref()
+            .ok_or_else(|| Error::internal("dynamic shared memory attributes are CUDA-only"))?;
+        let f = c.func_set_attribute.ok_or_else(|| {
+            Error::internal("driver does not expose cuFuncSetAttribute (CUDA < 11.0)")
+        })?;
+        dev.make_current()?;
+        // SAFETY: handle valid; attribute selector and value in range.
+        let r = unsafe {
+            (f)(
+                self.handle,
+                cuda::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                bytes as i32,
+            )
+        };
+        ensure!(
+            r == 0,
+            Internal,
+            "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES = {bytes}): {}",
+            c.error_string(r)
+        );
+        Ok(())
+    }
+
     /// Launch the kernel with packed arguments on `stream`.
     pub fn launch(&self, dev: &Device, launch: Launch, args: &KernelArgs, stream: &Stream)
         -> Result<()> {
@@ -1157,6 +1417,13 @@ impl KernelArgs {
     /// Device pointer parameter from a raw address.
     pub fn raw_ptr(self, p: u64) -> Self {
         self.u64(p)
+    }
+
+    /// A by-value `CUtensorMap` parameter (`const __grid_constant__
+    /// CUtensorMap` kernels). 128 bytes, 64-byte aligned per the ABI.
+    pub fn tensor_map(mut self, m: &TensorMap) -> Self {
+        self.push_aligned(&m.opaque, 64);
+        self
     }
 }
 

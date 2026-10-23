@@ -935,3 +935,25 @@ conv_gated_norm, dot_scores, qmean, gate_logits, gate_blend, causal_clip,
 select_top_k, moe_route, moe_dispatch, moe_combine, fill_zero}`.
 Golden integration tests vs the CPU crates (auto-skip without a device).
 See docs/GPU.md for the full contract, precision policy and upgrade paths.
+
+
+## GPU layer addenda (post-v1)
+
+* **tcgen05 FP8 GEMM** (`sm_100a`/`sm_103a`): `Kernels::gemm_fp8_nt_sm100`
+  — 5th-gen tensor cores with TMA, Tensor Memory accumulators and UE8M0
+  block scales; `DeviceModel` selects it automatically on Blackwell
+  (`DEEPINFER_TCGEN05=0` pins the portable kernel).
+* **Paged multi-sequence serving**: `DeviceModel::{serve_configure,
+  serve_attach, serve_prefill, serve_decode, serve_rollback, serve_detach,
+  serve_len, serve_attached}` — per-layer 64-token page pools, per-sequence
+  device page tables, one launch per operator per batch.
+* **Symmetric-buffer EP (NVSHMEM-style)**:
+  `deepinfer_kernels::{SymmetricHeap, SymmetricEp, Session}` — device-side
+  one-sided dispatch/combine over peer heaps with system-scope atomics;
+  single-process (`SymmetricEp::new`) and multi-process IPC rendezvous
+  (`SymmetricEp::new_multiprocess`).
+* **Golden-run harness**: `cargo run --release -p deepinfer-runtime
+  --example golden_run -- --record/--verify <file>` — the on-hardware
+  acceptance battery with JSON artifacts.
+* **AMD MFMA FP8** (opt-in, `DEEPINFER_AMD_MFMA=1`):
+  `Kernels::gemm_fp8_nt_mfma` on gfx940-class Instincts.

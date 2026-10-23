@@ -115,3 +115,16 @@ caches (including the dedicated FP4 decode kernel), CUDA-graph decode
 capture/replay, and single-process NVLink peer collectives for expert
 parallelism. Binaries build and test on GPU-less machines (device tests
 auto-skip). See `docs/GPU.md` for the architecture and operator inventory.
+
+### On-hardware acceptance (golden runs)
+
+```bash
+cargo run --release -p deepinfer-runtime --example golden_run -- --list
+cargo run --release -p deepinfer-runtime --example golden_run -- --record site.json
+cargo run --release -p deepinfer-runtime --example golden_run -- --verify site.json
+```
+
+Records the capability report plus the full check battery (CPU-vs-GPU
+model agreement, CUDA-graph replay/rollback exactness, tcgen05 vs portable
+GEMM, the paged multi-sequence serve engine, the symmetric-buffer EP, and
+timings) as a JSON artifact; `--verify` re-runs against it.

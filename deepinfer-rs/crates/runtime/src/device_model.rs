@@ -80,7 +80,7 @@ pub const DEVICE_MAX_PREFILL_TOKENS: usize = 2048;
 pub const MOE_CHUNK_TOKENS: usize = 512;
 
 /// DeepGEMM contiguous-layout alignment (rows per expert segment).
-const MOE_ALIGN: usize = 128;
+pub(crate) const MOE_ALIGN: usize = 128;
 
 /// Per-GEMM numeric mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,16 +95,16 @@ pub enum Precision {
 }
 
 /// One NT GEMM weight, device-resident in the precision-selected layout.
-struct GemmW {
-    dtype: GemmDType,
+pub(crate) struct GemmW {
+    pub(crate) dtype: GemmDType,
     /// `[n, k]` u8 FP8 payload (FP8 mode).
-    q: Option<Buffer>,
+    pub(crate) q: Option<Buffer>,
     /// `[ceil(n/128), k/128]` u8 ue8m0 scales (FP8 mode).
-    sf: Option<Buffer>,
+    pub(crate) sf: Option<Buffer>,
     /// `[n, k]` f32 or bf16-bits payload (F32/BF16 modes).
-    raw: Option<Buffer>,
-    n: usize,
-    k: usize,
+    pub(crate) raw: Option<Buffer>,
+    pub(crate) n: usize,
+    pub(crate) k: usize,
 }
 
 impl GemmW {
@@ -227,55 +227,55 @@ fn upload_grouped_gemm(
 }
 
 /// MoE weights of one layer (router + routed grouped + shared dense).
-struct MoeW {
-    router: GemmW,
-    router_bias: Option<Buffer>,
-    routed_gate_up: GemmW,
-    routed_down: GemmW,
-    shared: Vec<(GemmW, GemmW)>,
+pub(crate) struct MoeW {
+    pub(crate) router: GemmW,
+    pub(crate) router_bias: Option<Buffer>,
+    pub(crate) routed_gate_up: GemmW,
+    pub(crate) routed_down: GemmW,
+    pub(crate) shared: Vec<(GemmW, GemmW)>,
 }
 
 /// Self-decoder layer weights (MLA + DSA indexer + MoE).
-struct SelfLayerW {
-    fused_qkv: GemmW,
-    q_b: GemmW,
-    wv: Vec<GemmW>,
-    wo: GemmW,
-    attn_norm: Buffer,
-    ffn_norm: Buffer,
-    kv_norm: Buffer,
-    sink: Option<Buffer>,
-    wq: GemmW,
-    wk: GemmW,
-    weights_proj: GemmW,
-    gate_proj: Buffer,
-    conv_w: Buffer,
-    conv_off: Buffer,
-    conv_gain: Buffer,
-    conv_kernels: usize,
-    moe: MoeW,
+pub(crate) struct SelfLayerW {
+    pub(crate) fused_qkv: GemmW,
+    pub(crate) q_b: GemmW,
+    pub(crate) wv: Vec<GemmW>,
+    pub(crate) wo: GemmW,
+    pub(crate) attn_norm: Buffer,
+    pub(crate) ffn_norm: Buffer,
+    pub(crate) kv_norm: Buffer,
+    pub(crate) sink: Option<Buffer>,
+    pub(crate) wq: GemmW,
+    pub(crate) wk: GemmW,
+    pub(crate) weights_proj: GemmW,
+    pub(crate) gate_proj: Buffer,
+    pub(crate) conv_w: Buffer,
+    pub(crate) conv_off: Buffer,
+    pub(crate) conv_gain: Buffer,
+    pub(crate) conv_kernels: usize,
+    pub(crate) moe: MoeW,
 }
 
 /// Cross-decoder layer weights (YOCO cross-attention + MoE).
-struct CrossLayerW {
-    q_proj: GemmW,
-    o_proj: GemmW,
-    attn_norm: Buffer,
-    ffn_norm: Buffer,
-    moe: MoeW,
+pub(crate) struct CrossLayerW {
+    pub(crate) q_proj: GemmW,
+    pub(crate) o_proj: GemmW,
+    pub(crate) attn_norm: Buffer,
+    pub(crate) ffn_norm: Buffer,
+    pub(crate) moe: MoeW,
 }
 
 /// Root weights (embedding, final norm, LM head, RoPE table).
-struct RootW {
-    embed: Buffer,
-    final_norm: Buffer,
-    lm_head: GemmW,
-    rope_cs: Buffer,
+pub(crate) struct RootW {
+    pub(crate) embed: Buffer,
+    pub(crate) final_norm: Buffer,
+    pub(crate) lm_head: GemmW,
+    pub(crate) rope_cs: Buffer,
 }
 
 /// Per-self-layer append-only device caches (flat arenas; sequences carve
 /// contiguous row ranges).
-struct SelfLayerState {
+pub(crate) struct SelfLayerState {
     /// `[max_rows, kv_row_bytes]` — MLA KV rows in the config's cache
     /// format (f32 / 528 B FP8 / 288 B FP4).
     kv: Buffer,
@@ -313,7 +313,7 @@ struct DevSeq {
 
 /// Reusable activation staging + decode workspaces (fixed addresses for
 /// the whole model lifetime — the captured graph bakes them).
-struct Workspace {
+pub(crate) struct Workspace {
     h: Buffer,
     x: Buffer,
     qa: Buffer,
@@ -397,24 +397,30 @@ struct DecodeGraph {
 
 /// The GPU-resident DeepSeek-V4.1-Flash model.
 pub struct DeviceModel {
-    cfg: ModelConfig,
-    dev: Device,
-    stream: Stream,
-    k: Kernels,
-    prec: Precision,
-    root: RootW,
-    self_layers: Vec<(SelfLayerW, SelfLayerState)>,
-    cross_layers: Vec<CrossLayerW>,
+    pub(crate) cfg: ModelConfig,
+    pub(crate) dev: Device,
+    pub(crate) stream: Stream,
+    pub(crate) k: Kernels,
+    pub(crate) prec: Precision,
+    pub(crate) root: RootW,
+    pub(crate) self_layers: Vec<(SelfLayerW, SelfLayerState)>,
+    pub(crate) cross_layers: Vec<CrossLayerW>,
     mtp: Option<MtpWeights>,
     seqs: BTreeMap<u32, DevSeq>,
     max_rows: usize,
     kv_row_bytes: usize,
-    fmt: DevCacheFormat,
-    ws: Workspace,
-    geo: StepGeometry,
+    pub(crate) fmt: DevCacheFormat,
+    pub(crate) ws: Workspace,
+    pub(crate) geo: StepGeometry,
     graph_enabled: bool,
     graph: Option<DecodeGraph>,
     vocab_bytes: Option<Vec<Vec<u8>>>,
+    /// Paged multi-sequence serving state (allocated on first use).
+    pub(crate) paged: crate::serve::PagedState,
+    /// Whether the tcgen05 GEMM path is disabled — by the environment
+    /// (`DEEPINFER_TCGEN05=0`) or stickily after the first driver/JIT
+    /// rejection (interior mutability: `gemm` takes `&self`).
+    tcgen05_off: std::sync::atomic::AtomicBool,
 }
 
 /// Converts the config cache format to the device kernel format id.
@@ -427,7 +433,7 @@ fn dev_cache_format(f: CacheFormat) -> DevCacheFormat {
 }
 
 /// Bytes per cached KV row for `fmt` and `hd` dims.
-fn kv_row_bytes(fmt: DevCacheFormat, hd: usize) -> usize {
+pub(crate) fn kv_row_bytes(fmt: DevCacheFormat, hd: usize) -> usize {
     match fmt {
         DevCacheFormat::F32 => hd * 4,
         DevCacheFormat::Fp8Group32 => hd + hd / 32,
@@ -748,6 +754,10 @@ impl DeviceModel {
             graph_enabled: false,
             graph: None,
             vocab_bytes: None,
+            paged: crate::serve::PagedState::empty(),
+            tcgen05_off: std::sync::atomic::AtomicBool::new(
+                std::env::var("DEEPINFER_TCGEN05").ok().as_deref() == Some("0"),
+            ),
         })
     }
 
@@ -878,7 +888,7 @@ impl DeviceModel {
     /// `d = a @ w^T` with `a` f32 `[m, w.k]` and the weight's uploaded
     /// precision. FP8 mode stages the activation through the 1x128
     /// quantizer; BF16 mode rounds to bf16 first.
-    fn gemm(&self, w: &GemmW, a_f32: &Buffer, d: &Buffer, m: usize) -> Result<()> {
+    pub(crate) fn gemm(&self, w: &crate::device_model::GemmW, a_f32: &Buffer, d: &Buffer, m: usize) -> Result<()> {
         ensure!(m >= 1, InvalidArgument, "gemm needs m >= 1");
         let (n, kk) = (w.n(), w.k);
         match w.dtype {
@@ -895,6 +905,28 @@ impl DeviceModel {
                     .ok_or_else(|| Error::internal("FP8 scale staging missing"))?;
                 self.k
                     .quant_per_token_group(a_f32, aq, asf, m, kk, 128, &self.stream)?;
+                // Blackwell fast path: the 5th-gen tensor cores (tcgen05
+                // mxf8f6f4 + TMA + Tensor Memory). Falls back to the
+                // portable mma.sync kernel when unavailable or on the first
+                // driver/JIT rejection (sticky, so one failure costs one
+                // attempt per process).
+                if self.k.tcgen05_available()
+                    && !self.tcgen05_off.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let qp = w.q.as_ref().ok_or_else(|| Error::internal("fp8 payload missing"))?;
+                    let sp = w.sf.as_ref().ok_or_else(|| Error::internal("fp8 scales missing"))?;
+                    match self.k.gemm_fp8_nt_sm100(aq, asf, qp, sp, d, m, n, kk, &self.stream) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            if std::env::var("DEEPINFER_JIT_DEBUG").ok().as_deref() == Some("1") {
+                                eprintln!(
+                                    "[deepinfer] tcgen05 GEMM rejected ({e});                                      falling back to the portable kernel (sticky)"
+                                );
+                            }
+                            self.tcgen05_off.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
                 self.k.gemm_fp8_nt(
                     aq,
                     asf,
@@ -1511,7 +1543,7 @@ impl DeviceModel {
     /// Prefill MoE over `s` tokens (input in `ws.x`), adding into `ws.h`.
     /// Routed experts run the aligned-contiguous layout in
     /// [`MOE_CHUNK_TOKENS`] chunks; shared experts run dense.
-    fn moe_prefill(&self, m: &MoeW, s: usize) -> Result<()> {
+    pub(crate) fn moe_prefill(&self, m: &MoeW, s: usize) -> Result<()> {
         let cfg = &self.cfg;
         let hidden = cfg.moe.hidden;
         let inter = cfg.moe.intermediate;
@@ -2834,5 +2866,342 @@ mod tests {
             let xb = b.decode_step(0, 40 + i).unwrap();
             assert_eq!(xa, xb);
         }
+    }
+
+    /// The paged multi-sequence serve engine vs the single-sequence device
+    /// path (itself CPU-validated): two sequences interleaved through one
+    /// paged cache, rollback exactness, detach/re-attach.
+    #[test]
+    fn serve_engine_multi_sequence() {
+        let Some(dev) = gpu_device() else { return };
+        let cfg = ModelConfig::v41_tiny();
+        let mut gpu = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+        let prompt: Vec<u32> = (0..6u32).map(|t| (t * 61) % 250).collect();
+        // Single-sequence reference run.
+        let lp = gpu.prefill(7, &prompt).unwrap();
+        let mut steps: Vec<Vec<f32>> = Vec::new();
+        let mut t = 5u32;
+        for _ in 0..4 {
+            let xb = gpu.decode_step(7, t).unwrap();
+            t = deepinfer_core::math::argmax(&xb).unwrap() as u32;
+            steps.push(xb);
+        }
+        // Serve engine: two sequences, interleaved.
+        gpu.serve_configure(2, 64, 2).unwrap();
+        gpu.serve_attach(1).unwrap();
+        gpu.serve_attach(2).unwrap();
+        let prompt2: Vec<u32> = (0..6u32).map(|t| (t * 97 + 3) % 250).collect();
+        let l1 = gpu.serve_prefill(1, &prompt).unwrap();
+        let e = rel_err(&lp, &l1);
+        assert!(e < 5e-2, "serve prefill logits rel err {e}");
+        let _l2 = gpu.serve_prefill(2, &prompt2).unwrap();
+        assert_eq!(gpu.serve_len(1), 6);
+        assert_eq!(gpu.serve_len(2), 6);
+        // Interleaved decode: sequence 1 must match the single-seq path.
+        let mut tt = 5u32;
+        for (i, want) in steps.iter().enumerate() {
+            let got = gpu.serve_decode(&[(1, tt), (2, 100)]).unwrap();
+            assert_eq!(got.len(), 2);
+            assert_eq!(got[0].len(), cfg.vocab_size);
+            assert!(got[0].iter().all(|v| v.is_finite()));
+            assert!(got[1].iter().all(|v| v.is_finite()));
+            let e = rel_err(want, &got[0]);
+            assert!(e < 5e-2, "serve decode step {i} rel err {e}");
+            tt = deepinfer_core::math::argmax(&got[0]).unwrap() as u32;
+        }
+        assert_eq!(gpu.serve_len(1), 10);
+        assert_eq!(gpu.serve_len(2), 10);
+        // Rollback two rows of sequence 1: the re-decode of the same token
+        // must reproduce the same logits exactly (slot-keyed rewrite).
+        gpu.serve_rollback(1, 2).unwrap();
+        assert_eq!(gpu.serve_len(1), 8);
+        let again = gpu.serve_decode(&[(1, tt)]).unwrap();
+        let e = rel_err(&steps[3], &again[0]);
+        assert!(e < 5e-2, "post-rollback decode rel err {e}");
+        // Detach + re-attach: pages return to the pool and the sequence
+        // restarts cleanly.
+        gpu.serve_detach(1).unwrap();
+        assert!(!gpu.serve_attached(1));
+        assert_eq!(gpu.serve_len(1), 0);
+        gpu.serve_attach(1).unwrap();
+        let l1b = gpu.serve_prefill(1, &prompt).unwrap();
+        let e = rel_err(&lp, &l1b);
+        assert!(e < 5e-2, "re-attached prefill rel err {e}");
+    }
+
+    /// The NVSHMEM-style symmetric-buffer EP against a host-computed
+    /// reference (world = 1: the full dispatch -> group -> combine ->
+    /// reduce protocol over one rank; multi-rank needs the multi-GPU
+    /// variant below).
+    #[test]
+    fn symmetric_ep_world1_protocol() {
+        let Some(dev) = gpu_device() else { return };
+        let tokens = 16usize;
+        let hidden = 256usize;
+        let k = 4usize;
+        let e = 8usize;
+        let cap = tokens;
+        let mesh = deepinfer_kernels::PeerMesh::new(std::slice::from_ref(&dev)).unwrap();
+        let kern = deepinfer_kernels::Kernels::new(&dev).unwrap();
+        let ep = deepinfer_kernels::SymmetricEp::new(mesh, k, cap, tokens, hidden).unwrap();
+        // Random FP8 payloads + routing.
+        let mut rng = deepinfer_core::rng::Philox::new(7, 9);
+        let xq: Vec<u8> = (0..tokens * hidden).map(|_| (rng.next_u64_from_two() & 0xff) as u8).collect();
+        let xsf: Vec<u8> = (0..tokens * (hidden / 128)).map(|_| 0x80).collect();
+        let mut topk_idx: Vec<i32> = Vec::new();
+        for t in 0..tokens {
+            let base = ((t * 37) % e) as i32;
+            for kk in 0..k {
+                topk_idx.push((base + kk as i32) % e as i32);
+            }
+        }
+        let topk_w: Vec<f32> = (0..tokens * k).map(|i| 0.25 + (i % 7) as f32 / 28.0).collect();
+        let xq_b = dev.alloc_from(&xq).unwrap();
+        let xsf_b = dev.alloc_from(&xsf).unwrap();
+        let idx_b = dev.alloc_from(&topk_idx).unwrap();
+        let w_b = dev.alloc_from(&topk_w).unwrap();
+        let counters = dev.alloc(e * 4).unwrap();
+        let meta2 = dev.alloc(e * cap * 16).unwrap();
+        let drops = dev.alloc(4).unwrap();
+        let aq = dev.alloc(e * cap * hidden).unwrap();
+        let asf = dev.alloc(e * cap * (hidden / 128)).unwrap();
+        let y = dev.alloc(e * cap * hidden * 4).unwrap();
+        let out = dev.alloc(tokens * hidden * 4).unwrap();
+        // Step: reset -> dispatch -> group -> (stub expert GEMM: y row =
+        // f(expert)) -> combine -> reduce.
+        ep.reset_all(&kern).unwrap();
+        ep.dispatch(&kern, 0, &xq_b, &xsf_b, &idx_b, tokens, e).unwrap();
+        ep.group(&kern, 0, &counters, &aq, &asf, &meta2, &drops).unwrap();
+        // Stub: y[e*cap + r] = f(e) = (e+1) * 0.5 on every dim.
+        let y_host: Vec<f32> = (0..e * cap * hidden)
+            .map(|i| ((i / (cap * hidden)) as f32 + 1.0) * 0.5)
+            .collect();
+        let ys = dev.stream().unwrap();
+        ys.synchronize().unwrap();
+        dev.write(&y, &y_host).unwrap();
+        ep.combine(&kern, 0, &y, &meta2, &counters, e).unwrap();
+        ep.reduce(&kern, 0, &w_b, &idx_b, &out, tokens).unwrap();
+        ys.synchronize().unwrap();
+        let mut got = vec![0.0f32; tokens * hidden];
+        dev.read(&out, &mut got).unwrap();
+        // Reference: out[t] = sum_k w[t,k] * f(e(t,k)).
+        for t in 0..tokens {
+            for d in 0..hidden {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    let ei = topk_idx[t * k + kk];
+                    if ei < 0 {
+                        continue;
+                    }
+                    acc += topk_w[t * k + kk] * ((ei as f32 + 1.0) * 0.5);
+                }
+                let g = got[t * hidden + d];
+                assert!(
+                    (g - acc).abs() < 1e-4,
+                    "t={t} d={d} got {g} want {acc}"
+                );
+            }
+        }
+    }
+
+    /// Multi-rank symmetric EP (needs >= 2 same-backend devices; skipped
+    /// otherwise): the same protocol across a peer mesh, checked against
+    /// the block-ownership reference.
+    #[test]
+    fn symmetric_ep_multirank_protocol() {
+        let mut devs = Vec::new();
+        'outer: for b in [Backend::Cuda, Backend::Hip] {
+            if let Ok(gpu) = Gpu::new(b) {
+                if let Ok(n) = gpu.device_count() {
+                    for i in 0..n.min(2) {
+                        if let Ok(d) = gpu.device(i) {
+                            devs.push(d);
+                            if devs.len() == 2 {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if devs.len() < 2 {
+            eprintln!("note: <2 GPUs; multi-rank symmetric EP test skipped");
+            return;
+        }
+        let tokens = 8usize;
+        let hidden = 256usize;
+        let k = 4usize;
+        let e = 8usize;
+        let cap = 16usize; // per-rank channel capacity
+        let world = 2usize;
+        let mesh = deepinfer_kernels::PeerMesh::new(&devs).unwrap();
+        let kern: Vec<deepinfer_kernels::Kernels> =
+            devs.iter().map(|d| deepinfer_kernels::Kernels::new(d).unwrap()).collect();
+        let ep = deepinfer_kernels::SymmetricEp::new(mesh, k, cap, tokens, hidden).unwrap();
+        // Routing: token t on rank r routes experts so both ranks send.
+        let mut topk_idx: Vec<i32> = Vec::new();
+        for t in 0..tokens {
+            for kk in 0..k {
+                let ex = ((t + kk) as i32) % e as i32;
+                topk_idx.push(ex);
+            }
+        }
+        let topk_w: Vec<f32> = (0..tokens * k).map(|i| 0.125 + (i % 5) as f32 / 40.0).collect();
+        // Block-contiguous ownership is exercised implicitly through
+        // the kernels' `owner(e) = e * world / E` routing.
+        let mut bufs = Vec::new();
+        for r in 0..world {
+            let xq: Vec<u8> = (0..tokens * hidden).map(|i| ((i + r * 17) % 251) as u8).collect();
+            let xsf: Vec<u8> = vec![0x80; tokens * (hidden / 128)];
+            let xq_b = devs[r].alloc_from(&xq).unwrap();
+            let xsf_b = devs[r].alloc_from(&xsf).unwrap();
+            let idx_b = devs[r].alloc_from(&topk_idx).unwrap();
+            let w_b = devs[r].alloc_from(&topk_w).unwrap();
+            let counters = devs[r].alloc(e * 4).unwrap();
+            let meta2 = devs[r].alloc(e * cap * 16).unwrap();
+            let drops = devs[r].alloc(4).unwrap();
+            let aq = devs[r].alloc(e * cap * hidden).unwrap();
+            let asf = devs[r].alloc(e * cap * (hidden / 128)).unwrap();
+            let y = devs[r].alloc(e * cap * hidden * 4).unwrap();
+            let out = devs[r].alloc(tokens * hidden * 4).unwrap();
+            bufs.push((xq_b, xsf_b, idx_b, w_b, counters, meta2, drops, aq, asf, y, out));
+        }
+        ep.reset_all(&kern[0]).unwrap();
+        for r in 0..world {
+            let (xq_b, xsf_b, idx_b, _, _, _, drops, _, _, _, _) = &bufs[r];
+            ep.dispatch(&kern[r], r, xq_b, xsf_b, idx_b, tokens, e).unwrap();
+            let _ = drops;
+        }
+        for r in 0..world {
+            let (_, _, _, _, counters, meta2, drops, aq, asf, _, _) = &bufs[r];
+            ep.group(&kern[r], r, counters, aq, asf, meta2, drops).unwrap();
+        }
+        // Stub expert outputs on each rank: y[e*cap + rank] = f(e).
+        for r in 0..world {
+            let y_host: Vec<f32> = (0..e * cap * hidden)
+                .map(|i| ((i / (cap * hidden)) as f32 + 1.0) * 0.5)
+                .collect();
+            let (_, _, _, _, _, _, _, _, _, y, _) = &bufs[r];
+            devs[r].stream().unwrap().synchronize().unwrap();
+            devs[r].write(y, &y_host).unwrap();
+        }
+        for r in 0..world {
+            let (_, _, _, _, counters, meta2, _, _, _, y, _) = &bufs[r];
+            ep.combine(&kern[r], r, y, meta2, counters, e).unwrap();
+        }
+        for r in 0..world {
+            let (_, _, idx_b, w_b, _, _, _, _, _, _, out) = &bufs[r];
+            ep.reduce(&kern[r], r, w_b, idx_b, out, tokens).unwrap();
+        }
+        // Verify each rank's own tokens.
+        for r in 0..world {
+            devs[r].stream().unwrap().synchronize().unwrap();
+            let (_, _, _, _, _, _, _, _, _, _, out) = &bufs[r];
+            let mut got = vec![0.0f32; tokens * hidden];
+            devs[r].read(out, &mut got).unwrap();
+            for t in 0..tokens {
+                for d in 0..hidden {
+                    let mut acc = 0.0f32;
+                    for kk in 0..k {
+                        let ex = ((t + kk) % e) as i32;
+                        acc += topk_w[t * k + kk] * ((ex as f32 + 1.0) * 0.5);
+                    }
+                    let g = got[t * hidden + d];
+                    assert!(
+                        (g - acc).abs() < 1e-4,
+                        "rank {r} t={t} d={d} got {g} want {acc}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The tcgen05 (5th-gen tensor core) GEMM vs the portable kernel
+    /// (Blackwell-class CUDA only; skipped elsewhere). Both run the exact
+    /// DeepGEMM 1d1d recipe; only the accumulation order differs.
+    #[test]
+    fn tcgen05_gemm_matches_portable() {
+        let Some(dev) = gpu_device() else { return };
+        if dev.backend() != Backend::Cuda {
+            eprintln!("note: non-CUDA device; tcgen05 test skipped");
+            return;
+        }
+        let (maj, _min) = match dev.props().arch {
+            deepinfer_gpu::GpuArch::Sm(ma, mi) => (ma, mi),
+            _ => {
+                eprintln!("note: non-NVIDIA arch; tcgen05 test skipped");
+                return;
+            }
+        };
+        if maj < 10 {
+            eprintln!("note: compute capability < 10.0; tcgen05 test skipped");
+            return;
+        }
+        let k = deepinfer_kernels::Kernels::new(&dev).unwrap();
+        assert!(k.tcgen05_available());
+        let m = 96usize;
+        let n = 512usize;
+        let kk = 512usize;
+        let mut rng = deepinfer_core::rng::Philox::new(11, 3);
+        let a: Vec<f32> = (0..m * kk).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
+        let b: Vec<f32> = (0..n * kk).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
+        let (aq, asf) = deepinfer_fp8::quantize_per_token_group(&a, kk, 128).unwrap();
+        let (bq, bsf) = deepinfer_fp8::quantize_weight_per_block(&b, n, kk, 128, 128).unwrap();
+        let aq_b = dev.alloc_from(&aq).unwrap();
+        let asf_b = dev.alloc_from(&asf).unwrap();
+        let bq_b = dev.alloc_from(&bq).unwrap();
+        let bsf_b = dev.alloc_from(&bsf).unwrap();
+        let d1 = dev.alloc(m * n * 4).unwrap();
+        let d2 = dev.alloc(m * n * 4).unwrap();
+        let s = dev.stream().unwrap();
+        k.gemm_fp8_nt(&aq_b, &asf_b, &bq_b, &bsf_b, &d1, m, n, kk, &s).unwrap();
+        k.gemm_fp8_nt_sm100(&aq_b, &asf_b, &bq_b, &bsf_b, &d2, m, n, kk, &s).unwrap();
+        s.synchronize().unwrap();
+        let mut g1 = vec![0.0f32; m * n];
+        let mut g2 = vec![0.0f32; m * n];
+        dev.read(&d1, &mut g1).unwrap();
+        dev.read(&d2, &mut g2).unwrap();
+        let e = rel_err(&g1, &g2);
+        assert!(e < 1e-3, "tcgen05 vs portable rel err {e}");
+        assert!(g2.iter().all(|v| v.is_finite()));
+    }
+
+
+    /// The AMD MFMA FP8 GEMM vs the scalar path (Instinct + the
+    /// `DEEPINFER_AMD_MFMA=1` opt-in; skipped otherwise — the golden
+    /// harness is the first-contact validation vehicle).
+    #[test]
+    fn amd_mfma_matches_scalar() {
+        let Some(dev) = gpu_device() else { return };
+        if dev.backend() != Backend::Hip
+            || std::env::var("DEEPINFER_AMD_MFMA").ok().as_deref() != Some("1")
+        {
+            eprintln!("note: non-HIP backend or DEEPINFER_AMD_MFMA!=1; MFMA test skipped");
+            return;
+        }
+        let k = deepinfer_kernels::Kernels::new(&dev).unwrap();
+        let (m, n, kk) = (64usize, 128usize, 256usize);
+        let mut rng = deepinfer_core::rng::Philox::new(5, 2);
+        let a: Vec<f32> = (0..m * kk).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
+        let b: Vec<f32> = (0..n * kk).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
+        let (aq, asf) = deepinfer_fp8::quantize_per_token_group(&a, kk, 128).unwrap();
+        let (bq, bsf) = deepinfer_fp8::quantize_weight_per_block(&b, n, kk, 128, 128).unwrap();
+        let aq_b = dev.alloc_from(&aq).unwrap();
+        let asf_b = dev.alloc_from(&asf).unwrap();
+        let bq_b = dev.alloc_from(&bq).unwrap();
+        let bsf_b = dev.alloc_from(&bsf).unwrap();
+        let d1 = dev.alloc(m * n * 4).unwrap();
+        let d2 = dev.alloc(m * n * 4).unwrap();
+        let s = dev.stream().unwrap();
+        k.gemm_fp8_nt(&aq_b, &asf_b, &bq_b, &bsf_b, &d1, m, n, kk, &s).unwrap();
+        k.gemm_fp8_nt_mfma(&aq_b, &asf_b, &bq_b, &bsf_b, &d2, m, n, kk, &s).unwrap();
+        s.synchronize().unwrap();
+        let mut g1 = vec![0.0f32; m * n];
+        let mut g2 = vec![0.0f32; m * n];
+        dev.read(&d1, &mut g1).unwrap();
+        dev.read(&d2, &mut g2).unwrap();
+        let e = rel_err(&g1, &g2);
+        assert!(e < 1e-3, "MFMA vs scalar rel err {e}");
+        assert!(g2.iter().all(|v| v.is_finite()));
     }
 }

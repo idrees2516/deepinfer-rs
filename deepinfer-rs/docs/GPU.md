@@ -24,8 +24,9 @@ deepinfer-runtime  (DeepSeekModel = CPU golden · DeviceModel = GPU forward,
                     decode graphs, sampling, scheduler)        [host]
         |
 deepinfer-kernels  (typed launchers + embedded CUDA/HIP C++ sources:
-                    GEMMs, attention, DSA, MoE, the _dev decode family,
-                    peer-collective EP)
+                    GEMMs incl. the tcgen05/TMA SM100 path, attention, DSA,
+                    MoE, the _dev decode family, the paged serve family,
+                    stream-copy peer EP + symmetric-buffer LL EP)
         |
 deepinfer-gpu      (dlopen + CUDA driver / HIP + NVRTC / hipRTC + JIT cache
                     + events + stream-capture graphs + peer access)
@@ -87,6 +88,10 @@ Rust port, and the `kern` runtime, which all use the same model):
 | Graph-replayable decode family | `di_step_params`, `di_pos_fill`, `di_kv_encode_*_dev`, `di_append_*`, `di_lightning_*_dev`, `di_thunder_logits_dev`, `di_dot_scores_dev`, `di_gate_blend_dev`, `di_causal_window_clip_dev`, `di_block_preselect_dev`, `di_conv_*_dev` | the CPU crates' semantics with every varying scalar device-resident |
 | Masked MoE dispatch / combine | `di_moe_scatter_masked_kernel`, `di_silu_mul_masked_kernel` (fused gate/up layout) | DeepEP low-latency capacity semantics |
 | Indexed row gather | `di_gather_rows_indexed_kernel` | embedding lookup, EP send packing |
+| **tcgen05 FP8 GEMM (SM100)** | `di_gemm_fp8_nt_sm100a_kernel` — `tcgen05.mma.kind::mxf8f6f4.block_scale` with UE8M0 scale factors in Tensor Memory, `cp.async.bulk.tensor` TMA loads (SWIZZLE_128B), warp-specialized 3-stage pipeline (TMA / MMA / SF-loader / Layout-D epilogue), `sm_100a`/`sm_103a` targets | DeepGEMM SM100 `fp8_fp4_gemm_1d1d` semantics (same 1x128 / 128x128 ue8m0 recipe) |
+| **Paged multi-sequence serving** | the `di_serve_*` family: fanout cells, paged kv encode / row appends / per-head norm, cascade conv, lightning quant, thunder + conv scores, gate blend, causal clip, block preselect + top-k, split-KV decode partial/combine, sparse + dense-causal prefill, SWA rings — every row addressed through `tbl[r/64]*64 + r%64` page tables, one launch per op per batch | the arena kernels they port (all CPU-validated) |
+| AMD MFMA FP8 GEMM (opt-in) | `di_gemm_fp8_nt_mfma_kernel` (`v_mfma_f32_32x32x16_fp8_fp8`, gfx940-class; `DEEPINFER_AMD_MFMA=1`) | same DeepGEMM recipe; validated via the golden harness |
+| **Symmetric-buffer EP (NVSHMEM-style)** | `di_ep_{reset,dispatch,dispatch_done,group,combine,reduce}_ll_kernel` — device-initiated one-sided writes into peer symmetric heaps over NVLink with `atom/red.release.sys` + `ld.acquire.sys` progress counters; no host readback, no library | DeepEP low-latency dispatch/combine protocol |
 
 ## Precision and determinism policy
 
@@ -131,23 +136,39 @@ the supply-chain surface remains the Rust workspace itself.
 The v1 kernels favor *verifiable correctness* over peak throughput. Every
 cut below is isolated in one place and has a concrete upgrade:
 
-1. **NVIDIA GEMM runs bf16 `mma.sync.m16n8k16` tensor cores** (fragment
-   mapping per the PTX ISA tables); FP8 operands are decoded to bf16 during
-   the global->shared staging, so memory traffic stays FP8 while compute
-   runs at bf16 tensor rate (2.5 PF/GPU on B200 vs 5 PF FP8 peak).
-   Upgrades: (a) e4m3 `mma.sync.m16n8k32` fragments — one function;
-   (b) tcgen05 + TMA + UE8M0 packed scales on `sm_100a`/`sm_103a` for full
-   DeepGEMM SM100 parity. The fragment mapping shipped here is validated by
-   the GEMM goldens (any mapping error produces loud garbage, not silent
-   drift).
-2. **AMD GEMM runs LDS-tiled scalar f32 FMA** — correct and
-   bandwidth-efficient (decode GEMMs are bandwidth-bound at 8 TB/s), but
-   prefill leaves MFMA throughput unused. The MFMA upgrade requires the
-   exact per-lane register layouts (`v_mfma_f32_16x16x16_bf16` and the
-   gfx942 FP8 variants `v_mfma_f32_16x16x128_fp8_fp8`) to be validated on
-   hardware; we deliberately do not ship unverifiable ISA asm. On-device
-   validation is a half-day with the golden harness once an Instinct is
-   available.
+1. **NVIDIA GEMM below compute capability 10.0 runs bf16
+   `mma.sync.m16n8k16` tensor cores** (fragment mapping per the PTX ISA
+   tables); FP8 operands are decoded to bf16 during the global->shared
+   staging, so memory traffic stays FP8 while compute runs at bf16 tensor
+   rate. On Blackwell (`sm_100a`/`sm_103a`) the **tcgen05 path takes over
+   automatically** (see the inventory row above): e4m3 operands feed
+   `tcgen05.mma.kind::mxf8f6f4.block_scale` directly from 128B-swizzled
+   shared memory (TMA-loaded), the UE8M0 scales ride Tensor Memory as
+   packed x4 words (the DeepGEMM UTCCP-transposer pattern with
+   `tcgen05.cp.32x128b.warpx4`), and the f32 accumulator never leaves
+   Tensor Memory until the Layout-D epilogue. `DeviceModel` picks it
+   transparently (`DEEPINFER_TCGEN05=0` pins the portable kernel); the
+   first driver/JIT rejection falls back stickily, so mixed fleets keep
+   running. Known follow-ups (tracked): 2-CTA cluster MMA (cta_group::2,
+   M=256), persistent tile scheduling, and swap-AB for decode-shaped GEMMs
+   (M=1 wastes 127 accumulator lanes today — bandwidth-bound, so the cost
+   is compute-idle, not traffic).
+2. **AMD GEMM defaults to the LDS-tiled scalar f32 FMA core** — correct
+   and bandwidth-efficient (decode GEMMs are bandwidth-bound at 8 TB/s).
+   The **MFMA FP8 path is implemented and opt-in**
+   (`DEEPINFER_AMD_MFMA=1`): `di_gemm_fp8_nt_mfma_kernel` drives
+   `v_mfma_f32_32x32x16_fp8_fp8` (CDNA3+, compiled for gfx940-class
+   targets) with the fragment mappings transcribed from AMD's matrix-core
+   documentation — A: 8 contiguous k-bytes of row `lane%32`, k-block
+   `8*(lane/32)`; B: `B[k + 8*(lane/32)][lane%32]`; C: rows
+   `8i + j + 4*(lane/32)`, col `lane%32` — and the same per-128-k ue8m0
+   rescale as the scalar core. Because we cannot execute CDNA asm on the
+   CI plane, the path ships **disabled by default**: enable it, then run
+   `amd_mfma_matches_scalar` or one `golden_run --record`/`--verify`
+   round on the Instinct — the goldens compare against the CPU reference,
+   so a wrong lane mapping fails loudly, not silently. Remaining MFMA
+   follow-ups: the bf16 16x16x16 variant (trivial once the FP8 path is
+   validated) and LDS-bank-conflict tuning of the fragment loads.
 3. **Attention / DSA / MoE kernels are bandwidth-oriented scalar-warp
    designs** (warp-per-(head,query) online softmax; serial-per-thread
    dots). They match the algorithmic structure of FlashMLA / DeepGEMM's
@@ -173,17 +194,22 @@ model loop per the original blueprint, plus the three tracked follow-ups:
    CPU-golden test mode); [`Precision::Auto`] selects FP8 whenever
    `k % 128 == 0` (all GEMMs at V4.1 dims) and BF16 otherwise. The
    `q_a|kv_a` projection is fused into one GEMM (rows `[q_lora | kv_a]`).
-2. **Caches**: per self-decoder layer, flat append-only arenas — MLA KV
-   rows in the config's cache format (f32 / 528 B FP8 / 288 B FP4), the
-   DSA indexer's raw k rows (conv branch), the per-head-normed k rows with
-   their block-quantized FP8 copy (thunder branch, quantized incrementally
-   as blocks complete), and the cascade conv features. The arenas hold one
-   max-length sequence — the same total budget as the CPU paged caches —
-   so the device model serves one sequence at a time (`reset()` between
-   sequences; a paged device cache is the multi-sequence upgrade).
-   Rollback is exact: rows are position-keyed, so truncating the logical
-   length leaves surviving rows intact and re-appended rows overwrite
-   their slots (bit-identical to never having appended — tested).
+2. **Caches**: two coexisting engines.
+   *Single-sequence* (the CUDA-graph decode path): per self-decoder
+   layer, flat append-only arenas — MLA KV rows in the config's cache
+   format (f32 / 528 B FP8 / 288 B FP4), the DSA indexer's raw k rows
+   (conv branch), the per-head-normed k rows with their block-quantized
+   FP8 copy (thunder branch, quantized incrementally as blocks complete),
+   and the cascade conv features. Rollback is exact: rows are
+   position-keyed, so truncating the logical length leaves surviving rows
+   intact and re-appended rows overwrite their slots (bit-identical to
+   never having appended — tested).
+   *Multi-sequence* (the paged serve engine, below): the same five
+   per-layer caches become **pools of 64-token pages** (the DSA
+   sparse-index page granularity) with per-sequence device page tables;
+   sequences attach/prefill/decode/rollback/detach independently through
+   `serve_attach` / `serve_prefill` / `serve_decode(batch)` /
+   `serve_rollback` / `serve_detach`, sharing one free list.
 3. **Prefill** (multi-token, eager kernels): rmsnorm -> fused q_a|kv_a ->
    latent norm -> RoPE -> cache encode -> DSA (projections from the raw
    residual, per-head norm, lightning quant, thunder + conv + gating +
@@ -240,11 +266,147 @@ parallelism layer for the NVL72 / Infinity Fabric domain:
   `moe_combine` (fixed k-ascending accumulation).
 
 The receive side keeps the deterministic `(sender, token, k)` row order
-with per-row expert metadata; NVSHMEM-style symmetric buffers with
-sender-side writes directly into the aligned layout remain the documented
-upgrade (the upgrade table below tracks it).
+with per-row expert metadata; the stream-copy path remains the fallback
+for stacks without peer atomics.
+
+**Symmetric-buffer EP (implemented).** `deepinfer-kernels::peer_ll`
+rebuilds the NVSHMEM model on raw driver primitives: every rank owns one
+`SymmetricHeap` with an identical layout (dispatch channels keyed by
+routing slot, per-home combine slots, progress counters), kernels write
+peers' heaps directly over NVLink (in-process peer pointers, or
+IPC-imported pointers through the file-rendezvous `Session` for
+multi-process serving), and correctness rides system-scope
+acquire/release atomics (`red.release.sys` after each payload write,
+`ld.acquire.sys` spins on the receivers). The step protocol —
+reset (event-ordered) -> dispatch (remote slot reservation + payload +
+release-publish) -> dispatch_done (per-rank barrier) -> group (receiver
+scatters into the masked per-expert layout after the device barrier) ->
+[caller's expert GEMMs] -> combine (owner writes home combine slots) ->
+reduce (fixed k-ascending weighted sum) — has **no host readback and no
+per-step allocation**, exactly the DeepEP low-latency contract. Channel
+row order varies run-to-run (reservation races) but per-token outputs are
+deterministic; capacity drops are counted (`drops`) for the caller's
+backpressure.
+
+## Paged device cache and multi-sequence serving (implemented)
+
+`DeviceModel` grows a second cache engine alongside the flat arenas:
+
+* `serve_configure(max_seqs, max_len, pages_per_layer)` allocates, per
+  self-decoder layer, five paged pools (kv / k_raw / k_norm / k_u8 /
+  feat) of `pages_per_layer` x 64 rows plus the batch-sized serve
+  workspace (activations for `max_seqs` decode rows, score matrices for
+  the prefill chunk, split-KV partials, masked-MoE staging).
+* Page ids are global: one shared free list, one physical id addressing
+  the same logical page in every layer's pools (identical geometry).
+* One batched decode step = **one launch per operator per layer** across
+  all sequences: the `di_serve_*` kernels take `grid.z = slots` (or fold
+  the slot into `blockIdx`), read the per-slot geometry from a device
+  cell block that `di_serve_fanout_kernel` expands from a single small
+  host upload (`{active, pos, len, sq, sqnb}` per slot), and translate
+  every row through `tbl[r / 64] * 64 + r % 64`. No varying scalar is a
+  kernel argument — the same graph-safety rule as the decode family.
+* Prefill runs through the same kernels with one slot and `sq = chunk`
+  (512-token chunks, aligned-contiguous MoE); decode runs with
+  `sq = 1` per slot and the masked-capacity MoE (`cap = batch`), both
+  graph-safe.
+* Rollback truncates the logical length; page tables keep their entries
+  and re-appended rows overwrite their slots (the arena semantics,
+  position-keyed). Detach returns pages to the free list.
+* The single-sequence engine (arenas + CUDA-graph decode capture) is
+  untouched and shares weights, the JIT library, and the eager kernels
+  with the serve engine; MTP drafting stays on the single-sequence path
+  (documented; the serve batch loop re-enters through prefill for
+  verification).
+
+Golden: `serve_engine_multi_sequence` (auto-skipped without a GPU)
+compares two interleaved sequences against the single-sequence device
+path — itself CPU-validated — through prefill, four interleaved decode
+steps, an exact rollback, and a detach/re-attach cycle.
+
+## On-hardware golden runs (the acceptance battery)
+
+`crates/runtime/examples/golden_run.rs` is the machine-facing acceptance
+harness:
+
+```bash
+cargo run --release -p deepinfer-runtime --example golden_run -- --list
+cargo run --release -p deepinfer-runtime --example golden_run -- --record golden-<site>.json
+cargo run --release -p deepinfer-runtime --example golden_run -- --verify golden-<site>.json
+```
+
+`--record` writes a JSON artifact with the capability report (backend,
+device, arch, SM count, memory, NVRTC version, tcgen05-family and graph
+flags) plus one entry per check: the F32 model vs the CPU golden, the FP8
+Auto smoke, CUDA-graph replay determinism and rollback exactness (SHA
+hashes of the logits), the tcgen05-vs-portable GEMM agreement (Blackwell
+only), the paged serve engine vs the single-sequence path, the
+symmetric-buffer EP protocol (world 1, and multi-rank when >= 2 devices
+are visible), and decode/prefill timings. `--verify` re-runs the battery
+against a recorded artifact (same machine/driver) and fails on any
+regression. Without a GPU the harness prints the capability report and
+exits cleanly — the auto-skip contract of the test suite.
 
 ## Running on hardware
+
+## Paged device cache and multi-sequence serving (implemented)
+
+`DeviceModel` grows a second cache engine alongside the flat arenas:
+
+* `serve_configure(max_seqs, max_len, pages_per_layer)` allocates, per
+  self-decoder layer, five paged pools (kv / k_raw / k_norm / k_u8 /
+  feat) of `pages_per_layer` x 64 rows plus the batch-sized serve
+  workspace (activations for `max_seqs` decode rows, score matrices for
+  the prefill chunk, split-KV partials, masked-MoE staging).
+* Page ids are global: one shared free list, one physical id addressing
+  the same logical page in every layer's pools (identical geometry).
+* One batched decode step = **one launch per operator per layer** across
+  all sequences: the `di_serve_*` kernels take `grid.z = slots` (or fold
+  the slot into `blockIdx`), read the per-slot geometry from a device
+  cell block that `di_serve_fanout_kernel` expands from a single small
+  host upload (`{active, pos, len, sq, sqnb}` per slot), and translate
+  every row through `tbl[r / 64] * 64 + r % 64`. No varying scalar is a
+  kernel argument — the same graph-safety rule as the decode family.
+* Prefill runs through the same kernels with one slot and `sq = chunk`
+  (512-token chunks, aligned-contiguous MoE); decode runs with
+  `sq = 1` per slot and the masked-capacity MoE (`cap = batch`), both
+  graph-safe.
+* Rollback truncates the logical length; page tables keep their entries
+  and re-appended rows overwrite their slots (the arena semantics,
+  position-keyed). Detach returns pages to the free list.
+* The single-sequence engine (arenas + CUDA-graph decode capture) is
+  untouched and shares weights, the JIT library, and the eager kernels
+  with the serve engine; MTP drafting stays on the single-sequence path
+  (documented; the serve batch loop re-enters through prefill for
+  verification).
+
+Golden: `serve_engine_multi_sequence` (auto-skipped without a GPU)
+compares two interleaved sequences against the single-sequence device
+path — itself CPU-validated — through prefill, four interleaved decode
+steps, an exact rollback, and a detach/re-attach cycle.
+
+## On-hardware golden runs (the acceptance battery)
+
+`crates/runtime/examples/golden_run.rs` is the machine-facing acceptance
+harness:
+
+```bash
+cargo run --release -p deepinfer-runtime --example golden_run -- --list
+cargo run --release -p deepinfer-runtime --example golden_run -- --record golden-<site>.json
+cargo run --release -p deepinfer-runtime --example golden_run -- --verify golden-<site>.json
+```
+
+`--record` writes a JSON artifact with the capability report (backend,
+device, arch, SM count, memory, NVRTC version, tcgen05-family and graph
+flags) plus one entry per check: the F32 model vs the CPU golden, the FP8
+Auto smoke, CUDA-graph replay determinism and rollback exactness (SHA
+hashes of the logits), the tcgen05-vs-portable GEMM agreement (Blackwell
+only), the paged serve engine vs the single-sequence path, the
+symmetric-buffer EP protocol (world 1, and multi-rank when >= 2 devices
+are visible), and decode/prefill timings. `--verify` re-runs the battery
+against a recorded artifact (same machine/driver) and fails on any
+regression. Without a GPU the harness prints the capability report and
+exits cleanly — the auto-skip contract of the test suite.
 
 ## Running on hardware
 

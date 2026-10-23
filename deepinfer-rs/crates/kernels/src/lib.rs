@@ -35,8 +35,15 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Cache key of a tcgen05 tensor-map pair.
+type TmKey = (u64, u64, usize, usize, usize);
+/// The cached (A, B) tensor maps of one GEMM site.
+type TmPair = (TensorMap, TensorMap);
+
 use deepinfer_core::{ensure, Error, Result};
-use deepinfer_gpu::{compile_and_load, Backend, Buffer, Device, Function, Module, Stream};
+use deepinfer_gpu::{
+    compile_and_load, Backend, Buffer, Device, Function, GpuArch, Module, Stream, TensorMap,
+};
 
 mod elementwise;
 mod gemm;
@@ -44,12 +51,16 @@ mod attention;
 mod dsamoe;
 mod decode;
 mod peer;
+mod peer_ll;
+mod serve;
 
 pub use attention::DECODE_CHUNK;
 pub use decode::{fanout_params, DecodeParams, StepGeometry};
 pub use elementwise::CacheFormat;
 pub use gemm::GemmDType;
 pub use peer::{build_send_plan, PeerMesh, SendPlan};
+pub use peer_ll::{SymmetricEp, SymmetricHeap};
+pub use serve::{ServeCellIn, SERVE_CELL_FIELDS, SERVE_PAGE};
 
 /// Embedded kernel sources (one translation unit per group).
 pub mod source {
@@ -72,6 +83,12 @@ pub mod source {
     pub const DECODE_PARAMS: &str = include_str!("../kernels/decode_params.h");
     /// The graph-replayable `_dev` decode kernel family.
     pub const DECODE: &str = include_str!("../kernels/decode.cu");
+    /// tcgen05 + TMA FP8 GEMM (sm_100a / sm_103a only; CUDA only).
+    pub const GEMM_SM100: &str = include_str!("../kernels/gemm_sm100.cu");
+    /// NVSHMEM-style symmetric-buffer EP (device-initiated peer writes).
+    pub const PEER_LL: &str = include_str!("../kernels/peer_ll.cu");
+    /// The paged-cache multi-sequence serving kernel family.
+    pub const SERVE: &str = include_str!("../kernels/serve.cu");
 }
 
 /// Compile a module group for `device` (goes through the JIT disk cache).
@@ -86,6 +103,41 @@ fn build_module(device: &Device, name: &str, src: &str) -> Result<Module> {
     compile_and_load(device, src, name, &arch, &extra)
 }
 
+/// Build the tcgen05 module when `device` is a Blackwell-class CUDA device.
+///
+/// The `a`-suffixed targets carry the tcgen05 instructions (the portable
+/// `sm_100` target rejects them); the matching `compute_…a` PTX is the
+/// fallback when the local NVRTC predates the cubin target.
+fn sm100_module(device: &Device) -> Result<Option<Module>> {
+    if device.backend() != Backend::Cuda {
+        return Ok(None);
+    }
+    let (major, minor) = match device.props().arch {
+        GpuArch::Sm(maj, min) => (maj, min),
+        GpuArch::Gfx(_) => return Ok(None),
+    };
+    if major < 10 {
+        return Ok(None);
+    }
+    // Family targets: 10.0/10.1 -> sm_100a, 10.3+ -> sm_103a (B300).
+    let (sm, compute) = if minor >= 3 {
+        ("sm_103a", "compute_103a")
+    } else {
+        ("sm_100a", "compute_100a")
+    };
+    let src = format!("{}\n{}", source::COMMON, source::GEMM_SM100);
+    let extra = vec!["--use_fast_math=off".to_string()];
+    let m = deepinfer_gpu::compile_and_load_with_arch(
+        device,
+        &src,
+        "gemm_sm100",
+        &format!("--gpu-architecture={sm}"),
+        Some(&format!("--gpu-architecture={compute}")),
+        &extra,
+    )?;
+    Ok(Some(m))
+}
+
 /// Compiled kernel library bound to one device.
 ///
 /// All kernel entry points are resolved once at construction. Launches are
@@ -98,7 +150,22 @@ pub struct Kernels {
     m_dsa: Module,
     m_moe: Module,
     m_dec: Module,
+    /// tcgen05 module — present only on CUDA devices with compute
+    /// capability >= 10.0 (compiled for the `sm_100a`/`sm_103a` family
+    /// target). Everything else keeps the portable module set above.
+    m_gemm100: Option<Module>,
+    /// Low-latency symmetric-buffer EP module (any backend; the kernels
+    /// degrade to in-rank copies when world == 1).
+    m_peer_ll: Module,
+    /// Paged multi-sequence serving module.
+    m_serve: Module,
     cache: Mutex<HashMap<&'static str, Function>>,
+    /// Tensor maps for the tcgen05 GEMM, keyed by
+    /// `(a_ptr, b_ptr, m, n, k)`; bounded, cleared on overflow.
+    tm_cache: Mutex<HashMap<TmKey, TmPair>>,
+    /// Whether the tcgen05 kernel's dynamic-smem attribute was already
+    /// raised (per-function, sticky).
+    sm100_smem_set: Mutex<bool>,
 }
 
 impl std::fmt::Debug for Kernels {
@@ -106,6 +173,7 @@ impl std::fmt::Debug for Kernels {
         f.debug_struct("Kernels")
             .field("device", &self.device.props().name)
             .field("arch", &self.device.props().arch.as_str())
+            .field("tcgen05", &self.m_gemm100.is_some())
             .finish()
     }
 }
@@ -119,6 +187,12 @@ impl Kernels {
         let cd = format!("{}\n{}", source::COMMON, source::DSA);
         let cm = format!("{}\n{}", source::COMMON, source::MOE);
         let ck = format!("{}\n{}\n{}", source::COMMON, source::DECODE_PARAMS, source::DECODE);
+        let cpl = format!("{}\n{}", source::COMMON, source::PEER_LL);
+        let csv = format!("{}\n{}", source::COMMON, source::SERVE);
+        // The tcgen05 module targets the architecture-specific family
+        // (`sm_100a` / `sm_103a`); it is built only on Blackwell-class CUDA
+        // devices, and its absence is not an error anywhere else.
+        let m_gemm100 = sm100_module(device)?;
         let k = Kernels {
             m_elem: build_module(device, "elementwise", &cu)?,
             m_gemm: build_module(device, "gemm", &cg)?,
@@ -126,10 +200,21 @@ impl Kernels {
             m_dsa: build_module(device, "dsa", &cd)?,
             m_moe: build_module(device, "moe", &cm)?,
             m_dec: build_module(device, "decode", &ck)?,
+            m_peer_ll: build_module(device, "peer_ll", &cpl)?,
+            m_serve: build_module(device, "serve", &csv)?,
+            m_gemm100,
             device: device.clone(),
             cache: Mutex::new(HashMap::new()),
+            tm_cache: Mutex::new(HashMap::new()),
+            sm100_smem_set: Mutex::new(false),
         };
         Ok(k)
+    }
+
+    /// Whether the tcgen05 (5th-gen tensor core) GEMM module is available
+    /// on this device (CUDA with compute capability >= 10.0).
+    pub fn tcgen05_available(&self) -> bool {
+        self.m_gemm100.is_some()
     }
 
     /// The device this library runs on.
@@ -139,7 +224,7 @@ impl Kernels {
 
     /// Resolve (and memoize) a kernel entry point by name. Memoized lookups
     /// cost one uncontended mutex lock; misses do one driver lookup.
-    pub(crate) fn f(&self, name: &'static str) -> Result<Function> {
+    pub fn f(&self, name: &'static str) -> Result<Function> {
         if let Some(f) = self.cache.lock().expect("kernel cache poisoned").get(name) {
             return Ok(f.clone());
         }
@@ -156,6 +241,14 @@ impl Kernels {
             }
             n if n.starts_with("di_gather_rows") => &self.m_att,
             n if n.starts_with("di_silu_mul_masked") => &self.m_moe,
+            n if n.starts_with("di_gemm_fp8_nt_sm100a") => self
+                .m_gemm100
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::invalid("the tcgen05 GEMM needs CUDA compute capability >= 10.0")
+                })?,
+            n if n.starts_with("di_ep_") => &self.m_peer_ll,
+            n if n.starts_with("di_serve_") => &self.m_serve,
             n if n.starts_with("di_rmsnorm")
                 || n.starts_with("di_rope")
                 || n.starts_with("di_silu")
@@ -327,6 +420,10 @@ mod tests {
             (dsamoe::KERNEL_NAMES, source::DSA),
             (dsamoe::MOE_KERNEL_NAMES, source::MOE),
             (decode::KERNEL_NAMES, source::DECODE),
+            (gemm::KERNEL_NAMES_SM100, source::GEMM_SM100),
+            (gemm::KERNEL_NAMES_MFMA, source::GEMM),
+            (peer_ll::KERNEL_NAMES, source::PEER_LL),
+            (serve::KERNEL_NAMES, source::SERVE),
         ];
         for (names, src) in rust_sources {
             for k in names {

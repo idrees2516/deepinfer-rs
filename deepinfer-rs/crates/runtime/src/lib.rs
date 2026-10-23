@@ -24,6 +24,7 @@ pub mod device_model;
 pub mod generate;
 pub mod loader;
 pub mod model;
+pub mod serve;
 pub mod weights;
 
 pub use config::ModelConfig;

@@ -640,3 +640,143 @@ di_gemm_fp8_grouped_nt_kernel(const void* __restrict__ a,
     gemm_store_nv(acc, NULL, d, m0, n0, M_eff, N);
 #endif
 }
+
+
+// ---------------------------------------------------------------------------
+// AMD MFMA FP8 NT GEMM (CDNA3+ / gfx940-950), the MI335X counterpart of
+// the tcgen05 e4m3 path. Behind DEEPINFER_AMD_MFMA=1 until the first
+// on-hardware golden validation (docs/GPU.md "upgrade paths"): the
+// fragment mappings below are transcribed from AMD's matrix-core
+// documentation (v_mfma_f32_32x32x16_fp8_fp8, wave64):
+//   A [M=32, K=16] fragment: lane holds 8 contiguous k-bytes of row
+//     (lane % 32), k-block 8 * (lane / 32).
+//   B [K=16, N=32] fragment: lane holds B[k = i + 8*(lane/32)]
+//     [n = lane % 32] for i in 0..8 (our NT layout stores B as [n, k],
+//     i.e. the transpose, so the loads are k-strided).
+//   C [M=32, N=32]: lane holds C[row = 8*i + j + 4*(lane/32)]
+//     [col = lane % 32] for i in 0..4, j in 0..4 (16 f32).
+// Same DeepGEMM 1x128 / 128x128 ue8m0 rescale semantics as the scalar
+// core; per-128-k blocks fold into the register accumulators.
+// ---------------------------------------------------------------------------
+#if defined(__HIP__) && (defined(__gfx940__) || defined(__gfx941__) || \
+                         defined(__gfx942__) || defined(__gfx950__) || \
+                         defined(__gfx942) || defined(__gfx950))
+
+typedef float __attribute__((vector_size(16 * 4))) di_f32x16;
+typedef unsigned char __attribute__((vector_size(8))) di_u8x8;
+
+__device__ __forceinline__ di_f32x16 di_mfma_f32_32x32x16_fp8(long a, long b,
+                                                              di_f32x16 c) {
+    return __builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8(a, b, c, 0, 0, 0);
+}
+
+extern "C" __global__ void __launch_bounds__(GEMM_THREADS)
+di_gemm_fp8_nt_mfma_kernel(const void* __restrict__ a,
+                           const u8* __restrict__ a_sf,
+                           const void* __restrict__ b,
+                           const u8* __restrict__ b_sf,
+                           float* __restrict__ d,
+                           int M, int N, int K) {
+    // Stage raw FP8 tiles (no decode): A [64, 32], B [64, 32] per step.
+    __shared__ u8 as[GEMM_BM * GEMM_BK];
+    __shared__ u8 bs[GEMM_BN * GEMM_BK];
+    int m0 = (int)blockIdx.y * GEMM_BM;
+    int n0 = (int)blockIdx.x * GEMM_BN;
+    int kb_blocks = K >> 7;
+    const u8* a8 = (const u8*)a;
+    const u8* b8 = (const u8*)b;
+    // 4 waves: wave (wy, wx) owns the 32x32 output tile (wy, wx).
+    int wave = (int)(threadIdx.x / DI_WARP); // 0..3
+    int wy = wave >> 1;
+    int wx = wave & 1;
+    int lane = (int)(threadIdx.x & (DI_WARP - 1));
+    int arow_l = wy * 32 + (lane % 32); // A row this lane feeds
+    int bcol_l = wx * 32 + (lane % 32); // B (output) column this lane feeds
+    float acc[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+    for (int kb = 0; kb < kb_blocks; ++kb) {
+        int k0 = kb << 7;
+        float blk[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) blk[i] = 0.0f;
+        for (int kk = 0; kk < 4; ++kk) { // 4 x BK=32 = 128
+            int kc = k0 + kk * GEMM_BK;
+            // Stage raw bytes (bounds-guarded, zero padding).
+            for (int idx = (int)threadIdx.x; idx < GEMM_BM * GEMM_BK;
+                 idx += GEMM_THREADS) {
+                int r = idx / GEMM_BK;
+                int c = idx - r * GEMM_BK;
+                u8 v = 0;
+                int gm = m0 + r;
+                int gk = kc + c;
+                if (gm < M && gk < K) v = a8[(u64)gm * K + gk];
+                as[idx] = v;
+            }
+            for (int idx = (int)threadIdx.x; idx < GEMM_BN * GEMM_BK;
+                 idx += GEMM_THREADS) {
+                int r = idx / GEMM_BK; // n
+                int c = idx - r * GEMM_BK; // k
+                u8 v = 0;
+                int gn = n0 + r;
+                int gk = kc + c;
+                if (gn < N && gk < K) v = b8[(u64)gn * K + gk];
+                bs[idx] = v;
+            }
+            __syncthreads();
+            // Two MFMA steps of K=16 over the BK=32 tile.
+#pragma unroll
+            for (int step = 0; step < 2; ++step) {
+                int kbase = step * 16;
+                // A fragment: 8 contiguous bytes of row arow_l.
+                const u8* ap = as + arow_l * GEMM_BK + kbase + 8 * (lane / 32);
+                long areg = (long)*(const di_u8x8*)ap;
+                // B fragment: B[k = kbase + i + 8*(lane/32)][n = bcol_l]
+                // stored as bs[n * BK + k].
+                long breg = 0;
+                const u8* bp = bs + bcol_l * GEMM_BK + kbase + 8 * (lane / 32);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    breg |= ((long)bp[i]) << (8 * i);
+                }
+                di_f32x16 creg;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) creg[i] = blk[i];
+                creg = di_mfma_f32_32x32x16_fp8(areg, breg, creg);
+#pragma unroll
+                for (int i = 0; i < 16; ++i) blk[i] = creg[i];
+            }
+            __syncthreads();
+        }
+        // Fold the finished 128-k block with the ue8m0 scales.
+        // C row of blk[i*4+j] = wy*32 + 8*i + j + 4*(lane/32);
+        // C col = wx*32 + lane%32.
+        float sb = di_e8m0_to_f32(b_sf[(u64)((n0 + wx * 32 + (lane % 32)) >> 7) * kb_blocks + kb]);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int rlo = m0 + wy * 32 + 8 * i + 4 * (lane / 32);
+            float sa0 = (rlo < M) ? di_e8m0_to_f32(a_sf[(u64)rlo * kb_blocks + kb]) : 0.0f;
+            float sa1 = (rlo + 1 < M) ? di_e8m0_to_f32(a_sf[(u64)(rlo + 1) * kb_blocks + kb]) : 0.0f;
+            float sa2 = (rlo + 2 < M) ? di_e8m0_to_f32(a_sf[(u64)(rlo + 2) * kb_blocks + kb]) : 0.0f;
+            float sa3 = (rlo + 3 < M) ? di_e8m0_to_f32(a_sf[(u64)(rlo + 3) * kb_blocks + kb]) : 0.0f;
+            float sas[4] = {sa0, sa1, sa2, sa3};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                acc[i * 4 + j] += blk[i * 4 + j] * (sas[j] * sb);
+            }
+        }
+    }
+    // Store (guarded): row = m0 + wy*32 + 8*i + j + 4*(lane/32),
+    // col = n0 + wx*32 + lane%32.
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int r = m0 + wy * 32 + 8 * i + j + 4 * (lane / 32);
+            int c = n0 + wx * 32 + (lane % 32);
+            if (r < M && c < N) d[(u64)r * N + c] = acc[i * 4 + j];
+        }
+    }
+}
+
+#endif // __HIP__ && gfx940..950

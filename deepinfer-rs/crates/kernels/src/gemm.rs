@@ -1,12 +1,23 @@
 //! GEMM launchers (DeepGEMM semantics; see kernels/gemm.cu).
 
 use deepinfer_core::{ensure, Result};
-use deepinfer_gpu::{Buffer, KernelArgs, Launch, Stream};
+use deepinfer_gpu::{
+    Buffer, KernelArgs, Launch, Stream, TensorMapDType as TmDType, TensorMapSwizzle as TmSw,
+};
 
 use crate::Kernels;
 
 const BM: usize = 64;
 const BN: usize = 64;
+
+/// Tile geometry of the tcgen05 kernel (must match kernels/gemm_sm100.cu).
+pub(crate) const SM100_BM: usize = 128;
+pub(crate) const SM100_BN: usize = 256;
+/// Dynamic shared-memory bytes the tcgen05 kernel requests (SM100_SMEM_BYTES
+/// from kernels/gemm_sm100.cu — the launcher and the kernel must agree).
+pub(crate) const SM100_SMEM_BYTES: u32 = 152_144;
+/// Upper bound on cached (a, b) tensor-map pairs for the tcgen05 GEMM.
+const SM100_TM_CACHE_CAP: usize = 256;
 
 /// Kernel entry points defined in `kernels/gemm.cu` (used by the
 /// source-name sanity test).
@@ -18,6 +29,16 @@ pub(crate) const KERNEL_NAMES: &[&str] = &[
     "di_gemm_fp8_grouped_nt_kernel",
     "di_gemm_grouped_masked_nt_kernel",
 ];
+
+/// Kernel entry points defined in `kernels/gemm_sm100.cu`.
+#[cfg(test)]
+pub(crate) const KERNEL_NAMES_SM100: &[&str] = &["di_gemm_fp8_nt_sm100a_kernel"];
+
+/// Kernel entry points defined in `kernels/gemm.cu` under the AMD MFMA
+/// guard (present in the source on every backend; compiled only for
+/// gfx940-class targets).
+#[cfg(test)]
+pub(crate) const KERNEL_NAMES_MFMA: &[&str] = &["di_gemm_fp8_nt_mfma_kernel"];
 
 /// Operand dtype ids of the device GEMM kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +132,157 @@ impl Kernels {
         ensure!(m > 0 && n > 0 && k > 0, InvalidArgument, "gemm needs m/n/k > 0");
         ensure!(k % 128 == 0, InvalidArgument, "fp8 gemm requires k % 128 == 0");
         let f = self.f("di_gemm_fp8_nt_kernel")?;
+        f.launch(
+            self.device(),
+            gemm_launch(n, m),
+            &KernelArgs::new()
+                .ptr(a)
+                .ptr(a_sf)
+                .ptr(b)
+                .ptr(b_sf)
+                .ptr(d)
+                .i32(m as i32)
+                .i32(n as i32)
+                .i32(k as i32),
+            stream,
+        )
+    }
+
+    /// Dense FP8 block-scaled NT GEMM on the **5th-generation tensor cores**
+    /// (`tcgen05.mma.kind::mxf8f6f4` + TMA + Tensor Memory), for CUDA
+    /// devices with compute capability >= 10.0 (`sm_100a` / `sm_103a`).
+    ///
+    /// Identical numerics contract to [`Kernels::gemm_fp8_nt`]: the UE8M0
+    /// scales are applied inside the MMA (block-scaled kind), so the result
+    /// matches the portable kernel up to accumulation order (golden tests
+    /// compare both against the CPU reference with tolerances). Tensor maps
+    /// are cached per `(a_ptr, b_ptr, m, n, k)` — call sites with stable
+    /// workspace buffers (the DeviceModel) hit the cache every step.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] when the module is unavailable (non-Blackwell
+    /// or non-CUDA device) or shapes violate the fp8 contract;
+    /// [`Error::Internal`] on driver/JIT failures.
+    pub fn gemm_fp8_nt_sm100(
+        &self,
+        a: &Buffer,
+        a_sf: &Buffer,
+        b: &Buffer,
+        b_sf: &Buffer,
+        d: &Buffer,
+        m: usize,
+        n: usize,
+        k: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure!(
+            self.tcgen05_available(),
+            InvalidArgument,
+            "tcgen05 GEMM unavailable (needs CUDA cc >= 10.0)"
+        );
+        ensure!(m > 0 && n > 0 && k > 0, InvalidArgument, "gemm needs m/n/k > 0");
+        ensure!(k % 128 == 0, InvalidArgument, "fp8 gemm requires k % 128 == 0");
+        let f = self.f("di_gemm_fp8_nt_sm100a_kernel")?;
+        // Raise the dynamic-smem ceiling once per function handle.
+        {
+            let mut set = self.sm100_smem_set.lock().expect("sm100 smem flag poisoned");
+            if !*set {
+                f.set_max_dynamic_smem(self.device(), SM100_SMEM_BYTES)?;
+                *set = true;
+            }
+        }
+        // Tensor maps (cached; the workspace buffers are stable per site).
+        let key = (a.ptr(), b.ptr(), m, n, k);
+        let maps = {
+            let mut cache = self.tm_cache.lock().expect("tensor-map cache poisoned");
+            if !cache.contains_key(&key) {
+                if cache.len() >= SM100_TM_CACHE_CAP {
+                    cache.clear(); // bounded; stable working sets never hit this
+                }
+                let ta = self.device().encode_tensor_map_2d(
+                    a,
+                    TmDType::U8,
+                    k,
+                    m,
+                    128, // inner box = one 128 B swizzle atom (BLOCK_K)
+                    SM100_BM,
+                    TmSw::Sw128,
+                )?;
+                let tb = self.device().encode_tensor_map_2d(
+                    b,
+                    TmDType::U8,
+                    k,
+                    n,
+                    128,
+                    SM100_BN,
+                    TmSw::Sw128,
+                )?;
+                cache.insert(key, (ta, tb));
+            }
+            *cache.get(&key).expect("just inserted")
+        };
+        let grid = (
+            (n as u64).div_ceil(SM100_BN as u64) as u32,
+            (m as u64).div_ceil(SM100_BM as u64) as u32,
+            1,
+        );
+        f.launch(
+            self.device(),
+            Launch {
+                grid,
+                block: (256, 1, 1),
+                shared: SM100_SMEM_BYTES,
+            },
+            &KernelArgs::new()
+                .tensor_map(&maps.0)
+                .tensor_map(&maps.1)
+                .ptr(a_sf)
+                .ptr(b_sf)
+                .ptr(d)
+                .i32(m as i32)
+                .i32(n as i32)
+                .i32(k as i32),
+            stream,
+        )
+    }
+
+    /// Dense FP8 block-scaled NT GEMM on the **AMD matrix cores**
+    /// (`v_mfma_f32_32x32x16_fp8_fp8`, CDNA3+). Same numerics contract as
+    /// [`Kernels::gemm_fp8_nt`]; fragment mappings transcribed from AMD's
+    /// matrix-core documentation. Opt-in behind `DEEPINFER_AMD_MFMA=1`
+    /// until the first on-hardware golden validation
+    /// (`golden_run --record/--verify`); the scalar path stays the default.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] when the flag is unset, on a non-HIP
+    /// backend, or on shape violations; [`Error::Internal`] on launch
+    /// failures.
+    pub fn gemm_fp8_nt_mfma(
+        &self,
+        a: &Buffer,
+        a_sf: &Buffer,
+        b: &Buffer,
+        b_sf: &Buffer,
+        d: &Buffer,
+        m: usize,
+        n: usize,
+        k: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure!(
+            std::env::var("DEEPINFER_AMD_MFMA").ok().as_deref() == Some("1"),
+            InvalidArgument,
+            "the AMD MFMA path is opt-in (set DEEPINFER_AMD_MFMA=1 after \
+             golden-validating it on this Instinct)"
+        );
+        ensure!(
+            self.device().backend() == deepinfer_gpu::Backend::Hip,
+            InvalidArgument,
+            "the MFMA path is AMD-only"
+        );
+        ensure!(m > 0 && n > 0 && k > 0, InvalidArgument, "gemm needs m/n/k > 0");
+        ensure!(k % 128 == 0, InvalidArgument, "fp8 gemm requires k % 128 == 0");
+        let f = self.f("di_gemm_fp8_nt_mfma_kernel")?;
         f.launch(
             self.device(),
             gemm_launch(n, m),

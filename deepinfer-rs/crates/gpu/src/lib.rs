@@ -51,9 +51,11 @@ pub mod sync;
 
 pub use device::{
     Backend, Buffer, Device, DeviceProps, Function, Gpu, GpuArch, KernelArgs, Launch, Module,
-    Stream,
+    Stream, TensorMap, TensorMapDType, TensorMapSwizzle,
 };
-pub use jit::{compile, compile_and_load, KernelImage};
+pub use jit::{
+    compile, compile_and_load, compile_and_load_with_arch, KernelImage,
+};
 pub use sync::{graph_supported, CaptureGuard, Event, GraphExec};
 
 #[cfg(test)]

@@ -81,6 +81,161 @@ pub fn compile_and_load(
     device.load_module(image.bytes())
 }
 
+/// Compile with an explicit `--gpu-architecture` override and load it.
+///
+/// Used by family-specific modules (e.g. the tcgen05 GEMM, which requires
+/// the `sm_100a`/`sm_103a` architecture-specific targets rather than the
+/// portable `sm_100`/`sm_103`). `ptx_flag` is the matching `compute_…a`
+/// fallback for driver-side JIT when the local NVRTC predates the cubin
+/// target.
+pub fn compile_and_load_with_arch(
+    device: &Device,
+    source: &str,
+    kernel_name: &str,
+    arch_flag: &str,
+    ptx_flag: Option<&str>,
+    extra_options: &[String],
+) -> Result<Module> {
+    let arch_tag = arch_flag.trim_start_matches("--gpu-architecture=");
+    let image = compile_with_arch(device, source, kernel_name, arch_tag, arch_flag, ptx_flag, extra_options)?;
+    device.load_module(image.bytes())
+}
+
+/// Cache-keyed compile with an explicit architecture flag pair.
+fn compile_with_arch(
+    device: &Device,
+    source: &str,
+    kernel_name: &str,
+    arch_tag: &str,
+    arch_flag: &str,
+    ptx_flag: Option<&str>,
+    extra: &[String],
+) -> Result<KernelImage> {
+    let backend = device.backend();
+    let key = hex_digest(&[
+        backend.name().as_bytes(),
+        arch_tag.as_bytes(),
+        kernel_name.as_bytes(),
+        extra_options_joined(extra).as_bytes(),
+        source.as_bytes(),
+    ]);
+    let dir = cache_dir();
+    let cache_path = dir.as_ref().map(|d| d.join(format!("{key}.bin")));
+    if let Some(path) = &cache_path {
+        if let Ok(bytes) = std::fs::read(path) {
+            debug_log(&format!("cache hit {kernel_name} ({key:.12})"));
+            return Ok(match backend {
+                Backend::Cuda => KernelImage::Cubin(bytes),
+                Backend::Hip => KernelImage::CodeObject(bytes),
+            });
+        }
+    }
+    debug_log(&format!("compiling {kernel_name} for {arch_tag}"));
+    let image = match backend {
+        Backend::Cuda => {
+            let rtc = device
+                .nvrtc()
+                .ok_or_else(|| Error::internal("libnvrtc not present; cannot JIT CUDA kernels"))?;
+            compile_cuda_with_arch(rtc, source, kernel_name, arch_flag, ptx_flag, extra)?
+        }
+        Backend::Hip => {
+            let rtc = device
+                .hiprtc()
+                .ok_or_else(|| Error::internal("libhiprtc not present; cannot JIT HIP kernels"))?;
+            let arch = GpuArch::Gfx(arch_tag.to_string());
+            compile_hip(rtc, source, kernel_name, &arch, extra)?
+        }
+    };
+    if let Some(path) = &cache_path {
+        if let Some(parent) = path.parent() {
+            if std::fs::create_dir_all(parent).is_ok() {
+                if let Ok(mut f) = std::fs::File::create(path) {
+                    let _ = f.write_all(image.bytes());
+                }
+            }
+        }
+    }
+    Ok(image)
+}
+
+fn extra_options_joined(extra: &[String]) -> String {
+    extra.join("\u{1}")
+}
+
+/// CUDA compile with an explicit architecture flag (no GpuArch indirection).
+fn compile_cuda_with_arch(
+    rtc: &Nvrtc,
+    source: &str,
+    kernel_name: &str,
+    arch_flag: &str,
+    ptx_flag: Option<&str>,
+    extra: &[String],
+) -> Result<KernelImage> {
+    let src = cstring(source)?;
+    let name = cstring(&format!("{kernel_name}.cu"))?;
+    let mut prog: *mut c_void = std::ptr::null_mut();
+    // SAFETY: NVRTC program creation per nvrtc.h; out-pointer valid, source
+    // NUL-terminated, zero headers.
+    let r = unsafe {
+        (rtc.create_program)(
+            &mut prog,
+            src.as_ptr(),
+            name.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    ensure!(r == 0, Internal, "nvrtcCreateProgram: {}", rtc.error_string(r));
+
+    let run_compile = |flag: &str| -> Result<(u32, String)> {
+        let mut flags: Vec<String> = vec![
+            "--std=c++17".to_string(),
+            flag.to_string(),
+            "-default-device".to_string(),
+        ];
+        flags.extend(extra.iter().cloned());
+        let cflags: Vec<CString> = flags.iter().map(|f| cstring(f)).collect::<Result<_>>()?;
+        let ptrs: Vec<*const std::ffi::c_char> = cflags.iter().map(|f| f.as_ptr()).collect();
+        // SAFETY: program handle valid; options NUL-terminated.
+        let r = unsafe { (rtc.compile_program)(prog, ptrs.len() as i32, ptrs.as_ptr()) };
+        let log = program_log_nvrtc(rtc, prog);
+        Ok((r, log))
+    };
+
+    let (mut r, mut log) = run_compile(arch_flag)?;
+    let mut used_ptx = false;
+    if r != 0 {
+        if let Some(ptx) = ptx_flag {
+            debug_log("sm target rejected; retrying with PTX for driver JIT");
+            let (r2, log2) = run_compile(ptx)?;
+            r = r2;
+            log = log2;
+            used_ptx = true;
+        }
+    }
+    if r != 0 {
+        // SAFETY: destroys the program we created; handle becomes invalid.
+        unsafe { (rtc.destroy_program)(&mut prog) };
+        return Err(Error::internal(format!(
+            "NVRTC compile failed for {kernel_name} ({}):\n{log}",
+            rtc.error_string(r)
+        )));
+    }
+    if !log.trim().is_empty() {
+        debug_log(&format!("{kernel_name} nvrtc log: {log}"));
+    }
+    let want_ptx = used_ptx || arch_flag.starts_with("--gpu-architecture=compute_");
+    let bytes = if want_ptx {
+        get_blob_nvrtc(rtc, prog, kernel_name, true)?
+    } else {
+        get_blob_nvrtc(rtc, prog, kernel_name, false)?
+    };
+    // SAFETY: destroys the program we created; we never touch it again.
+    unsafe { (rtc.destroy_program)(&mut prog) };
+    Ok(KernelImage::Cubin(bytes))
+}
+
 /// Compile one translation unit, going through the disk cache when enabled.
 pub fn compile(
     device: &Device,
