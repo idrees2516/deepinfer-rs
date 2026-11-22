@@ -39,7 +39,7 @@
 pub mod rebalance;
 pub mod stats;
 
-pub use rebalance::{get_redundant_experts, rebalance_experts, EplbMaps};
+pub use rebalance::{ep_routing, get_redundant_experts, rebalance_experts, EplbMaps};
 pub use stats::ExpertStats;
 
 use deepinfer_core::{ensure, Error, Result};

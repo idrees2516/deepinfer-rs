@@ -249,11 +249,19 @@ model and upgrade paths: [docs/GPU.md](docs/GPU.md).
 
 `deepinfer-runtime::DeviceModel` runs the full V4.1-Flash forward pass on
 CUDA (GB200 NVL72 `sm_100`, GB300 `sm_103`) or HIP (MI335X-class) with
-runtime-JIT-compiled kernels, per-GEMM F32/FP8/BF16 precision, FP8/FP4 KV
+runtime-JIT-compiled kernels, per-GEMM F32/FP8/BF16/NVFP4 precision, FP8/FP4 KV
 caches (including the dedicated FP4 decode kernel), CUDA-graph decode
 capture/replay, and single-process NVLink peer collectives for expert
-parallelism. Binaries build and test on GPU-less machines (device tests
-auto-skip). See `docs/GPU.md` for the architecture and operator inventory.
+parallelism. The serving plane adds device-side sampling, prefill/verify/
+decode serve graphs, a block-radix **GPU prefix cache** with a host-memory
+L2 tier, **cp.async-pipelined attention** (bit-identical to the direct
+walks) and vectorized DSA score kernels, the **fused symmetric-heap EP**
+(grouped masked GEMM directly over the heaps, completion-table combine,
+EPLB-driven routing), and an opt-in **persistent self-layer megakernel**
+(`DEEPINFER_MEGAKERNEL=1`). Kernel sources are validated offline by the
+NVRTC+ptxas compile gate (`scripts/check-cuda.py`, sm_80/90/100/103).
+Binaries build and test on GPU-less machines (device tests auto-skip).
+See `docs/GPU.md` for the architecture and operator inventory.
 
 ### On-hardware acceptance (golden runs)
 

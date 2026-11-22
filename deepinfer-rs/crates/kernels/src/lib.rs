@@ -60,8 +60,11 @@ pub use decode::{fanout_params, DecodeParams, StepGeometry};
 pub use elementwise::CacheFormat;
 pub use gemm::GemmDType;
 pub use peer::{build_send_plan, PeerMesh, SendPlan};
-pub use peer_ll::{SymmetricEp, SymmetricHeap};
-pub use serve::{ServeCellIn, SERVE_CELL_FIELDS, SERVE_PAGE};
+pub use peer_ll::{
+    default_rank_map, default_slot_map, experts_per_rank, FusedBuffers, SymmetricEp,
+    SymmetricHeap,
+};
+pub use serve::{mega_shared, mega_tile_n, mega_wdtype, ServeCellIn, SERVE_CELL_FIELDS, SERVE_PAGE};
 pub use sampler::SampleParams;
 
 /// Embedded kernel sources (one translation unit per group).
@@ -99,9 +102,9 @@ pub mod source {
 fn build_module(device: &Device, name: &str, src: &str) -> Result<Module> {
     let arch = device.props().arch.clone();
     let extra: Vec<String> = match device.backend() {
-        // Match the CPU reference's rounding closely enough for golden
-        // tolerances; FP contraction stays ON for GEMM throughput.
-        Backend::Cuda => vec!["--use_fast_math=off".to_string()],
+        // NVRTC's fast-math is OFF by default (the CPU-golden rounding
+        // contract); FP contraction stays ON for GEMM throughput.
+        Backend::Cuda => Vec::new(),
         Backend::Hip => vec![],
     };
     compile_and_load(device, src, name, &arch, &extra)
@@ -130,14 +133,13 @@ fn sm100_module(device: &Device) -> Result<Option<Module>> {
         ("sm_100a", "compute_100a")
     };
     let src = format!("{}\n{}", source::COMMON, source::GEMM_SM100);
-    let extra = vec!["--use_fast_math=off".to_string()];
     let m = deepinfer_gpu::compile_and_load_with_arch(
         device,
         &src,
         "gemm_sm100",
         &format!("--gpu-architecture={sm}"),
         Some(&format!("--gpu-architecture={compute}")),
-        &extra,
+        &[],
     )?;
     Ok(Some(m))
 }

@@ -4104,7 +4104,7 @@ mod tests {
         // Step: reset -> dispatch -> group -> (stub expert GEMM: y row =
         // f(expert)) -> combine -> reduce.
         ep.reset_all(&kern).unwrap();
-        ep.dispatch(&kern, 0, &xq_b, &xsf_b, &idx_b, tokens, e)
+        ep.dispatch(&kern, 0, &xq_b, &xsf_b, &idx_b, tokens, e, None)
             .unwrap();
         ep.group(&kern, 0, &counters, &aq, &asf, &meta2, &drops)
             .unwrap();
@@ -4135,6 +4135,132 @@ mod tests {
                 assert!((g - acc).abs() < 1e-4, "t={t} d={d} got {g} want {acc}");
             }
         }
+    }
+
+    /// The FUSED symmetric-heap EP path (P1-9): dispatch -> group_fused
+    /// (into the heap's masked region via the slot map) -> expert outputs
+    /// written into the heap's `y` region -> publish (completion entries)
+    /// -> reduce_remote (peers' y read directly). Checked against the same
+    /// host reference as the legacy protocol test.
+    #[test]
+    fn symmetric_ep_fused_world1_protocol() {
+        let Some(dev) = gpu_device() else { return };
+        let tokens = 16usize;
+        let hidden = 256usize;
+        let k = 4usize;
+        let e = 8usize;
+        let cap = tokens;
+        let world = 1usize;
+        let per = deepinfer_kernels::experts_per_rank(world, e);
+        let mesh =
+            deepinfer_kernels::PeerMesh::new(std::slice::from_ref(&dev)).unwrap();
+        let kern = deepinfer_kernels::Kernels::new(&dev).unwrap();
+        let ep = deepinfer_kernels::SymmetricEp::new_with_experts(
+            mesh, k, cap, tokens, hidden, per,
+        )
+        .unwrap();
+        let mut rng = deepinfer_core::rng::Philox::new(7, 9);
+        let xq: Vec<u8> = (0..tokens * hidden)
+            .map(|_| (rng.next_u64_from_two() & 0xff) as u8)
+            .collect();
+        let xsf: Vec<u8> = vec![0x80; tokens * (hidden / 128)];
+        let mut topk_idx: Vec<i32> = Vec::new();
+        for t in 0..tokens {
+            let base = ((t * 37) % e) as i32;
+            for kk in 0..k {
+                topk_idx.push((base + kk as i32) % e as i32);
+            }
+        }
+        let topk_w: Vec<f32> = (0..tokens * k)
+            .map(|i| 0.25 + (i % 7) as f32 / 28.0)
+            .collect();
+        let xq_b = dev.alloc_from(&xq).unwrap();
+        let xsf_b = dev.alloc_from(&xsf).unwrap();
+        let idx_b = dev.alloc_from(&topk_idx).unwrap();
+        let w_b = dev.alloc_from(&topk_w).unwrap();
+        let slot_map = dev
+            .alloc_from(&deepinfer_kernels::default_slot_map(world, e, 0))
+            .unwrap();
+        let out = dev.alloc(tokens * hidden * 4).unwrap();
+        let fused = ep.fused_buffers(0).unwrap();
+        let s = dev.stream().unwrap();
+        // Step: reset -> dispatch -> group_fused -> (stub expert GEMM: y
+        // row = f(expert slot)) -> publish -> reduce_remote.
+        ep.reset_all(&kern).unwrap();
+        ep.reset_fused().unwrap();
+        ep.dispatch(&kern, 0, &xq_b, &xsf_b, &idx_b, tokens, e, None)
+            .unwrap();
+        ep.group_fused(&kern, 0, &slot_map).unwrap();
+        // Stub: y[slot*cap + r] = (slot + 1) * 0.5 on every dim (the same
+        // f(expert) the legacy test uses; slots are the local expert ids,
+        // which for world 1 equal the global ids).
+        let y_host: Vec<f32> = (0..per * cap * hidden)
+            .map(|i| ((i / (cap * hidden)) as f32 + 1.0) * 0.5)
+            .collect();
+        s.synchronize().unwrap();
+        dev.write(&fused.y, &y_host).unwrap();
+        ep.publish(&kern, 0).unwrap();
+        ep.reduce_remote(&kern, 0, &w_b, &idx_b, &out, tokens)
+            .unwrap();
+        s.synchronize().unwrap();
+        let mut got = vec![0.0f32; tokens * hidden];
+        dev.read(&out, &mut got).unwrap();
+        for t in 0..tokens {
+            for d in 0..hidden {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    let ei = topk_idx[t * k + kk];
+                    if ei < 0 {
+                        continue;
+                    }
+                    acc += topk_w[t * k + kk] * ((ei as f32 + 1.0) * 0.5);
+                }
+                let g = got[t * hidden + d];
+                assert!(
+                    (g - acc).abs() < 1e-4,
+                    "fused t={t} d={d} got {g} want {acc}"
+                );
+            }
+        }
+    }
+
+    /// The EPLB feedback loop on device: a routing histogram accumulated by
+    /// `topk_histogram` matches the host reference, and the derived
+    /// dispatch tables (rank/slot maps from `ep_routing`) drive a fused
+    /// step whose outputs match the reference for the remapped placement.
+    #[test]
+    fn ep_topk_histogram_and_eplb_routing() {
+        let Some(dev) = gpu_device() else { return };
+        let (tokens, k, e) = (32usize, 4usize, 16usize);
+        let kern = deepinfer_kernels::Kernels::new(&dev).unwrap();
+        let s = dev.stream().unwrap();
+        let mut topk_idx: Vec<i32> = Vec::new();
+        for t in 0..tokens {
+            let base = ((t * 53) % e) as i32;
+            for kk in 0..k {
+                topk_idx.push((base + kk as i32 * 3) % e as i32);
+            }
+        }
+        topk_idx[3] = -1; // padding slot must be skipped
+        let idx_b = dev.alloc_from(&topk_idx).unwrap();
+        let hist = dev.alloc(e * 4).unwrap();
+        dev.write(&hist, &vec![0i32; e]).unwrap();
+        kern.topk_histogram(&idx_b, &hist, tokens, k, e, &s).unwrap();
+        s.synchronize().unwrap();
+        let mut got = vec![0i32; e];
+        dev.read(&hist, &mut got).unwrap();
+        let mut want = vec![0i32; e];
+        for &ei in &topk_idx {
+            if ei >= 0 {
+                want[ei as usize] += 1;
+            }
+        }
+        assert_eq!(got, want, "device histogram matches the host reference");
+        // The counts feed the EPLB statistics exactly once per batch.
+        let u64s: Vec<u64> = got.iter().map(|&c| c as u64).collect();
+        let mut stats = deepinfer_eplb::ExpertStats::new(e, 4);
+        stats.record(&u64s);
+        assert_eq!(stats.average(), u64s.iter().map(|&c| c as f64).collect::<Vec<_>>());
     }
 
     /// Multi-rank symmetric EP (needs >= 2 same-backend devices; skipped
@@ -4210,7 +4336,7 @@ mod tests {
         ep.reset_all(&kern[0]).unwrap();
         for r in 0..world {
             let (xq_b, xsf_b, idx_b, _, _, _, drops, _, _, _, _) = &bufs[r];
-            ep.dispatch(&kern[r], r, xq_b, xsf_b, idx_b, tokens, e)
+            ep.dispatch(&kern[r], r, xq_b, xsf_b, idx_b, tokens, e, None)
                 .unwrap();
             let _ = drops;
         }

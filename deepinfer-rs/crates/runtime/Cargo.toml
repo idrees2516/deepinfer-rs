@@ -22,3 +22,6 @@ deepinfer-sampler = { workspace = true }
 deepinfer-gpu = { path = "../gpu" }
 deepinfer-kernels = { path = "../kernels" }
 deepinfer-grammar = { workspace = true }
+
+[dev-dependencies]
+deepinfer-eplb = { workspace = true }

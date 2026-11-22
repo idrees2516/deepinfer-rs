@@ -675,3 +675,121 @@ mod tests {
         assert!(!maps.is_consistent(&cfg(4, 0, 3, 1, 2))); // invalid cfg
     }
 }
+
+/// The expert-parallel **dispatch tables** derived from an EPLB placement:
+/// the device-resident `rank_map` / `slot_map` pair the symmetric-heap EP
+/// dispatch consumes (see `deepinfer-kernels::peer_ll`).
+///
+/// Physical expert `p` lives on GPU `p / per_rank` with local slot
+/// `p % per_rank` (the `phy2log` list is GPU-major). For every logical
+/// expert `e`, the FIRST physical replica is the canonical dispatch target
+/// (spreading across replicas is a policy knob upstream of this function);
+/// the hosting rank's slot map accepts `e`, every other rank's map rejects
+/// it (`-1`). With `num_replicas == 0` the result is exactly a permutation
+/// placement; with replicas it is a valid many-to-one routing.
+///
+/// # Errors
+/// [`deepinfer_core::Error::InvalidArgument`] when `phy2log.len()` is not
+/// a multiple of `world` (uneven physical slots per GPU) or a logical id
+/// is out of range.
+pub fn ep_routing(phy2log: &[u32], num_logical: usize, world: usize) -> Result<(Vec<i32>, Vec<Vec<i32>>)> {
+    ensure!(
+        world >= 1,
+        InvalidArgument,
+        "ep_routing: world must be >= 1, got {world}"
+    );
+    ensure!(
+        phy2log.len() % world == 0,
+        InvalidArgument,
+        "ep_routing: {} physical experts do not divide evenly over {world} GPUs",
+        phy2log.len()
+    );
+    let per_rank = phy2log.len() / world;
+    let mut rank_map = vec![-1i32; num_logical];
+    let mut slot_maps = vec![vec![-1i32; num_logical]; world];
+    for (p, &e) in phy2log.iter().enumerate() {
+        let e = e as usize;
+        ensure!(
+            e < num_logical,
+            InvalidArgument,
+            "ep_routing: physical expert {p} maps to logical {e} >= {num_logical}"
+        );
+        let gpu = p / per_rank;
+        let slot = p % per_rank;
+        // First replica wins the canonical dispatch target.
+        if rank_map[e] < 0 {
+            rank_map[e] = gpu as i32;
+        }
+        slot_maps[gpu][e] = slot as i32;
+    }
+    // Every logical expert must be placed at least once.
+    for (e, &r) in rank_map.iter().enumerate() {
+        ensure!(
+            r >= 0,
+            InvalidArgument,
+            "ep_routing: logical expert {e} has no physical placement"
+        );
+    }
+    Ok((rank_map, slot_maps))
+}
+
+#[cfg(test)]
+mod ep_routing_tests {
+    use super::*;
+
+    #[test]
+    fn ep_routing_identity_partition() {
+        // No replicas, even GPU split: every logical expert lands on
+        // exactly one GPU with a unique local slot.
+        let (world, logical) = (4usize, 8usize);
+        let phy2log: Vec<u32> = (0..logical).map(|e| e as u32).collect();
+        let (rank_map, slot_maps) = ep_routing(&phy2log, logical, world).unwrap();
+        assert_eq!(rank_map.len(), logical);
+        for e in 0..logical {
+            let r = rank_map[e] as usize;
+            assert!(r < world);
+            assert_eq!(slot_maps[r][e] as usize, e % (logical / world));
+            for (r2, sm) in slot_maps.iter().enumerate() {
+                if r2 != r {
+                    assert_eq!(sm[e], -1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ep_routing_matches_rebalance_output() {
+        // The tables derived from a real rebalance are a valid routing:
+        // rank/slot within bounds, exactly one canonical target, and the
+        // hosting slot maps cover every logical expert.
+        let c = EplbConfig {
+            num_logical: 32,
+            num_replicas: 8,
+            num_groups: 4,
+            num_nodes: 1,
+            num_gpus: 4,
+        };
+        let weight: Vec<f64> = (0..32).map(|e| 1.0 + (e % 7) as f64).collect();
+        let maps = rebalance_experts(&weight, &c).unwrap();
+        assert!(maps.is_consistent(&c));
+        let (rank_map, slot_maps) =
+            ep_routing(&maps.phy2log, c.num_logical, c.num_gpus).unwrap();
+        for e in 0..c.num_logical {
+            let r = rank_map[e] as usize;
+            assert!(r < c.num_gpus);
+            assert!(slot_maps[r][e] >= 0);
+            let slot = slot_maps[r][e] as usize;
+            assert!(slot < c.num_physical() / c.num_gpus);
+            // The canonical target's slot really hosts e.
+            assert_eq!(maps.phy2log[r * (c.num_physical() / c.num_gpus) + slot] as usize, e);
+        }
+    }
+
+    #[test]
+    fn ep_routing_rejects_uneven_and_unplaced() {
+        assert!(ep_routing(&[0u32, 1, 2], 3, 2).is_err()); // 3 % 2 != 0
+        assert!(ep_routing(&[7u32], 3, 1).is_err()); // logical id out of range
+        // A logical expert with no physical placement.
+        assert!(ep_routing(&[0u32, 1], 3, 2).is_err());
+    }
+}

@@ -12,6 +12,7 @@ use deepinfer_core::{ensure, Result};
 use deepinfer_gpu::{Buffer, KernelArgs, Launch, Stream};
 
 use crate::elementwise::CacheFormat;
+use crate::gemm::GemmDType;
 use crate::Kernels;
 
 /// Page size of the paged caches (matches the DSA sparse-index page
@@ -65,6 +66,31 @@ fn next_pow2(n: usize) -> usize {
 #[allow(dead_code)] // consumed by the runtime serve engine
 pub const SERVE_CELL_FIELDS: usize = 16;
 
+/// Pipeline depth of the cp.async serve kernels (ABI with serve.cu's
+/// `SV_PIPE_STAGES`).
+pub const SV_PIPE_STAGES: usize = 3;
+
+/// Dynamic shared-memory budget for one pipelined serve kernel (bytes).
+/// Kept at 32 KiB so every launch stays under the 48 KiB default dynamic
+/// limit without a `cuFuncSetAttribute` dance.
+pub const SV_PIPE_SMEM: usize = 32 * 1024;
+
+/// Byte stride of one cached KV row in the pool (mirrors `sv_row_bytes`).
+fn cache_row_bytes(fmt: CacheFormat, d: usize) -> usize {
+    match fmt {
+        CacheFormat::F32 => d * 4,
+        CacheFormat::Fp8Group32 => 528,
+        CacheFormat::Fp4Group16 => 288,
+    }
+}
+
+/// Rows per pipeline stage for the given cache row stride (mirrors the
+/// kernel's `rows_per_stage` contract; the launcher passes the matching
+/// `STAGES * rows * row_bytes` dynamic shared size).
+fn pipe_rows_per_stage(row_bytes: usize) -> usize {
+    (SV_PIPE_SMEM / (SV_PIPE_STAGES * row_bytes)).clamp(1, 64)
+}
+
 #[cfg(test)]
 pub(crate) const KERNEL_NAMES: &[&str] = &[
     "di_serve_fanout_kernel",
@@ -87,9 +113,29 @@ pub(crate) const KERNEL_NAMES: &[&str] = &[
     "di_serve_prefill_dense_kernel",
     "di_serve_ring_append_kernel",
     "di_serve_swa_attention_kernel",
+    // P1-8: cp.async-pipelined / vectorized variants.
+    "di_serve_mla_decode_pipe_kernel",
+    "di_serve_prefill_dense_pipe_kernel",
+    "di_serve_thunder_logits_vec_kernel",
+    "di_serve_dot_scores_vec_kernel",
+    "di_mega_self_block_kernel",
 ];
 
 impl Kernels {
+    /// Whether the cp.async-pipelined KV-walk kernels are used. On by
+    /// default (they are bit-identical to the direct-load family);
+    /// `DEEPINFER_SERVE_PIPE=0` forces the legacy kernels for A/B goldens.
+    pub fn serve_pipe_enabled(&self) -> bool {
+        std::env::var("DEEPINFER_SERVE_PIPE").ok().as_deref() != Some("0")
+    }
+
+    /// Whether the vectorized DSA score kernels (one warp per key row) are
+    /// used. On by default (deterministic, tolerance-golden vs the scalar
+    /// family); `DEEPINFER_SERVE_VEC=0` forces the scalar kernels.
+    pub fn serve_vec_enabled(&self) -> bool {
+        std::env::var("DEEPINFER_SERVE_VEC").ok().as_deref() != Some("0")
+    }
+
     /// Expand the host cells `{active, pos, len, sq, sqnb}` `[B, 5]` i32
     /// into the full 16-field device block `[B, 16]` (`cells`).
     pub fn serve_fanout(
@@ -387,6 +433,45 @@ impl Kernels {
         b: usize,
         stream: &Stream,
     ) -> Result<()> {
+        if self.serve_vec_enabled() {
+            // One warp per key row: packed u32 e4m3 loads + float4 f32 loads
+            // (fully coalesced), fixed warp-tree reduction order.
+            let f = self.f("di_serve_thunder_logits_vec_kernel")?;
+            let warps = 8u32; // ATT_WARPS
+            let grid_x = self
+                .device()
+                .props()
+                .sm_count
+                .max(warps)
+                .min((b * sq).max(1) as u32 * 64);
+            return f.launch(
+                self.device(),
+                Launch {
+                    grid: (grid_x, (b * sq) as u32, 1),
+                    block: (warps * self.warp_size(), 1, 1),
+                    shared: ((nh * ihd * 4).max(4)) as u32,
+                },
+                &KernelArgs::new()
+                    .ptr(q_f32)
+                    .ptr(q_u8)
+                    .ptr(q_sf)
+                    .ptr(k_norm_pool)
+                    .ptr(k_u8_pool)
+                    .ptr(tbl_ptrs)
+                    .ptr(sf_ptrs)
+                    .ptr(cells)
+                    .ptr(w)
+                    .ptr(scores)
+                    .i32(nh as i32)
+                    .i32(ihd as i32)
+                    .i32(qb as i32)
+                    .i32(q_nblocks as i32)
+                    .i32(max_cols as i32)
+                    .i32(sq as i32)
+                    .i32(b as i32),
+                stream,
+            );
+        }
         let f = self.f("di_serve_thunder_logits_kernel")?;
         f.launch(
             self.device(),
@@ -431,6 +516,37 @@ impl Kernels {
         b: usize,
         stream: &Stream,
     ) -> Result<()> {
+        if self.serve_vec_enabled() {
+            // One warp per feat row with float4 loads (coalesced), fixed
+            // warp-tree reduction order.
+            let f = self.f("di_serve_dot_scores_vec_kernel")?;
+            let warps = 8u32; // ATT_WARPS
+            let grid_x = self
+                .device()
+                .props()
+                .sm_count
+                .max(warps)
+                .min((b * sq).max(1) as u32 * 64);
+            return f.launch(
+                self.device(),
+                Launch {
+                    grid: (grid_x, (b * sq) as u32, 1),
+                    block: (warps * self.warp_size(), 1, 1),
+                    shared: 0,
+                },
+                &KernelArgs::new()
+                    .ptr(q)
+                    .ptr(feat_pool)
+                    .ptr(tbl_ptrs)
+                    .ptr(cells)
+                    .ptr(out)
+                    .i32(hidden as i32)
+                    .i32(max_cols as i32)
+                    .i32(sq as i32)
+                    .i32(b as i32),
+                stream,
+            );
+        }
         let f = self.f("di_serve_dot_scores_kernel")?;
         f.launch(
             self.device(),
@@ -603,13 +719,47 @@ impl Kernels {
         b: usize,
         stream: &Stream,
     ) -> Result<()> {
-        let f = self.f("di_serve_mla_decode_partial_kernel")?;
         let splits = topk_max.div_ceil(chunk).max(1);
+        if self.serve_pipe_enabled() {
+            // cp.async 3-stage pipeline (bit-identical to the direct walk).
+            let rb = cache_row_bytes(fmt, d);
+            ensure!(rb % 16 == 0, InvalidArgument, "cache row not 16B aligned");
+            let r = pipe_rows_per_stage(rb);
+            let f = self.f("di_serve_mla_decode_pipe_kernel")?;
+            return f.launch(
+                self.device(),
+                Launch {
+                    grid: (splits as u32, h.div_ceil(8).max(1) as u32, (b * sq) as u32),
+                    block: (8 * self.warp_size(), 1, 1),
+                    shared: (SV_PIPE_STAGES * r * rb) as u32,
+                },
+                &KernelArgs::new()
+                    .ptr(q)
+                    .ptr(kv_pool)
+                    .ptr(tbl_ptrs)
+                    .ptr(cells)
+                    .ptr(sel)
+                    .ptr(pm)
+                    .ptr(pl)
+                    .ptr(po)
+                    .i32(h as i32)
+                    .i32(d as i32)
+                    .i32(topk_max as i32)
+                    .i32(chunk as i32)
+                    .f32(sm_scale)
+                    .i32(fmt_id(fmt))
+                    .i32(sq as i32)
+                    .i32(b as i32)
+                    .i32(r as i32),
+                stream,
+            );
+        }
+        let f = self.f("di_serve_mla_decode_partial_kernel")?;
         f.launch(
             self.device(),
             Launch {
                 grid: (splits as u32, h.div_ceil(8).max(1) as u32, (b * sq) as u32),
-                block: (8 * 32, 1, 1),
+                block: (8 * self.warp_size(), 1, 1),
                 shared: 0,
             },
             &KernelArgs::new()
@@ -701,7 +851,7 @@ impl Kernels {
             self.device(),
             Launch {
                 grid: (sq.div_ceil(8).max(1) as u32, h as u32, b as u32),
-                block: (8 * 32, 1, 1),
+                block: (8 * self.warp_size(), 1, 1),
                 shared: 0,
             },
             &KernelArgs::new()
@@ -740,12 +890,41 @@ impl Kernels {
         b: usize,
         stream: &Stream,
     ) -> Result<()> {
+        if self.serve_pipe_enabled() {
+            // cp.async 3-stage pipeline (bit-identical to the direct walk).
+            let rb = cache_row_bytes(fmt, d);
+            ensure!(rb % 16 == 0, InvalidArgument, "cache row not 16B aligned");
+            let r = pipe_rows_per_stage(rb);
+            let f = self.f("di_serve_prefill_dense_pipe_kernel")?;
+            return f.launch(
+                self.device(),
+                Launch {
+                    grid: (sq.div_ceil(8).max(1) as u32, h as u32, b as u32),
+                    block: (8 * self.warp_size(), 1, 1),
+                    shared: (SV_PIPE_STAGES * r * rb) as u32,
+                },
+                &KernelArgs::new()
+                    .ptr(q)
+                    .ptr(kv_pool)
+                    .ptr(tbl_ptrs)
+                    .ptr(cells)
+                    .ptr(out)
+                    .i32(h as i32)
+                    .i32(d as i32)
+                    .f32(sm_scale)
+                    .i32(fmt_id(fmt))
+                    .i32(sq as i32)
+                    .i32(b as i32)
+                    .i32(r as i32),
+                stream,
+            );
+        }
         let f = self.f("di_serve_prefill_dense_kernel")?;
         f.launch(
             self.device(),
             Launch {
                 grid: (sq.div_ceil(8).max(1) as u32, h as u32, b as u32),
-                block: (8 * 32, 1, 1),
+                block: (8 * self.warp_size(), 1, 1),
                 shared: 0,
             },
             &KernelArgs::new()
@@ -838,6 +1017,153 @@ impl Kernels {
     }
 }
 
+/// Weight-dtype id for the megakernel (ABI with serve.cu's `wdtype`).
+pub fn mega_wdtype(d: GemmDType) -> i32 {
+    match d {
+        GemmDType::F32 => 0,
+        GemmDType::Bf16 => 1,
+        GemmDType::Fp8 => 2,
+        GemmDType::Nvfp4 => 3,
+    }
+}
+
+/// Weight-tile output rows for the megakernel, by dtype (must divide 128
+/// so a tile never straddles an fp8 scale block; sized to keep the
+/// double-buffered tile + resident rows inside the 48 KiB default smem).
+pub fn mega_tile_n(wdtype: i32) -> usize {
+    match wdtype {
+        0 => 32,
+        1 => 64,
+        2 => 64,
+        _ => 128,
+    }
+}
+
+/// Dynamic shared bytes the megakernel needs (mirror of its layout:
+/// `[fused f32][x tile 512 B][fp8 qa quant pad][2 W tiles]`).
+pub fn mega_shared(hidden: usize, q_lora: usize, hd: usize, wdtype: i32) -> usize {
+    let _ = hidden; // layout depends on q_lora/hd; kept for ABI clarity
+    let fused = q_lora + hd;
+    let elt: usize = match wdtype {
+        0 => 4,
+        1 => 2,
+        _ => 1,
+    };
+    let pad = if wdtype == 2 {
+        (q_lora + q_lora.div_ceil(128) + 15) & !15
+    } else {
+        0
+    };
+    let tile_n = mega_tile_n(wdtype);
+    fused * 4 + 512 + pad + 2 * tile_n * (128 * elt + 16)
+}
+
+
+impl Kernels {
+    /// P1-7 phase 1: the persistent self-layer block — ONE launch for
+    /// rmsnorm -> GEMV(fused_qkv) -> latent-norm -> rope(kv) -> paged KV
+    /// encode -> GEMV(q_b) -> rope(q), per (row, layer) CTA. All pointer
+    /// tables are `[n_layers]` u64; `q_out` is `[rows * n_heads * hd]`.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] on geometry the kernel does not support;
+    /// [`Error::Internal`] on launch failures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mega_self_block(
+        &self,
+        h: &Buffer,
+        norm_ptrs: &Buffer,
+        qkv_ptrs: &Buffer,
+        qkv_sf_ptrs: &Buffer,
+        kvn_ptrs: &Buffer,
+        qb_ptrs: &Buffer,
+        qb_sf_ptrs: &Buffer,
+        pool_ptrs: &Buffer,
+        tbl_ptrs: &Buffer,
+        cells: &Buffer,
+        rope_cs: &Buffer,
+        pos_kv: &Buffer,
+        pos_q: &Buffer,
+        q_out: &Buffer,
+        hidden: usize,
+        q_lora: usize,
+        hd: usize,
+        rope_dim: usize,
+        n_heads: usize,
+        rows: usize,
+        sq: usize,
+        b: usize,
+        n_layers: usize,
+        wdtype: i32,
+        fmt: CacheFormat,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let latent = hd - rope_dim;
+        let half = rope_dim / 2;
+        let elt: usize = match wdtype {
+            0 => 4,
+            1 => 2,
+            _ => 1,
+        };
+        ensure!(hidden >= 1 && q_lora >= 1 && hd >= 32, InvalidArgument, "mega: degenerate dims");
+        ensure!(latent % 2 == 0, InvalidArgument, "mega: latent must be even");
+        ensure!(hd % 32 == 0, InvalidArgument, "mega: hd must be a multiple of 32");
+        ensure!(half >= 1, InvalidArgument, "mega: rope_dim must be >= 2");
+        // 16-byte cp.async alignment of the weight rows.
+        ensure!(
+            (hidden * elt) % 16 == 0 && (q_lora * elt) % 16 == 0,
+            InvalidArgument,
+            "mega: k*elt must be 16B aligned (hidden {hidden}, q_lora {q_lora}, wdtype {wdtype})"
+        );
+        let shared = mega_shared(hidden, q_lora, hd, wdtype);
+        ensure!(
+            shared <= self.device().props().max_shared as usize,
+            InvalidArgument,
+            "mega: {shared} B dynamic smem exceeds the device limit"
+        );
+        let tile_n = mega_tile_n(wdtype);
+        let f = self.f("di_mega_self_block_kernel")?;
+        f.launch(
+            self.device(),
+            Launch {
+                grid: (rows as u32, n_layers as u32, 1),
+                block: (256, 1, 1),
+                shared: shared as u32,
+            },
+            &KernelArgs::new()
+                .ptr(h)
+                .ptr(norm_ptrs)
+                .ptr(qkv_ptrs)
+                .ptr(qkv_sf_ptrs)
+                .ptr(kvn_ptrs)
+                .ptr(qb_ptrs)
+                .ptr(qb_sf_ptrs)
+                .ptr(pool_ptrs)
+                .ptr(tbl_ptrs)
+                .ptr(cells)
+                .ptr(rope_cs)
+                .ptr(pos_kv)
+                .ptr(pos_q)
+                .ptr(q_out)
+                .i32(hidden as i32)
+                .i32(q_lora as i32)
+                .i32(hd as i32)
+                .i32(latent as i32)
+                .i32(half as i32)
+                .i32(n_heads as i32)
+                .i32(rows as i32)
+                .i32(sq as i32)
+                .i32(b as i32)
+                .i32(wdtype)
+                .i32(fmt_id(fmt))
+                .f32(eps)
+                .i32(tile_n as i32),
+            stream,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,4 +1202,55 @@ mod tests {
         assert_eq!(fmt_id(CacheFormat::Fp8Group32), 1);
         assert_eq!(fmt_id(CacheFormat::Fp4Group16), 2);
     }
+
+    #[test]
+    fn pipe_geometry_fits_default_smem_and_alignment() {
+        // The FlashMLA V4.1 head dim and all three cache formats.
+        for (fmt, d) in [
+            (CacheFormat::F32, 512),
+            (CacheFormat::Fp8Group32, 512),
+            (CacheFormat::Fp4Group16, 512),
+            (CacheFormat::F32, 576),
+        ] {
+            let rb = cache_row_bytes(fmt, d);
+            assert_eq!(rb % 16, 0, "cp.async 16B units need 16B rows");
+            let r = pipe_rows_per_stage(rb);
+            assert!(r >= 1);
+            let smem = SV_PIPE_STAGES * r * rb;
+            assert!(
+                smem <= 48 * 1024,
+                "{smem} B exceeds the default dynamic smem limit"
+            );
+            // The budget is tight: one more row per stage would not fit
+            // (unless the stage is already at the cap).
+            assert!(smem + SV_PIPE_STAGES * rb > SV_PIPE_SMEM || r == 64);
+        }
+        // Expected concrete values (32 KiB budget, 3 stages).
+        assert_eq!(cache_row_bytes(CacheFormat::Fp8Group32, 512), 528);
+        assert_eq!(pipe_rows_per_stage(528), 20); // 3*20*528 = 31680 B
+        assert_eq!(pipe_rows_per_stage(2048), 5); // 3*5*2048 = 30720 B
+        assert_eq!(pipe_rows_per_stage(288), 37); // 3*37*288 = 31968 B
+        // 16-byte chunks per staged row (mirror of the kernel's `chunks`).
+        for rb in [2048usize, 528, 288] {
+            assert_eq!(rb >> 4, rb / 16);
+        }
+    }
+
+    #[test]
+    fn pipe_and_vec_kill_switches_parse() {
+        // The switches are read per call; only the "0" value disables.
+        // (Env-var tests run serially per crate; restore afterwards.)
+        std::env::set_var("DEEPINFER_SERVE_PIPE", "0");
+        std::env::set_var("DEEPINFER_SERVE_VEC", "1");
+        // Cannot construct a Kernels without a device; assert the parse
+        // contract directly through the same expression.
+        let pipe_off = std::env::var("DEEPINFER_SERVE_PIPE").ok().as_deref() == Some("0");
+        let vec_off = std::env::var("DEEPINFER_SERVE_VEC").ok().as_deref() == Some("0");
+        assert!(pipe_off);
+        assert!(!vec_off);
+        std::env::remove_var("DEEPINFER_SERVE_PIPE");
+        std::env::remove_var("DEEPINFER_SERVE_VEC");
+    }
 }
+
+

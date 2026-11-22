@@ -488,6 +488,115 @@ fn main() {
         });
     }
 
+    // 5d) P1-8 kernel-family A/B: the cp.async-pipelined KV walk must be
+    //     BIT-IDENTICAL to the direct-load family (hash compare with the
+    //     vec kernels held off), and the vectorized DSA score kernels must
+    //     stay within the serve tolerance band of the scalar family.
+    {
+        let name = "serve_pipe_vs_legacy";
+        let cfg = ModelConfig::v41_tiny();
+        let prompt: Vec<u32> = (0..130u32).map(|t| (t * 37 + 5) % 250).collect();
+        // The workload under test: warm prefill + a few batched decodes.
+        let run_engine = |pipe: Option<bool>, vec: Option<bool>| -> Vec<String> {
+            match pipe {
+                Some(true) => std::env::set_var("DEEPINFER_SERVE_PIPE", "1"),
+                Some(false) => std::env::set_var("DEEPINFER_SERVE_PIPE", "0"),
+                None => std::env::remove_var("DEEPINFER_SERVE_PIPE"),
+            }
+            match vec {
+                Some(true) => std::env::set_var("DEEPINFER_SERVE_VEC", "1"),
+                Some(false) => std::env::set_var("DEEPINFER_SERVE_VEC", "0"),
+                None => std::env::remove_var("DEEPINFER_SERVE_VEC"),
+            }
+            let mut gpu = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+            gpu.serve_configure(2, 256, 16).unwrap();
+            gpu.serve_attach(1).unwrap();
+            gpu.serve_attach(2).unwrap();
+            let prompt2: Vec<u32> = (0..80u32).map(|t| (t * 53 + 7) % 250).collect();
+            let l1 = gpu.serve_prefill(1, &prompt).unwrap();
+            let l2 = gpu.serve_prefill(2, &prompt2).unwrap();
+            let mut hashes = vec![hash_f32(&l1), hash_f32(&l2)];
+            let mut t1 = 5u32;
+            let mut t2 = 100u32;
+            for _ in 0..4 {
+                let got = gpu.serve_decode(&[(1, t1), (2, t2)]).unwrap();
+                t1 = deepinfer_core::math::argmax(&got[0]).unwrap() as u32;
+                t2 = (t2 + 7) % 200;
+                hashes.push(hash_f32(&got[0]));
+                hashes.push(hash_f32(&got[1]));
+            }
+            hashes
+        };
+        let legacy = run_engine(Some(false), Some(false));
+        let piped = run_engine(Some(true), Some(false));
+        let piped_vec = run_engine(Some(true), Some(true));
+        std::env::remove_var("DEEPINFER_SERVE_PIPE");
+        std::env::remove_var("DEEPINFER_SERVE_VEC");
+        let bit_exact = legacy.iter().zip(&piped).all(|(a, b)| a == b);
+        // The vec family reassociates the DSA dots (fixed tree): compare
+        // via the hash difference count only (logits already flowed through
+        // argmax; the serve tolerance contract is checked by 5/5b/5c which
+        // run with the same defaults as the vec path).
+        let vec_diffs = piped
+            .iter()
+            .zip(&piped_vec)
+            .filter(|(a, b)| a != b)
+            .count();
+        let ok = bit_exact;
+        checks.push(Check {
+            name,
+            status: if ok { Status::Pass } else { Status::Fail },
+            metric: vec_diffs as f64,
+            detail: format!(
+                "pipe bit-exact: {bit_exact}; vec reassociated steps: {vec_diffs}/{}",
+                piped.len()
+            ),
+        });
+    }
+
+    // 5e) P1-7 megakernel: the fused self-layer block must track the
+    //     unfused chain within the serve tolerance band (the GEMV
+    //     association differs from the tiled GEMM kernels).
+    {
+        let name = "serve_megakernel_vs_unfused";
+        let cfg = ModelConfig::v41_tiny();
+        let prompt: Vec<u32> = (0..80u32).map(|t| (t * 37 + 5) % 250).collect();
+        let run_engine = |mega: bool| -> Vec<f32> {
+            if mega {
+                std::env::set_var("DEEPINFER_MEGAKERNEL", "1");
+            } else {
+                std::env::set_var("DEEPINFER_MEGAKERNEL", "0");
+            }
+            let mut gpu = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+            gpu.serve_configure(2, 256, 16).unwrap();
+            gpu.serve_attach(1).unwrap();
+            gpu.serve_attach(2).unwrap();
+            let prompt2: Vec<u32> = (0..50u32).map(|t| (t * 53 + 7) % 250).collect();
+            let l1 = gpu.serve_prefill(1, &prompt).unwrap();
+            let _l2 = gpu.serve_prefill(2, &prompt2).unwrap();
+            let mut t1 = 5u32;
+            let mut last = l1.clone();
+            for _ in 0..4 {
+                let got = gpu.serve_decode(&[(1, t1), (2, 100)]).unwrap();
+                t1 = deepinfer_core::math::argmax(&got[0]).unwrap() as u32;
+                last = got[0].clone();
+            }
+            std::env::remove_var("DEEPINFER_MEGAKERNEL");
+            let mut all = l1;
+            all.extend(last);
+            all
+        };
+        let unfused = run_engine(false);
+        let mega = run_engine(true);
+        let e = rel_err(&unfused, &mega);
+        checks.push(Check {
+            name,
+            status: if e < 5e-2 { Status::Pass } else { Status::Fail },
+            metric: e as f64,
+            detail: format!("worst rel err {e}"),
+        });
+    }
+
     // 6) Symmetric-buffer EP (world 1; multi-rank when available).
     {
         let name = "symmetric_ep_protocol";
@@ -536,7 +645,7 @@ fn main() {
             ep.reset_all(&kern[0]).unwrap();
             for r in 0..devs.len() {
                 let (xq, xsf, idx, ..) = &bufs[r];
-                ep.dispatch(&kern[r], r, xq, xsf, idx, tokens, e).unwrap();
+                ep.dispatch(&kern[r], r, xq, xsf, idx, tokens, e, None).unwrap();
             }
             for r in 0..devs.len() {
                 let (_, _, _, _, counters, meta2, drops, aq, asf, _, _) = &bufs[r];
@@ -571,6 +680,128 @@ fn main() {
                         for kk in 0..k {
                             let ex = ((t + kk) % e) as i32;
                             acc += topk_w[t * k + kk] * ((ex as f32 + 1.0) * 0.5);
+                        }
+                        worst = worst.max((got[t * hidden + d] - acc).abs() as f64);
+                    }
+                }
+            }
+            worst
+        };
+        let devs: Vec<_> = devices.iter().map(|(_, d, _)| d.clone()).collect();
+        let err = run(&devs[..world]);
+        checks.push(Check {
+            name,
+            status: if err < 1e-4 {
+                Status::Pass
+            } else {
+                Status::Fail
+            },
+            metric: err,
+            detail: format!("world {world}, worst abs err {err}"),
+        });
+    }
+
+    // 6b) Fused symmetric EP (P1-9): the heap-resident masked workspace +
+    //     completion-table protocol (group_fused -> stub expert compute ->
+    //     publish -> reduce_remote), vs the same host reference as 6).
+    {
+        let name = "symmetric_ep_fused_protocol";
+        let world = devices.len().min(2);
+        let run = |devs: &[deepinfer_gpu::Device]| -> f64 {
+            let (tokens, hidden, k, e, cap) = (8usize, 256usize, 4usize, 8usize, 16usize);
+            let per = deepinfer_kernels::experts_per_rank(devs.len(), e);
+            let mesh = deepinfer_kernels::PeerMesh::new(devs).unwrap();
+            let kern: Vec<_> = devs
+                .iter()
+                .map(|d| deepinfer_kernels::Kernels::new(d).unwrap())
+                .collect();
+            let ep = deepinfer_kernels::SymmetricEp::new_with_experts(
+                mesh, k, cap, tokens, hidden, per,
+            )
+            .unwrap();
+            let mut topk_idx = Vec::new();
+            for t in 0..tokens {
+                for kk in 0..k {
+                    topk_idx.push(((t + kk) % e) as i32);
+                }
+            }
+            let topk_w: Vec<f32> = (0..tokens * k)
+                .map(|i| 0.125 + (i % 5) as f32 / 40.0)
+                .collect();
+            let mut bufs = Vec::new();
+            for r in 0..devs.len() {
+                let xq: Vec<u8> = (0..tokens * hidden)
+                    .map(|i| ((i + r * 17) % 251) as u8)
+                    .collect();
+                let xsf = vec![0x80u8; tokens * (hidden / 128)];
+                let slot_map = deepinfer_kernels::default_slot_map(devs.len(), e, r);
+                bufs.push((
+                    devs[r].alloc_from(&xq).unwrap(),
+                    devs[r].alloc_from(&xsf).unwrap(),
+                    devs[r].alloc_from(&topk_idx).unwrap(),
+                    devs[r].alloc_from(&topk_w).unwrap(),
+                    devs[r].alloc_from(&slot_map).unwrap(),
+                    devs[r].alloc(tokens * hidden * 4).unwrap(),
+                ));
+            }
+            ep.reset_all(&kern[0]).unwrap();
+            ep.reset_fused().unwrap();
+            for r in 0..devs.len() {
+                let (xq, xsf, idx, _, _, _) = &bufs[r];
+                ep.dispatch(&kern[r], r, xq, xsf, idx, tokens, e, None)
+                    .unwrap();
+            }
+            for r in 0..devs.len() {
+                let (_, _, _, _, slot_map, _) = &bufs[r];
+                ep.group_fused(&kern[r], r, slot_map).unwrap();
+            }
+            // Stub expert compute: y[slot*cap + r] = f(local slot) — the
+            // local slot of global expert e on rank r under the default
+            // placement; write through the fused y views.
+            let rank_map = deepinfer_kernels::default_rank_map(devs.len(), e);
+            for r in 0..devs.len() {
+                let fused = ep.fused_buffers(r).unwrap();
+                let s_map =
+                    deepinfer_kernels::default_slot_map(devs.len(), e, r);
+                let mut y_host = vec![0.0f32; per * cap * hidden];
+                for ex in 0..e {
+                    if rank_map[ex] as usize != r {
+                        continue;
+                    }
+                    let slot = s_map[ex] as usize;
+                    for row in 0..cap {
+                        for d in 0..hidden {
+                            y_host[(slot * cap + row) * hidden + d] =
+                                (slot as f32 + 1.0) * 0.5;
+                        }
+                    }
+                }
+                let s = devs[r].stream().unwrap();
+                s.synchronize().unwrap();
+                devs[r].write(&fused.y, &y_host).unwrap();
+            }
+            for r in 0..devs.len() {
+                ep.publish(&kern[r], r).unwrap();
+            }
+            for r in 0..devs.len() {
+                let (_, _, idx, w, _, out) = &bufs[r];
+                ep.reduce_remote(&kern[r], r, w, idx, out, tokens)
+                    .unwrap();
+            }
+            let mut worst = 0.0f64;
+            for r in 0..devs.len() {
+                devs[r].stream().unwrap().synchronize().unwrap();
+                let (_, _, _, _, _, out) = &bufs[r];
+                let mut got = vec![0.0f32; tokens * hidden];
+                devs[r].read(out, &mut got).unwrap();
+                let s_map = deepinfer_kernels::default_slot_map(devs.len(), e, r);
+                for t in 0..tokens {
+                    for d in 0..hidden {
+                        let mut acc = 0.0f32;
+                        for kk in 0..k {
+                            let ex = (t + kk) % e;
+                            let slot = s_map[ex] as usize;
+                            acc += topk_w[t * k + kk] * ((slot as f32 + 1.0) * 0.5);
                         }
                         worst = worst.max((got[t * hidden + d] - acc).abs() as f64);
                     }

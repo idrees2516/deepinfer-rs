@@ -34,6 +34,7 @@ deepinfer-mtp = { path = "crates/mtp" }
 deepinfer-sampler = { path = "crates/sampler" }
 deepinfer-grammar = { path = "crates/grammar" }
 deepinfer-scheduler = { path = "crates/scheduler" }
+deepinfer-eplb = { path = "crates/eplb" }
 
 [profile.dev]
 opt-level = 1

@@ -18,6 +18,15 @@ typedef unsigned short u16;
 typedef unsigned int u32;
 typedef unsigned long long u64;
 
+// Header-free float constants (NVRTC / hipRTC compile without <math.h>;
+// NAN and INFINITY are macros there, not builtins).
+#ifndef INFINITY
+#define INFINITY __int_as_float(0x7f800000u)
+#endif
+#ifndef NAN
+#define NAN __int_as_float(0x7fc00000u)
+#endif
+
 #if defined(__HIP__)
 #define DI_WARP 64 // CDNA wavefront size
 #else
@@ -217,4 +226,49 @@ __device__ __forceinline__ void di_bitonic_sort_u64(u64* v, int n) {
         }
     }
     __syncthreads();
+}
+
+// ---------------------------------------------------------------------------
+// Asynchronous 16-byte global->shared copies (the FA4-style pipeline
+// primitive). NVIDIA sm_80+ gets real `cp.async` (the copy engine bypasses
+// the register file and does not stall the issuing warp); every other
+// target (HIP CDNA, pre-Ampere NV) degrades to a synchronous 16-byte load
+// + store with the same memory semantics, so a single kernel source serves
+// all devices — only the overlap is lost.
+// ---------------------------------------------------------------------------
+
+// True when the compiled target has hardware cp.async (Ampere and later).
+#if !defined(__HIP__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#define DI_CP_ASYNC 1
+#else
+#define DI_CP_ASYNC 0
+#endif
+
+__device__ __forceinline__ void di_cp16(void* smem_dst, const void* gmem_src) {
+#if DI_CP_ASYNC
+    unsigned s = (unsigned)__cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(s),
+                 "l"(gmem_src)
+                 : "memory");
+#else
+    const u64* src = (const u64*)gmem_src;
+    u64* dst = (u64*)smem_dst;
+    dst[0] = src[0];
+    dst[1] = src[1];
+#endif
+}
+
+__device__ __forceinline__ void di_cp_commit() {
+#if DI_CP_ASYNC
+    asm volatile("cp.async.commit_group;" ::: "memory");
+#endif
+}
+
+// Wait until at most `N` committed groups are still in flight (the oldest
+// groups have landed). N is an immediate.
+template <int N>
+__device__ __forceinline__ void di_cp_wait() {
+#if DI_CP_ASYNC
+    asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory");
+#endif
 }

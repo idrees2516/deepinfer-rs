@@ -111,6 +111,7 @@ di_ep_dispatch_ll_kernel(const unsigned char* __restrict__ xq,
                          const unsigned char* __restrict__ xsf,
                          const int* __restrict__ topk_idx,
                          const unsigned long long* __restrict__ peer_heaps,
+                         const int* __restrict__ rank_map,
                          int my_rank, int world, int tokens, int hidden,
                          int K, int cap, int num_experts) {
     const int t = blockIdx.x;
@@ -118,7 +119,10 @@ di_ep_dispatch_ll_kernel(const unsigned char* __restrict__ xq,
     if (t >= tokens || kk >= K) return;
     const int e = topk_idx[t * K + kk];
     if (e < 0) return; // padding slot
-    const int dst = (int)(((long long)e * world) / num_experts);
+    // EPLB placement when a rank map is present; otherwise the balanced
+    // contiguous-range map (the DeepEP default).
+    const int dst = rank_map ? rank_map[e]
+                             : (int)(((long long)e * world) / num_experts);
     const unsigned long long hd = peer_heaps[dst];
     const int sf_row = hidden >> 7;
     const int rb = ep_row_bytes(hidden);
@@ -284,5 +288,208 @@ di_ep_reduce_ll_kernel(const unsigned long long* __restrict__ peer_heaps,
             acc += topk_w[t * K + kk] * comb[((long long)t * K + kk) * hidden + h];
         }
         out[i] = acc;
+    }
+}
+
+// ===========================================================================
+// P1-9: the FUSED expert path (the MegaMoE / DeepEP-v2 shape).
+//
+// The masked per-expert workspace (aq/asf/meta2/counters/y) moves INTO the
+// symmetric heap, so:
+//   * `di_ep_group_fused_ll_kernel` scatters channel rows straight into the
+//     heap's masked region using a LOCAL expert slot map (the EPLB hook:
+//     logical -> (rank, slot) is a device-resident table, not a formula);
+//   * the grouped masked GEMM runs directly over the heap layout (the
+//     caller's `gemm_grouped_masked_nt` over heap slices — no staging
+//     copies between communication and compute);
+//   * `di_ep_publish_ll_kernel` replaces the row-copying combine: the
+//     expert rank writes one 8-byte completion entry
+//     `(my_rank << 48) | y_row_byte_offset` into the home's completion
+//     table (a tiny remote write instead of a hidden*f32 row) and
+//     release-increments the home's combine_done;
+//   * `di_ep_reduce_remote_ll_kernel` reads the y rows DIRECTLY from the
+//     peers' heaps through the completion table (peer reads over the same
+//     symmetric pointers the dispatch already uses).
+// Per-(token,k) traffic drops from write+read of a full f32 row to one
+// 64-bit entry — the staging copy between expert compute and the home
+// reduction is gone.
+//
+// Heap layout v2 (appended after the legacy combine region, 16B aligned):
+//   [MB, MB + E*cap*hidden)          aq      masked e4m3 activations
+//   [MS, MS + E*cap*(hidden/128))    asf     ue8m0 scales
+//   [MM, MM + E*cap*16)              meta2   {src, token, k, slot} i32 x4
+//   [MC, MC + E*4)                   counters (masked_m)
+//   [MD, MD + 4)                     drops
+//   [MY, MY + E*cap*hidden*4)        y       expert outputs (f32)
+//   [MT, MT + tokens_max*K*8)        completion table (u64 entries)
+// ===========================================================================
+
+__device__ __forceinline__ long long ep_masked_off(int K, int cap, int tokens,
+                                                   int hidden) {
+    return (ep_combine_off(K, cap, hidden)
+            + (long long)tokens * K * hidden * 4 + 15) & ~15ll;
+}
+
+// The fused-path heap sub-pointers of one rank (formulas mirrored on the
+// host side in deepinfer-kernels::peer_ll).
+struct EpFusedPtrs {
+    unsigned char* aq;
+    unsigned char* asf;
+    int* meta2;
+    int* counters;
+    int* drops;
+    float* y;
+    unsigned long long* ctab;
+    long long y_off;    // byte offset of y inside the heap (completion entries)
+    long long ctab_off;
+};
+
+__device__ __forceinline__ EpFusedPtrs ep_fused_ptrs(unsigned long long heap,
+                                                     int K, int cap, int tokens,
+                                                     int hidden, int E) {
+    EpFusedPtrs p;
+    unsigned char* base = (unsigned char*)heap;
+    long long mb = ep_masked_off(K, cap, tokens, hidden);
+    p.aq = base + mb;
+    p.asf = p.aq + (long long)E * cap * hidden;
+    p.meta2 = (int*)(p.asf + (long long)E * cap * (hidden >> 7));
+    p.counters = p.meta2 + (long long)E * cap * 4;
+    p.drops = p.counters + E;
+    p.y = (float*)(((unsigned long long)(p.drops + 1) + 15) & ~15ull);
+    p.ctab = (unsigned long long*)((unsigned char*)p.y
+                                    + (long long)E * cap * hidden * 4);
+    p.y_off = (unsigned char*)p.y - base;
+    p.ctab_off = (unsigned char*)p.ctab - base;
+    return p;
+}
+
+// Fused group: channel rows -> the heap's masked region, local slot map.
+// grid = (K * ceil(cap / GR),); block = GR. `slot_map[e]` is the local
+// expert slot of logical expert e ON THIS RANK (the dispatch rank map and
+// the slot map are two views of the same EPLB placement).
+extern "C" __global__ void __launch_bounds__(EP_LL_GR)
+di_ep_group_fused_ll_kernel(const unsigned long long* peer_heaps,
+                            int my_rank, int world, int K, int cap, int hidden,
+                            int E, int tokens,
+                            const int* __restrict__ slot_map) {
+    __shared__ int s_rank;
+    if (threadIdx.x == 0) {
+        const unsigned long long my0 = peer_heaps[my_rank];
+        di_spin_until_ge(my0 + 4ull * (3 * K), (unsigned)world);
+    }
+    __syncthreads();
+    const int sf_row = hidden >> 7;
+    const int rb = ep_row_bytes(hidden);
+    const long long choff = ep_chan_off(K);
+    const int tiles = (cap + EP_LL_GR - 1) / EP_LL_GR;
+    const int kk = blockIdx.x / tiles;
+    const int r0 = (blockIdx.x - kk * tiles) * EP_LL_GR;
+    const unsigned long long my = peer_heaps[my_rank];
+    EpFusedPtrs p = ep_fused_ptrs(my, K, cap, tokens, hidden, E);
+    const unsigned n = (unsigned)di_ld_sys_acquire(my + 4ull * (K + kk));
+    const unsigned lim = min(n, (unsigned)cap);
+    const unsigned char* base =
+        (const unsigned char*)(my + choff + (long long)kk * cap * rb);
+    for (int r = r0; r < (int)lim; ++r) {
+        const unsigned char* row = base + (long long)r * rb;
+        const int* meta = (const int*)(row + hidden + sf_row);
+        const int src = meta[0];
+        const int tok = meta[1];
+        const int e = meta[3];
+        const int slot = slot_map[e];
+        if (threadIdx.x == 0) s_rank = atomicAdd(&p.counters[slot], 1);
+        __syncthreads();
+        if (s_rank < cap) {
+            unsigned char* dq = p.aq + ((long long)slot * cap + s_rank) * hidden;
+            unsigned char* ds = p.asf + ((long long)slot * cap + s_rank) * sf_row;
+            for (int i = (int)threadIdx.x; i < hidden; i += EP_LL_GR) dq[i] = row[i];
+            for (int i = (int)threadIdx.x; i < sf_row; i += EP_LL_GR) ds[i] = row[hidden + i];
+            if (threadIdx.x == 0) {
+                int* m2 = p.meta2 + ((long long)slot * cap + s_rank) * 4;
+                m2[0] = src; m2[1] = tok; m2[2] = kk; m2[3] = slot;
+            }
+        } else if (threadIdx.x == 0) {
+            atomicAdd(p.drops, 1);
+        }
+        __syncthreads();
+    }
+}
+
+// Fused publish: per valid (slot, r) row, write the completion entry into
+// the home rank's table and release-increment its combine_done. Entry:
+// (my_rank << 48) | byte offset of y[(slot*cap + r)] inside MY heap.
+// grid = (ceil(cap / GR), E); block = GR.
+extern "C" __global__ void __launch_bounds__(EP_LL_GR)
+di_ep_publish_ll_kernel(const unsigned long long* peer_heaps,
+                        int my_rank, int K, int cap, int hidden, int E,
+                        int tokens) {
+    const int slot = blockIdx.y;
+    if (slot >= E) return;
+    const unsigned long long my = peer_heaps[my_rank];
+    EpFusedPtrs p = ep_fused_ptrs(my, K, cap, tokens, hidden, E);
+    const int m = min(p.counters[slot], cap);
+    const int r0 = blockIdx.x * EP_LL_GR;
+    for (int r = r0 + (int)threadIdx.x; r < m; r += EP_LL_GR) {
+        const int* m2 = p.meta2 + ((long long)slot * cap + r) * 4;
+        const int src = m2[0];
+        const int tok = m2[1];
+        const int kk = m2[2];
+        unsigned long long entry = ((unsigned long long)(unsigned)my_rank << 48)
+                                 | (unsigned long long)(p.y_off
+                                      + (((long long)slot * cap + r) * hidden) * 4);
+        unsigned long long* dst = (unsigned long long*)(
+            peer_heaps[src] + p.ctab_off + ((long long)tok * K + kk) * 8);
+        *dst = entry; // exactly one writer per (tok, kk)
+        di_red_add_sys_release(peer_heaps[src] + 4ull * (3 * K + 1), 1u);
+    }
+}
+
+// Fused reduce: read y rows directly from the peers' heaps through the
+// completion table (fixed k-ascending order; the acquire on combine_done
+// orders every expert's y writes before this read).
+extern "C" __global__ void __launch_bounds__(256)
+di_ep_reduce_remote_ll_kernel(const unsigned long long* peer_heaps,
+                              int my_rank, int K, int cap, int hidden, int E,
+                              int tokens,
+                              const float* __restrict__ topk_w,
+                              const int* __restrict__ topk_idx,
+                              float* __restrict__ out) {
+    const unsigned long long my = peer_heaps[my_rank];
+    if (threadIdx.x == 0) {
+        const unsigned want = (unsigned)di_ld_sys_acquire(my + 4ull * (3 * K + 2));
+        di_spin_until_ge(my + 4ull * (3 * K + 1), want);
+    }
+    __syncthreads();
+    EpFusedPtrs p = ep_fused_ptrs(my, K, cap, tokens, hidden, E);
+    const long long tot = (long long)tokens * hidden;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < tot;
+         i += (long long)gridDim.x * blockDim.x) {
+        const int t = (int)(i / hidden);
+        const int h = (int)(i - (long long)t * hidden);
+        float acc = 0.0f;
+        for (int kk = 0; kk < K; ++kk) {
+            if (topk_idx[t * K + kk] < 0) continue;
+            unsigned long long entry = p.ctab[(long long)t * K + kk];
+            int peer = (int)(entry >> 48);
+            const float* yrow = (const float*)(
+                peer_heaps[peer] + (entry & 0x0000FFFFFFFFFFFFull));
+            acc += topk_w[t * K + kk] * yrow[h];
+        }
+        out[i] = acc;
+    }
+}
+
+// EPLB feedback: per-expert histogram of one routing decision
+// (`topk_idx [tokens, K]`, -1 slots skipped). Integer atomics: the result
+// is order-independent, hence deterministic.
+extern "C" __global__ void __launch_bounds__(256)
+di_ep_topk_histogram_ll_kernel(const int* __restrict__ topk_idx,
+                               int* __restrict__ hist,
+                               int tokens, int K, int num_experts) {
+    const long long tot = (long long)tokens * K;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < tot;
+         i += (long long)gridDim.x * blockDim.x) {
+        int e = topk_idx[i];
+        if (e >= 0 && e < num_experts) atomicAdd(&hist[e], 1);
     }
 }

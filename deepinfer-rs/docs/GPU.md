@@ -566,3 +566,95 @@ chunks, zero-dependency `std::thread::scope`, zero unsafe) — the MLA
 projections, indexer tensors and the routed experts that dominate the
 tensor count read in parallel from the page cache (P1-10). Order and
 error semantics are preserved (first failing chunk wins).
+
+## Offline CUDA compile gate (implemented)
+
+`scripts/check-cuda.py` compiles every embedded kernel translation unit
+exactly the way the runtime JIT does (COMMON + module source, `--std=c++17
+-default-device`) through NVRTC and then assembles the emitted PTX with
+ptxas for `sm_80`, `sm_90`, `sm_100` (plus `sm_100a`/`sm_103a` for the
+tcgen05 module). Syntax, semantics **and inline PTX** (the `cp.async`,
+`atom.sys`, `mma.sync` strings) are validated without a GPU present; the
+gate caught three latent breakages on its first run (an invalid
+`--use_fast_math=off` NVRTC flag, the header-only `NAN`/`INFINITY` macros,
+and `ATT_WARPS` leaking across translation units) — all of which would
+have failed every kernel JIT on hardware. Run it with
+`python3 scripts/check-cuda.py` (requires the `nvidia-cuda-nvrtc-cu12`
+and `nvidia-cuda-nvcc-cu12` pip wheels).
+
+## cp.async-pipelined attention and vectorized DSA kernels (implemented)
+
+The hot serve walks gained a second kernel family (P1-8, the FA4
+technique adapted to the page-table indirection):
+
+* `di_serve_mla_decode_pipe_kernel` and
+  `di_serve_prefill_dense_pipe_kernel` stage their KV rows through a
+  3-deep shared-memory pipeline of 16-byte `cp.async` copies
+  (`di_cp16`/`di_cp_commit`/`di_cp_wait<N>` in common.cuh). The whole CTA
+  consumes ONE staged copy of each row (the direct-load family reads
+  every row once per warp — 8x), and tile t+1 is in flight while tile t
+  is consumed. The per-row online-softmax order and every arithmetic
+  expression are identical to the direct-load kernels — **bit-identical
+  outputs**, pinned by the `serve_pipe_vs_legacy` golden entry (hash
+  compare). On HIP/pre-Ampere the copy helper degrades to synchronous
+  loads (same bytes, no overlap). `DEEPINFER_SERVE_PIPE=0` forces the
+  legacy family for A/B.
+* `di_serve_thunder_logits_vec_kernel` and
+  `di_serve_dot_scores_vec_kernel` switch the DSA score kernels from one
+  thread per key row (32-way uncoalesced row streams) to one WARP per key
+  row with packed loads — u32 for the e4m3 lightning rows, float4 for the
+  f32 tail and the conv feat rows — so every load instruction becomes a
+  full 128-byte transaction. Lane-sliced d-ascending partials merge
+  through the fixed warp tree: deterministic, tolerance-golden versus the
+  scalar family (`DEEPINFER_SERVE_VEC=0` to disable).
+
+Tile geometry lives in the launcher (`SV_PIPE_SMEM` = 32 KiB budget, 3
+stages, rows-per-stage by cache format — unit-tested in Rust).
+
+## Fused symmetric-heap EP and EPLB feedback (implemented)
+
+The low-latency EP path gained a fused shape (P1-9, the MegaMoE/DeepEP-v2
+technique on the existing symmetric heaps):
+
+* The masked per-expert workspace (aq/asf/meta2/counters) plus the expert
+  outputs `y` and a **completion table** moved INTO the heap
+  (`SymmetricEp::new_with_experts`); `fused_buffers` hands the slices
+  straight to `gemm_grouped_masked_nt` — the grouped GEMM computes
+  directly over the symmetric heap layout, no staging copies between
+  communication and compute.
+* `di_ep_publish_ll_kernel` replaces the row-copying combine: per valid
+  expert row the owner writes one 8-byte completion entry
+  `(rank << 48) | y_row_byte_offset` into the home's table (a tiny remote
+  write instead of a `hidden`-f32 row) and release-increments the home's
+  `combine_done`; `di_ep_reduce_remote_ll_kernel` reads the y rows
+  directly from the peers' heaps through the table. Per-(token,k)
+  traffic drops from a full f32 row write+read to 8 bytes.
+* EPLB feedback: `Kernels::topk_histogram` accumulates a routing
+  histogram on device (integer atomics — order-independent, hence
+  deterministic); the host drains it into `deepinfer_eplb`'s
+  `ExpertStats`, whose moving average drives `rebalance_experts`, and the
+  resulting placement becomes the dispatch tables through
+  `deepinfer_eplb::ep_routing` (`rank_map` + per-rank `slot_map` — the
+  dispatch kernel takes them as device-resident tables, replacing the
+  hard-coded `e * world / num_experts` formula).
+
+## Persistent self-layer megakernel (implemented — phase 1)
+
+`di_mega_self_block_kernel` (P1-7, `DEEPINFER_MEGAKERNEL=1`, BS <= 4)
+replaces the per-layer chain
+`rmsnorm -> GEMV(fused_qkv) -> copy_cols x2 -> latent-norm -> rope(kv) ->
+paged KV encode -> GEMV(q_b) -> rope(q)`
+— eight kernels and four global round-trips of the intermediate rows —
+with ONE launch (grid = rows x layers): each CTA keeps `h/x/qa/kv`
+resident in shared memory, streams both weight matrices through a
+2-deep `cp.async` tile pipeline, quantizes the activations per-token-group
+in-kernel for the FP8 weight path (bit-exact codecs), applies the latent
+norm, both RoPEs (the q-pair lives in adjacent lanes — one shuffle) and
+writes the encoded KV row straight into the paged pool. All four weight
+dtypes (f32/bf16/fp8/nvfp4) are decoded in-kernel. Every reduction is a
+fixed tree and every GEMV accumulates k-ascending — deterministic; versus
+the tiled GEMM kernels the association differs, so outputs are
+tolerance-goldens (`serve_megakernel_vs_unfused` in golden_run). The
+launcher validates the geometry (16 B row alignment, even latent,
+hd % 32, smem budget) and the engine falls back to the unfused chain
+whenever anything is unsupported.

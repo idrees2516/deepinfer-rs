@@ -413,6 +413,7 @@ version = "0.1.0"
 dependencies = [
  "deepinfer-core",
  "deepinfer-dsa",
+ "deepinfer-eplb",
  "deepinfer-fp8",
  "deepinfer-gemm",
  "deepinfer-gpu",

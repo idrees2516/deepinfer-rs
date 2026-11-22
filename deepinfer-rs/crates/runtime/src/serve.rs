@@ -218,6 +218,16 @@ struct ServeWs {
     mpf_aq2: Option<Buffer>,
     mpf_asf2: Option<Buffer>,
     mpf_down: Buffer,
+    // P1-7 megakernel: per-layer pointer tables (u64) + the resolved
+    // weight dtype (-1 = geometry unsupported, mega disabled).
+    mega_wdtype: i32,
+    mega_norm: Buffer,
+    mega_qkv: Buffer,
+    mega_qkv_sf: Buffer,
+    mega_kvn: Buffer,
+    mega_qb: Buffer,
+    mega_qb_sf: Buffer,
+    mega_pool: Buffer,
 }
 
 /// The paged-cache state of a [`DeviceModel`].
@@ -373,6 +383,66 @@ impl DeviceModel {
                 .map_err(|er| Error::CapacityExceeded(format!("serve workspace: {er}")))
         };
         let splits = topk.div_ceil(deepinfer_kernels::DECODE_CHUNK).max(1);
+        // P1-7: resolve the megakernel weight dtype once (per-layer
+        // tables follow). -1 disables the fused path.
+        let mega_wdtype = {
+            let dt = self
+                .self_layers
+                .first()
+                .map(|(w, _)| deepinfer_kernels::mega_wdtype(w.fused_qkv.dtype))
+                .unwrap_or(-1);
+            let uniform = self
+                .self_layers
+                .iter()
+                .all(|(w, _)| w.fused_qkv.dtype == w.q_b.dtype);
+            let geo_ok = (hd - cfg.rope_dim) % 2 == 0
+                && hd % 32 == 0
+                && cfg.rope_dim >= 2;
+            if dt >= 0 && uniform && geo_ok {
+                let elt: usize = match dt {
+                    0 => 4,
+                    1 => 2,
+                    _ => 1,
+                };
+                let align_ok = (hidden * elt) % 16 == 0 && (cfg.q_lora_rank * elt) % 16 == 0;
+                let smem_ok = deepinfer_kernels::mega_shared(
+                    hidden,
+                    cfg.q_lora_rank,
+                    hd,
+                    dt,
+                ) <= self.dev.props().max_shared as usize;
+                if align_ok && smem_ok {
+                    dt
+                } else {
+                    -1
+                }
+            } else {
+                -1
+            }
+        };
+        let l_cnt = cfg.n_self_layers;
+        let p64 = |vals: &[u64]| -> Result<Buffer> {
+            dev.alloc_from(vals)
+                .map_err(|er| Error::CapacityExceeded(format!("mega tables: {er}")))
+        };
+        let mut t_norm = Vec::with_capacity(l_cnt);
+        let mut t_qkv = Vec::with_capacity(l_cnt);
+        let mut t_qkv_sf = Vec::with_capacity(l_cnt);
+        let mut t_kvn = Vec::with_capacity(l_cnt);
+        let mut t_qb = Vec::with_capacity(l_cnt);
+        let mut t_qb_sf = Vec::with_capacity(l_cnt);
+        let mut t_pool = Vec::with_capacity(l_cnt);
+        for (w, _) in &self.self_layers {
+            t_norm.push(w.attn_norm.ptr());
+            t_qkv.push(w.fused_qkv.raw.as_ref().map(|b| b.ptr()).or_else(|| w.fused_qkv.q.as_ref().map(|b| b.ptr())).unwrap_or(0));
+            t_qkv_sf.push(w.fused_qkv.sf.as_ref().map(|b| b.ptr()).unwrap_or(0));
+            t_kvn.push(w.kv_norm.ptr());
+            t_qb.push(w.q_b.raw.as_ref().map(|b| b.ptr()).or_else(|| w.q_b.q.as_ref().map(|b| b.ptr())).unwrap_or(0));
+            t_qb_sf.push(w.q_b.sf.as_ref().map(|b| b.ptr()).unwrap_or(0));
+        }
+        for pools in &self.paged.layers {
+            t_pool.push(pools.kv.buf.ptr());
+        }
         Ok(ServeWs {
             h: f(score_rows * hidden)?,
             x: f(score_rows * hidden)?,
@@ -481,6 +551,14 @@ impl DeviceModel {
                 None
             },
             mpf_down: f(mpf_bound * hidden)?,
+            mega_wdtype,
+            mega_norm: p64(&t_norm)?,
+            mega_qkv: p64(&t_qkv)?,
+            mega_qkv_sf: p64(&t_qkv_sf)?,
+            mega_kvn: p64(&t_kvn)?,
+            mega_qb: p64(&t_qb)?,
+            mega_qb_sf: p64(&t_qb_sf)?,
+            mega_pool: p64(&t_pool)?,
         })
     }
 
@@ -1991,8 +2069,56 @@ impl DeviceModel {
         self.k
             .serve_pos_fill(&ws.cells, &ws.pos_kv, &ws.pos_q, b, sq, cfg.n_heads, s)?;
 
+        let fmt = match self.fmt {
+            DevCacheFormat::F32 => deepinfer_kernels::CacheFormat::F32,
+            DevCacheFormat::Fp8Group32 => deepinfer_kernels::CacheFormat::Fp8Group32,
+            DevCacheFormat::Fp4Group16 => deepinfer_kernels::CacheFormat::Fp4Group16,
+        };
+        // P1-7: the persistent self-layer block — ONE launch covers
+        // rmsnorm -> fused_qkv GEMV -> latent-norm -> rope(kv) -> paged KV
+        // encode -> q_b GEMV -> rope(q) for EVERY layer (grid.y). Opt-in
+        // (DEEPINFER_MEGAKERNEL=1), BS <= 4 low-latency regime.
+        let mega = std::env::var("DEEPINFER_MEGAKERNEL").ok().as_deref() == Some("1")
+            && ws.mega_wdtype >= 0
+            && rows <= 4;
+        if mega {
+            self.k.mega_self_block(
+                &ws.h,
+                &ws.mega_norm,
+                &ws.mega_qkv,
+                &ws.mega_qkv_sf,
+                &ws.mega_kvn,
+                &ws.mega_qb,
+                &ws.mega_qb_sf,
+                &ws.mega_pool,
+                &ws.tbl_ptrs,
+                &ws.cells,
+                &self.root.rope_cs,
+                &ws.pos_kv,
+                &ws.pos_q,
+                &ws.q,
+                hidden,
+                cfg.q_lora_rank,
+                hd,
+                cfg.rope_dim,
+                cfg.n_heads,
+                rows,
+                sq,
+                b,
+                cfg.n_self_layers,
+                ws.mega_wdtype,
+                fmt,
+                cfg.rms_eps,
+                s,
+            )?;
+        }
+
         for l in 0..cfg.n_self_layers {
             let (w, pools) = (&self.self_layers[l].0, &self.paged.layers[l]);
+            if mega {
+                // The megakernel already produced ws.q and the paged KV
+                // rows for this layer; continue with the DSA indexer.
+            } else {
             self.k
                 .rmsnorm(&ws.h, &w.attn_norm, &ws.x, rows, hidden, cfg.rms_eps, s)?;
             self.gemm(&w.fused_qkv, &ws.x, &ws.fused, rows)?;
@@ -2051,11 +2177,6 @@ impl DeviceModel {
                 s,
             )?;
             // Paged cache writes.
-            let fmt = match self.fmt {
-                DevCacheFormat::F32 => deepinfer_kernels::CacheFormat::F32,
-                DevCacheFormat::Fp8Group32 => deepinfer_kernels::CacheFormat::Fp8Group32,
-                DevCacheFormat::Fp4Group16 => deepinfer_kernels::CacheFormat::Fp4Group16,
-            };
             self.k.serve_kv_encode(
                 &ws.kv_rows,
                 &pools.kv.buf,
@@ -2067,6 +2188,7 @@ impl DeviceModel {
                 b,
                 s,
             )?;
+            } // end of the non-mega block
             // DSA indexer.
             self.gemm(&w.wq, &ws.h, &ws.q_idx, rows)?;
             self.gemm(&w.wk, &ws.h, &ws.k_new, rows)?;

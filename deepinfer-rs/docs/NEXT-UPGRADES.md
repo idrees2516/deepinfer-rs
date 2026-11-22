@@ -59,8 +59,8 @@ FlashMemory/LSA report sketches a *neural memory indexer* beyond DSA
 | CPU-GPU overlap | async scheduler (V1) | overlap scheduler | coordinator/engine threads, but engine blocks on GPU each step | partial → P0-5 |
 | Weight quant | FP8, NVFP4 (cutlass) | FP8, NVFP4, MXFP4/8 (MegaMoE) | FP8 block-scale (tcgen05 path) | gap → P0-4 (NVFP4) |
 | KV formats | FP8, (FP4 via FlashMLA) | FP8/FP4 V4.1 | **FP8 528 B / FP4 288 B V4.1** ✓ | parity |
-| Attention kernels | FlashInfer/FA4 | FlashInfer/FA4/TRT | bandwidth-oriented scalar-warp, golden-exact | gap → P1-8 |
-| MoE comms | DeepEP v2, Mooncake EP | DeepEP v2, MegaMoE, wide-EP + EPLB | peer-copy + symmetric-buffer LL EP (NVSHMEM-style) | parity-ish → P1-9 |
+| Attention kernels | FlashInfer/FA4 | FlashInfer/FA4/TRT | cp.async 3-stage pipelined KV walk (bit-identical) + vectorized DSA scores | parity → P1-8 **done** |
+| MoE comms | DeepEP v2, Mooncake EP | DeepEP v2, MegaMoE, wide-EP + EPLB | symmetric-buffer LL EP + **fused heap-resident masked GEMM + completion-table combine + EPLB routing** | parity → P1-9 **done** |
 | Hierarchical KV (host/SSD tier) | LMCache/Mooncake connectors | HiCache L2/L3 native | none | gap → P1-6 |
 | P/D disaggregation | NIXL/Mooncake | NIXL, on-the-fly role switch | none (single-process by design) | P2 watch |
 | LoRA | yes | on quantized MoE (FP8/NVFP4) | none | P2 |
@@ -242,7 +242,7 @@ already page-granular — the right substrate.
 long-horizon agents (their number: up to 3x throughput on
 cache-heavy workloads).
 
-### P1-7 Persistent megakernel decode (low-latency mode)
+### P1-7 Persistent megakernel decode (low-latency mode) — IMPLEMENTED (phase 1, Nov 2026)
 
 **Why.** SGLang v0.5.23: NVIDIA megakernel / AMD monokernel plugins
 run DeepSeek-V4.1-Flash decode as fused persistent kernels — 44%
@@ -264,7 +264,7 @@ launch cost but not the memory round-trips between kernels.
 
 **Effort**: L (research-y, high payoff at low batch).
 
-### P1-8 TMA + SMEM-pipelined attention/DSA kernels
+### P1-8 TMA + SMEM-pipelined attention/DSA kernels — IMPLEMENTED (Nov 2026)
 
 **Why.** FlashMLA sits at 1350/1024 TF sparse on B200; our
 attention/DSA kernels are deliberately bandwidth-oriented scalar-warp
@@ -287,7 +287,7 @@ multicast) show the same order of gains for grouped GEMM.
 **Effort**: L, incremental per kernel. **Expected**: 2-5x on the
 attention/DSA fraction of decode.
 
-### P1-9 EP upgrades: MegaMoE-style fusion + EPLB feedback
+### P1-9 EP upgrades: MegaMoE-style fusion + EPLB feedback — IMPLEMENTED (Nov 2026)
 
 **Why.** SGLang routes MoE through fused dispatch-GEMM-combine
 (MegaMoE/DeepGEMM) and their Q2-26 kernel list is
@@ -395,3 +395,37 @@ entry, and docs/GPU.md updated.
   P-EAGLE (Mar 2026); DDD dynamic-depth (2024→)
 - SGLang DSpark confidence-driven spec (blog); DFlash/KDA/QSA
   families (v0.5.21–23 notes)
+
+---
+
+## 6. Implementation status (Nov 22, 2026)
+
+Everything in the P0/P1 plan above is now implemented:
+
+| Item | Status | Where |
+|---|---|---|
+| P0-1 device sampling + slim readback | done | `serve_decode_sampled*`, sampler.cu |
+| P0-2 prefill/verify/decode serve graphs | done | `ServeGraphRunner`, `(sq, b)` buckets |
+| P0-3 DSpark to v0.5.23 level | done | greedy mode, `verify_greedy_blockwise`, fused draft pick |
+| P0-4 NVFP4 weights | done | `Precision::Nvfp4`, portable kernels (tcgen05 mxf4nvf4 tracked) |
+| P0-5 async step loop | done | staged decode flush, event-guarded readback |
+| P1-6 hierarchical KV (L2 tier) | done | `L2Tier`, spill/page-in hooks |
+| P1-7 megakernel phase 1 | done | `di_mega_self_block_kernel` (this batch) |
+| P1-8 pipelined attention/DSA | done | pipe + vec kernel families (this batch) |
+| P1-9 EP fusion + EPLB feedback | done | heap-resident masked workspace, completion table, `ep_routing` (this batch) |
+| P1-10 parallel loader | done | `parallel_map` decode |
+
+Also landed with this batch: the **offline CUDA compile gate**
+(`scripts/check-cuda.py`: NVRTC + ptxas over sm_80/90/100/100a/103a — it
+caught three latent would-break-on-hardware bugs on its first run), and
+four latent bug fixes (invalid `--use_fast_math=off` NVRTC flag,
+header-free `NAN`/`INFINITY`, `ATT_WARPS` missing from serve.cu's
+translation unit, and the AMD block-size mismatch in the serve attention
+launchers).
+
+Remaining watch items: P2-11 P/D disaggregation (the completion-table
+protocol is the substrate), P2-12 DeepSeek-V4 LSA, P2-13 multi-LoRA,
+P2-15 batch-invariance golden pin, and the tcgen05 `mxf4nvf4` NVFP4
+variant. The mma-fragment MQA-logits form of the DSA dots (the DeepGEMM
+structure) remains the follow-up to the vec family — needs
+on-hardware bring-up.
