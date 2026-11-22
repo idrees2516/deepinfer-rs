@@ -62,6 +62,7 @@ use deepinfer_kernels::{
     CacheFormat as DevCacheFormat, DecodeParams, GemmDType, Kernels, StepGeometry,
 };
 use deepinfer_mla::CacheFormat;
+use deepinfer_mtp::weights::MTP_RMS_EPS;
 use deepinfer_mtp::MtpWeights;
 
 use crate::config::ModelConfig;
@@ -92,6 +93,12 @@ pub enum Precision {
     /// At V4.1-Flash dims (hidden 7162-multiples, q-LoRA 1536, head 512,
     /// indexer 128·heads, MoE intermediate 2048) every GEMM runs FP8.
     Auto,
+    /// **NVFP4 weight-only** (P0-4): every GEMM's B side is quantized to
+    /// e2m1 nibbles with per-16 E4M3 scales
+    /// (`deepinfer_fp8::quantize_weight_nvfp4`); the A side stays f32
+    /// and the scalar-core kernels decode B on the fly. Halves the
+    /// weight memory versus FP8 (`--precision nvfp4`).
+    Nvfp4,
 }
 
 /// One NT GEMM weight, device-resident in the precision-selected layout.
@@ -120,6 +127,8 @@ fn dtype_for(prec: Precision, k: usize) -> GemmDType {
         Precision::F32 => GemmDType::F32,
         Precision::Auto if k % 128 == 0 => GemmDType::Fp8,
         Precision::Auto => GemmDType::Bf16,
+        Precision::Nvfp4 if k % 2 == 0 => GemmDType::Nvfp4,
+        Precision::Nvfp4 => GemmDType::Bf16,
     }
 }
 
@@ -136,6 +145,17 @@ fn upload_gemm(dev: &Device, w: &[f32], n: usize, k: usize, prec: Precision) -> 
             let (q, sf) = deepinfer_fp8::quantize_weight_per_block(w, n, k, 128, 128)?;
             Ok(GemmW {
                 dtype: GemmDType::Fp8,
+                q: Some(dev.alloc_from(&q)?),
+                sf: Some(dev.alloc_from(&sf)?),
+                raw: None,
+                n,
+                k,
+            })
+        }
+        GemmDType::Nvfp4 => {
+            let (q, sf) = deepinfer_fp8::quantize_weight_nvfp4(w, n, k)?;
+            Ok(GemmW {
+                dtype: GemmDType::Nvfp4,
                 q: Some(dev.alloc_from(&q)?),
                 sf: Some(dev.alloc_from(&sf)?),
                 raw: None,
@@ -183,6 +203,25 @@ fn upload_grouped_gemm(
         w.len()
     );
     match dtype_for(prec, k) {
+        GemmDType::Nvfp4 => {
+            let nk = n * k;
+            let mut q_all = Vec::with_capacity(g * n * k.div_ceil(2));
+            let mut sf_all = Vec::with_capacity(g * n * k.div_ceil(16));
+            for e in 0..g {
+                let (q, sf) =
+                    deepinfer_fp8::quantize_weight_nvfp4(&w[e * nk..(e + 1) * nk], n, k)?;
+                q_all.extend_from_slice(&q);
+                sf_all.extend_from_slice(&sf);
+            }
+            Ok(GemmW {
+                dtype: GemmDType::Nvfp4,
+                q: Some(dev.alloc_from(&q_all)?),
+                sf: Some(dev.alloc_from(&sf_all)?),
+                raw: None,
+                n,
+                k,
+            })
+        }
         GemmDType::Fp8 => {
             let nk = n * k;
             let mut q_all = Vec::with_capacity(g * nk);
@@ -400,6 +439,44 @@ struct DecodeGraph {
     exec: deepinfer_gpu::GraphExec,
 }
 
+/// GPU-resident DSpark draft module (P0-3): the MTP weights uploaded once
+/// plus persistent scratch, so [`DeviceModel::draft_step_fused`] runs the
+/// whole draft — concat, eh_proj, norms, the degenerate single-head block
+/// (Wv/Wo only: `softmax` of the 1x1 score is exactly 1, so the Q/K
+/// projections cancel), SwiGLU MLP and the fused head pick — on device
+/// with no `[vocab]` logits and no host round trip beyond 8 bytes.
+pub(crate) struct DraftDev {
+    // weights (f32, row-major, `out[r] = sum_c w[r*cols+c] * x[c]`)
+    w_eh: Buffer,
+    w_shared_norm: Buffer,
+    w_attn_norm: Buffer,
+    w_wv: Buffer,
+    w_wo: Buffer,
+    w_mlp_norm: Buffer,
+    w_gate_up: Buffer,
+    w_down: Buffer,
+    w_depth_norm: Buffer,
+    w_head: Buffer,
+    // scratch
+    concat: Buffer,
+    hp: Buffer,
+    normed: Buffer,
+    v: Buffer,
+    y: Buffer,
+    gu: Buffer,
+    act: Buffer,
+    hd: Buffer,
+    idx: Buffer,
+    part_max: Buffer,
+    part_idx: Buffer,
+    part_sum: Buffer,
+    out_tok: Buffer,
+    out_conf: Buffer,
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+}
+
 /// The GPU-resident DeepSeek-V4.1-Flash model.
 pub struct DeviceModel {
     pub(crate) cfg: ModelConfig,
@@ -411,6 +488,9 @@ pub struct DeviceModel {
     pub(crate) self_layers: Vec<(SelfLayerW, SelfLayerState)>,
     pub(crate) cross_layers: Vec<CrossLayerW>,
     mtp: Option<MtpWeights>,
+    /// Device-resident draft module (lazily uploaded on the first fused
+    /// draft step).
+    draft_dev: Option<crate::device_model::DraftDev>,
     seqs: BTreeMap<u32, DevSeq>,
     max_rows: usize,
     kv_row_bytes: usize,
@@ -779,6 +859,7 @@ impl DeviceModel {
             self_layers,
             cross_layers,
             mtp,
+            draft_dev: None,
             seqs: BTreeMap::new(),
             max_rows,
             kv_row_bytes: kv_bytes,
@@ -928,6 +1009,194 @@ impl DeviceModel {
         })
     }
 
+    /// One **device-side** MTP draft step (P0-3, the fused DSpark path —
+    /// SGLang's `MarkovSampleStep` shape): uploads the anchor hidden
+    /// row, runs the whole draft module on the GPU (GEMV projections,
+    /// norms, the degenerate single-head block and the fused
+    /// embedding-dot head pick) and reads back only `(token,
+    /// confidence)` — 8 bytes, no `[vocab]` logits, no host GEMV.
+    ///
+    /// The returned [`deepinfer_mtp::DraftToken`] carries **empty**
+    /// `logits` (nothing vocabulary-sized is materialized). Callers that
+    /// need the full draft distribution — grammar-masked drafting,
+    /// byte-mode vocabulary caps — use [`DeviceModel::draft_step`], which
+    /// keeps the host path with the full logits.
+    ///
+    /// The single-head attention of the length-1 draft context
+    /// degenerates exactly to the value path (`softmax` of the 1x1 score
+    /// is exactly 1), so the device path computes `y = h' + Wo(Wv n)`
+    /// and skips the Q/K projections — bit-identical to the CPU block's
+    /// `softmax([q.k/sqrt(d)]) == [1]` rule.
+    ///
+    /// # Errors
+    /// As [`DeviceModel::draft_step`], plus
+    /// [`deepinfer_core::Error::Numerical`] when the fused pick yields a
+    /// degenerate distribution.
+    pub fn draft_step_fused(
+        &mut self,
+        last_token: u32,
+        hidden: &[f32],
+    ) -> Result<deepinfer_mtp::DraftToken> {
+        let vocab = self.cfg.vocab_size;
+        let hidden_len = self.cfg.hidden_size;
+        ensure!(
+            self.mtp.is_some(),
+            InvalidArgument,
+            "draft_step_fused: the model has no MTP weights"
+        );
+        ensure!(
+            (last_token as usize) < vocab,
+            OutOfRange,
+            "draft anchor token {last_token} outside the vocabulary ({vocab})"
+        );
+        ensure!(
+            hidden.len() == hidden_len,
+            DimensionMismatch,
+            "draft_step_fused: hidden length {} does not match the model ({hidden_len})",
+            hidden.len()
+        );
+        if self.draft_dev.is_none() {
+            let d = self.upload_draft_dev()?;
+            self.draft_dev = Some(d);
+        }
+        let d = self
+            .draft_dev
+            .as_ref()
+            .ok_or_else(|| Error::internal("draft module upload"))?;
+        let s = &self.stream;
+        let h = d.hidden;
+        // Stage the anchor hidden into concat[0..H] and gather the
+        // embedding row into concat[H..2H] (both outside any graph).
+        let hdst = d.concat.slice(0, h * 4)?;
+        self.stream.write_async(&self.dev, &hdst, hidden)?;
+        self.stream.write_async(&self.dev, &d.idx, &[last_token])?;
+        let edst = d.concat.slice(h * 4, h * 4)?;
+        self.k
+            .gather_indexed(&self.root.embed, &edst, &d.idx, 1, h * 4, s)?;
+        // h' = rmsnorm_shared(eh_proj @ [h ; emb])
+        self.k.gemv_nt(&d.w_eh, &d.concat, &d.hp, h, 2 * h, s)?;
+        self.k
+            .rmsnorm(&d.hp, &d.w_shared_norm, &d.normed, 1, h, MTP_RMS_EPS, s)?;
+        // Degenerate attention: n1 = rmsnorm_attn(h'); y = h' + Wo(Wv n1)
+        // (the Q/K projections cancel — softmax of the 1x1 score is 1).
+        self.k
+            .rmsnorm(&d.normed, &d.w_attn_norm, &d.hp, 1, h, MTP_RMS_EPS, s)?;
+        self.k.gemv_nt(&d.w_wv, &d.hp, &d.v, h, h, s)?;
+        self.k.gemv_nt(&d.w_wo, &d.v, &d.y, h, h, s)?;
+        self.k.add(&d.normed, &d.y, h, s)?;
+        // SwiGLU MLP: y += Wd(silu(Wg n2) * (Wu n2)).
+        self.k
+            .rmsnorm(&d.y, &d.w_mlp_norm, &d.normed, 1, h, MTP_RMS_EPS, s)?;
+        self.k
+            .gemv_nt(&d.w_gate_up, &d.normed, &d.gu, 2 * d.inter, h, s)?;
+        self.k.silu_mul_fused(&d.gu, &d.act, 1, d.inter, s)?;
+        self.k.gemv_nt(&d.w_down, &d.act, &d.hp, h, d.inter, s)?;
+        self.k.add(&d.hp, &d.y, h, s)?;
+        // depth norm + the fused head pick.
+        self.k
+            .rmsnorm(&d.y, &d.w_depth_norm, &d.hd, 1, h, MTP_RMS_EPS, s)?;
+        deepinfer_kernels::sampler::draft_pick(
+            &self.k,
+            &d.hd,
+            &d.w_head,
+            &d.part_max,
+            &d.part_idx,
+            &d.part_sum,
+            &d.out_tok,
+            &d.out_conf,
+            d.vocab,
+            h,
+            s,
+        )?;
+        self.stream.synchronize()?;
+        let mut tok = [0u32; 1];
+        let mut conf = [0f32; 1];
+        self.dev.read(&d.out_tok, &mut tok)?;
+        self.dev.read(&d.out_conf, &mut conf)?;
+        let conf = conf[0];
+        ensure!(
+            (tok[0] as usize) < vocab,
+            OutOfRange,
+            "draft_step_fused: picked token {} outside the vocabulary ({vocab})",
+            tok[0]
+        );
+        ensure!(
+            conf.is_finite() && conf > 0.0 && conf <= 1.0 + 1e-5,
+            Numerical,
+            "draft_step_fused: degenerate draft distribution (confidence {conf})"
+        );
+        Ok(deepinfer_mtp::DraftToken {
+            token: tok[0],
+            confidence: conf,
+            logits: Vec::new(),
+        })
+    }
+
+    /// Uploads the MTP module for [`DeviceModel::draft_step_fused`] (one
+    /// full copy; the weights then stay resident for the model lifetime).
+    fn upload_draft_dev(&self) -> Result<DraftDev> {
+        let m = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| Error::invalid("draft module missing"))?;
+        let h = self.cfg.hidden_size;
+        let vocab = self.cfg.vocab_size;
+        ensure!(
+            m.eh_proj.len() == 2 * h * h,
+            DimensionMismatch,
+            "draft upload: eh_proj has {} floats, expected [hidden, 2*{h}]",
+            m.eh_proj.len()
+        );
+        ensure!(
+            !m.head.is_empty() && m.head.len() % h == 0 && m.head.len() / h == vocab,
+            DimensionMismatch,
+            "draft upload: head has {} floats, expected [vocab={vocab}, {h}]",
+            m.head.len()
+        );
+        let inter = m.block.w_down.len() / h;
+        ensure!(
+            inter >= 1 && m.block.w_down.len() % h == 0,
+            DimensionMismatch,
+            "draft upload: w_down has {} floats, not a positive multiple of hidden {h}",
+            m.block.w_down.len()
+        );
+        let f = |n: usize| -> Result<Buffer> {
+            self.dev
+                .alloc(n.max(1) * 4)
+                .map_err(|e| Error::CapacityExceeded(format!("draft scratch: {e}")))
+        };
+        let slabs = vocab.div_ceil(256).max(1);
+        Ok(DraftDev {
+            w_eh: self.dev.alloc_from(&m.eh_proj)?,
+            w_shared_norm: self.dev.alloc_from(&m.shared_norm)?,
+            w_attn_norm: self.dev.alloc_from(&m.block.attn_norm)?,
+            w_wv: self.dev.alloc_from(&m.block.wv)?,
+            w_wo: self.dev.alloc_from(&m.block.wo)?,
+            w_mlp_norm: self.dev.alloc_from(&m.block.mlp_norm)?,
+            w_gate_up: self.dev.alloc_from(&m.block.w_gate_up)?,
+            w_down: self.dev.alloc_from(&m.block.w_down)?,
+            w_depth_norm: self.dev.alloc_from(&m.depth_norm)?,
+            w_head: self.dev.alloc_from(&m.head)?,
+            concat: f(2 * h)?,
+            hp: f(h)?,
+            normed: f(h)?,
+            v: f(h)?,
+            y: f(h)?,
+            gu: f(2 * inter)?,
+            act: f(inter)?,
+            hd: f(h)?,
+            idx: f(1)?,
+            part_max: f(slabs)?,
+            part_idx: f(slabs)?,
+            part_sum: f(slabs)?,
+            out_tok: f(1)?,
+            out_conf: f(1)?,
+            hidden: h,
+            inter,
+            vocab,
+        })
+    }
+
     /// Tokens cached for `seq` (0 for unknown sequences).
     pub fn seq_len(&self, seq: u32) -> usize {
         self.seqs.get(&seq).map(|s| s.len).unwrap_or(0)
@@ -983,6 +1252,20 @@ impl DeviceModel {
         ensure!(m >= 1, InvalidArgument, "gemm needs m >= 1");
         let (n, kk) = (w.n(), w.k);
         match w.dtype {
+            GemmDType::Nvfp4 => {
+                // Weight-only FP4: the activation stays f32, the weight
+                // decodes from nibbles + per-16 E4M3 scales in-kernel.
+                let q = w
+                    .q
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("nvfp4 payload missing"))?;
+                let sf = w
+                    .sf
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("nvfp4 scales missing"))?;
+                self.k
+                    .gemm_nvfp4_nt(a_f32, q, sf, None, d, m, n, kk, &self.stream)
+            }
             GemmDType::Fp8 => {
                 let aq = self
                     .ws
@@ -1788,6 +2071,29 @@ impl DeviceModel {
                             let (gw, _dtype) = (&m.routed_gate_up, dtype);
                             match gw.dtype {
                                 GemmDType::Fp8 => unreachable!(),
+                                GemmDType::Nvfp4 => {
+                                    let q0 = ex * (2 * inter) * hidden / 2;
+                                    let q = gw.q.as_ref().unwrap().slice(
+                                        q0,
+                                        (2 * inter) * hidden / 2,
+                                    )?;
+                                    let sf0 = ex * (2 * inter) * hidden.div_ceil(16);
+                                    let sf = gw.sf.as_ref().unwrap().slice(
+                                        sf0,
+                                        (2 * inter) * hidden.div_ceil(16),
+                                    )?;
+                                    self.k.gemm_nvfp4_nt(
+                                        &a,
+                                        &q,
+                                        &sf,
+                                        None,
+                                        &d,
+                                        cnt,
+                                        2 * inter,
+                                        hidden,
+                                        &self.stream,
+                                    )?;
+                                }
                                 GemmDType::Bf16 => {
                                     let a16 = self.dev.alloc(cnt * hidden * 2)?;
                                     self.k.f32_to_bf16(&a, &a16, cnt * hidden, &self.stream)?;
@@ -1859,6 +2165,31 @@ impl DeviceModel {
                             let dw = &m.routed_down;
                             match dtype {
                                 GemmDType::Fp8 => unreachable!(),
+                                GemmDType::Nvfp4 => {
+                                    let q0 = ex * hidden * inter / 2;
+                                    let q = dw
+                                        .q
+                                        .as_ref()
+                                        .unwrap()
+                                        .slice(q0, hidden * inter / 2)?;
+                                    let sf0 = ex * hidden * inter.div_ceil(16);
+                                    let sf = dw
+                                        .sf
+                                        .as_ref()
+                                        .unwrap()
+                                        .slice(sf0, hidden * inter.div_ceil(16))?;
+                                    self.k.gemm_nvfp4_nt(
+                                        &a,
+                                        &q,
+                                        &sf,
+                                        None,
+                                        &d,
+                                        cnt,
+                                        hidden,
+                                        inter,
+                                        &self.stream,
+                                    )?;
+                                }
                                 GemmDType::Bf16 => {
                                     let a16 = self.dev.alloc(cnt * inter * 2)?;
                                     self.k.f32_to_bf16(&a, &a16, cnt * inter, &self.stream)?;
@@ -1951,6 +2282,22 @@ impl DeviceModel {
         )?;
         // gate_up
         match m.routed_gate_up.dtype {
+            GemmDType::Nvfp4 => {
+                self.k.gemm_grouped_masked_nt(
+                    &self.ws.moe_perm,
+                    None,
+                    m.routed_gate_up.q.as_ref().unwrap(),
+                    m.routed_gate_up.sf.as_ref(),
+                    &self.ws.moe_counters,
+                    &self.ws.moe_act,
+                    cap,
+                    2 * inter,
+                    hidden,
+                    e,
+                    GemmDType::Nvfp4,
+                    &self.stream,
+                )?;
+            }
             GemmDType::Fp8 => {
                 let aq = self.ws.moe_aq.as_ref().unwrap();
                 let asf = self.ws.moe_asf.as_ref().unwrap();
@@ -2025,6 +2372,22 @@ impl DeviceModel {
         )?;
         // down
         match m.routed_down.dtype {
+            GemmDType::Nvfp4 => {
+                self.k.gemm_grouped_masked_nt(
+                    &self.ws.moe_silu,
+                    None,
+                    m.routed_down.q.as_ref().unwrap(),
+                    m.routed_down.sf.as_ref(),
+                    &self.ws.moe_counters,
+                    &self.ws.moe_down,
+                    cap,
+                    hidden,
+                    inter,
+                    e,
+                    GemmDType::Nvfp4,
+                    &self.stream,
+                )?;
+            }
             GemmDType::Fp8 => {
                 let aq = self.ws.moe_aq2.as_ref().unwrap();
                 let asf = self.ws.moe_asf2.as_ref().unwrap();
@@ -3223,6 +3586,312 @@ mod tests {
         let _ = anchor;
     }
 
+    /// P0-1 device sampling: [`DeviceModel::serve_decode_sampled`] runs the
+    /// same forward as `serve_decode_out`, samples on device, and returns
+    /// `(token, anchor hidden)` without the `[vocab]` logits crossing
+    /// back. Greedy rows must equal the host argmax bitwise (the device
+    /// argmax compares the same f32 values); stochastic rows agree with
+    /// the CPU sampler up to `expf` rounding (distributional contract);
+    /// replays are bit-deterministic; the input-token semantics match
+    /// `serve_decode_out` (the batch token is appended; the sampled token
+    /// belongs to the next step).
+    #[test]
+    fn serve_device_sampling() {
+        let Some(dev) = gpu_device() else { return };
+        let cfg = ModelConfig::v41_tiny();
+        let mut gpu = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+        let prompt: Vec<u32> = (0..6u32).map(|t| (t * 61) % 250).collect();
+        gpu.serve_configure(2, 64, 4).unwrap();
+        gpu.serve_attach(1).unwrap();
+        gpu.serve_attach(2).unwrap();
+        let _ = gpu.serve_prefill(1, &prompt).unwrap();
+        let _ = gpu.serve_prefill(2, &prompt).unwrap();
+
+        // Greedy: host argmax over the logits path's row vs the device
+        // sampler's token (identical deterministic forwards).
+        let host = gpu.serve_decode_out(&[(1, 5)]).unwrap();
+        let am = deepinfer_core::math::argmax(&host[0].logits).unwrap() as u32;
+        let got = gpu
+            .serve_decode_sampled(
+                &[(2, 5)],
+                &[deepinfer_kernels::SampleParams {
+                    temperature: 0.0,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].token, am,
+            "greedy device sampling must equal the host argmax"
+        );
+        assert_eq!(gpu.serve_len(2), prompt.len() + 1, "input token appended");
+        let e = rel_err(&host[0].hidden, &got[0].hidden);
+        assert!(e < 1e-3, "sampled anchor hidden rel err {e}");
+
+        // Stochastic agreement: both sequences share the history, so the
+        // logits paths agree; the CPU sampler draws the same u from an
+        // identical Philox stream.
+        let cpu = deepinfer_sampler::Sampler::new(deepinfer_sampler::SamplingParams {
+            temperature: 1.3,
+            top_p: 0.9,
+            top_k: 16,
+            min_p: 0.02,
+            ..Default::default()
+        });
+        let n = 24usize;
+        let mut agree = 0usize;
+        let mut last_dev = 0u32;
+        for k in 0..n {
+            let host = gpu.serve_decode_out(&[(1, 7)]).unwrap();
+            let u = deepinfer_core::rng::Philox::new(0x5EED, k as u64).next_f32();
+            let cpu_tok = cpu
+                .sample(
+                    &host[0].logits,
+                    None,
+                    &mut deepinfer_core::rng::Philox::new(0x5EED, k as u64),
+                )
+                .unwrap();
+            let dev = gpu
+                .serve_decode_sampled(
+                    &[(2, 7)],
+                    &[deepinfer_kernels::SampleParams {
+                        temperature: 1.3,
+                        top_p: 0.9,
+                        top_k: 16,
+                        min_p: 0.02,
+                        u,
+                        ..Default::default()
+                    }],
+                )
+                .unwrap();
+            last_dev = dev[0].token;
+            if dev[0].token == cpu_tok {
+                agree += 1;
+            }
+        }
+        assert!(
+            agree * 10 >= n * 9,
+            "device/host sampler agreement {agree}/{n} (expf-rounding tolerance)"
+        );
+
+        // Replay determinism from the same state.
+        let fixed = deepinfer_kernels::SampleParams {
+            temperature: 1.1,
+            top_p: 0.95,
+            top_k: 8,
+            min_p: 0.01,
+            u: 0.42,
+            ..Default::default()
+        };
+        gpu.serve_rollback(2, 1).unwrap();
+        let a = gpu.serve_decode_sampled(&[(2, 7)], &[fixed]).unwrap();
+        gpu.serve_rollback(2, 1).unwrap();
+        let b = gpu.serve_decode_sampled(&[(2, 7)], &[fixed]).unwrap();
+        assert_eq!(a[0].token, b[0].token, "replay must be bit-deterministic");
+        assert_ne!(gpu.serve_len(2), 0);
+        let _ = last_dev;
+
+        // Validation: a bad uniform is rejected before any launch.
+        assert!(gpu
+            .serve_decode_sampled(
+                &[(2, 0)],
+                &[deepinfer_kernels::SampleParams {
+                    temperature: 1.0,
+                    u: 1.5,
+                    ..Default::default()
+                }]
+            )
+            .is_err());
+        assert!(gpu
+            .serve_decode_sampled(
+                &[(2, 0)],
+                &[deepinfer_kernels::SampleParams {
+                    temperature: 1.0,
+                    top_p: 0.0,
+                    ..Default::default()
+                }]
+            )
+            .is_err());
+    }
+
+    /// P0-4 NVFP4 weight-only precision: a model uploaded with
+    /// `Precision::Nvfp4` runs every GEMM's B side as e2m1 nibbles with
+    /// per-16 E4M3 scales (the A side stays f32) and matches the F32
+    /// reference within the 4-bit weight-quantization envelope.
+    #[test]
+    fn nvfp4_precision_end_to_end() {
+        let Some(dev) = gpu_device() else { return };
+        let cfg = ModelConfig::v41_tiny();
+        let mut f32m = DeviceModel::random_init(&cfg, 33, &dev, Precision::F32).unwrap();
+        let mut nvm = DeviceModel::random_init(&cfg, 33, &dev, Precision::Nvfp4).unwrap();
+        assert_eq!(nvm.precision(), Precision::Nvfp4);
+        let prompt: Vec<u32> = (0..6u32).map(|t| (t * 53) % 250).collect();
+        let la = f32m.prefill(1, &prompt).unwrap();
+        let lb = nvm.prefill(1, &prompt).unwrap();
+        let e = rel_err(&la, &lb);
+        assert!(
+            e < 0.35,
+            "nvfp4 prefill rel err {e} exceeds the 4-bit weight envelope"
+        );
+        // Decode stays coherent across steps.
+        let (mut ta, mut tb) = (5u32, 5u32);
+        for _ in 0..4 {
+            let xa = f32m.decode_step(1, ta).unwrap();
+            let xb = nvm.decode_step(1, tb).unwrap();
+            ta = deepinfer_core::math::argmax(&xa).unwrap() as u32;
+            tb = deepinfer_core::math::argmax(&xb).unwrap() as u32;
+        }
+        // The serve path (masked + bound grouped MoE) also runs nvfp4.
+        nvm.serve_configure(2, 64, 4).unwrap();
+        nvm.serve_attach(1).unwrap();
+        let l = nvm.serve_prefill(1, &prompt).unwrap();
+        assert!(l.iter().all(|v| v.is_finite()));
+        let d = nvm.serve_decode(&[(1, 7)]).unwrap();
+        assert!(d[0].iter().all(|v| v.is_finite()));
+        assert_eq!(nvm.serve_len(1), prompt.len() + 1);
+    }
+
+    /// P0-3 fused device draft: `draft_step_fused` runs the MTP module
+    /// on the GPU and must agree with the host `draft_step` (same
+    /// weights, same inputs) on the picked token, with the confidence
+    /// within the GEMV-vs-host reduction tolerance. The returned logits
+    /// are empty (nothing vocabulary-sized crossed back), and replays
+    /// are deterministic.
+    #[test]
+    fn draft_step_fused_matches_host() {
+        let Some(dev) = gpu_device() else { return };
+        let cfg = ModelConfig::v41_tiny();
+        let mut gpu = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+        assert!(gpu.has_mtp());
+        let mut h: Vec<f32> = Vec::new();
+        for i in 0..cfg.hidden_size {
+            h.push(((i * 37 + 11) as f32 * 0.05) - 1.25);
+        }
+        // Several anchors: the pick must match the host argmax each time.
+        for anchor_tok in [0u32, 3, 17, 120] {
+            let host = gpu.draft_step(anchor_tok, &h).unwrap();
+            let fused = gpu.draft_step_fused(anchor_tok, &h).unwrap();
+            assert_eq!(
+                fused.token, host.token,
+                "fused draft pick diverged at anchor {anchor_tok}"
+            );
+            let dc = fused.confidence;
+            let hc = host.confidence;
+            assert!(
+                (dc - hc).abs() <= 1e-3 * hc.max(1e-3),
+                "confidence drift {dc} vs {hc}"
+            );
+            assert!(
+                fused.logits.is_empty(),
+                "the fused path must not materialize draft logits"
+            );
+            assert!(dc > 0.0 && dc <= 1.0 + 1e-5);
+        }
+        // Replay determinism.
+        let a = gpu.draft_step_fused(7, &h).unwrap();
+        let b = gpu.draft_step_fused(7, &h).unwrap();
+        assert_eq!((a.token, a.confidence), (b.token, b.confidence));
+        // Validation mirrors draft_step.
+        assert!(gpu.draft_step_fused(cfg.vocab_size as u32, &h).is_err());
+        assert!(gpu.draft_step_fused(0, &h[..3]).is_err());
+    }
+
+    /// P0-2 serve graphs: prefill chunks, verify chains and decode batches
+    /// at bucketed shapes are captured once and replayed bit-compatibly
+    /// with the eager launches (same weights, same inputs). Replays reuse
+    /// the captured graph (the bucket table does not grow), and a
+    /// rolled-back sequence re-decodes identically through the graph.
+    #[test]
+    fn serve_graph_replay_matches_eager() {
+        let Some(dev) = gpu_device() else { return };
+        let cfg = ModelConfig::v41_tiny();
+        let mut eager = DeviceModel::random_init(&cfg, 11, &dev, Precision::F32).unwrap();
+        let mut graphed = DeviceModel::random_init(&cfg, 11, &dev, Precision::F32).unwrap();
+        for m in [&mut eager, &mut graphed] {
+            m.serve_configure(2, 128, 4).unwrap();
+        }
+        graphed.enable_serve_graph(true).unwrap();
+        assert!(graphed.serve_graph_enabled());
+        assert_eq!(graphed.serve_graphs_captured(), 0);
+
+        // Prefill bucket (sq = 64): capture on first use, replay after.
+        eager.serve_attach(1).unwrap();
+        graphed.serve_attach(1).unwrap();
+        let prompt: Vec<u32> = (0..64u32)
+            .map(|t| (t * 37) % (cfg.vocab_size as u32 - 1))
+            .collect();
+        let le = eager.serve_prefill(1, &prompt).unwrap();
+        let lg = graphed.serve_prefill(1, &prompt).unwrap();
+        let e = rel_err(&le, &lg);
+        assert!(e < 5e-2, "graphed prefill rel err {e}");
+        assert_eq!(
+            graphed.serve_graphs_captured(),
+            1,
+            "the 64-token prefill bucket must be captured"
+        );
+        eager.serve_attach(2).unwrap();
+        graphed.serve_attach(2).unwrap();
+        let le2 = eager.serve_prefill(2, &prompt).unwrap();
+        let lg2 = graphed.serve_prefill(2, &prompt).unwrap();
+        assert_eq!(
+            graphed.serve_graphs_captured(),
+            1,
+            "the second 64-token prefill must replay, not recapture"
+        );
+        assert!(rel_err(&le2, &lg2) < 5e-2, "replayed prefill diverged");
+
+        // Decode bucket (sq = 1, b = 2): captured, replayed, and the
+        // interleaved rows match the eager engine.
+        let (mut ta, mut tb) = (5u32, 9u32);
+        for i in 0..4 {
+            let ge = eager.serve_decode(&[(1, ta), (2, tb)]).unwrap();
+            let gg = graphed.serve_decode(&[(1, ta), (2, tb)]).unwrap();
+            for (r, (a, b)) in ge.iter().zip(gg.iter()).enumerate() {
+                let e = rel_err(a, b);
+                assert!(e < 5e-2, "graphed decode step {i} row {r} rel err {e}");
+            }
+            ta = deepinfer_core::math::argmax(&gg[0]).unwrap() as u32;
+            tb = deepinfer_core::math::argmax(&gg[1]).unwrap() as u32;
+        }
+        assert!(
+            graphed.serve_graphs_captured() >= 2,
+            "the (1, 2) decode bucket must be captured"
+        );
+        let graphs_after_decode = graphed.serve_graphs_captured();
+
+        // Verify-chain bucket (sq = 3): one graph replay for the chain.
+        let chain = [ta.wrapping_add(1) % 200, ta.wrapping_add(2) % 200, tb % 200];
+        let re = eager.serve_verify(1, &chain).unwrap();
+        let rg = graphed.serve_verify(1, &chain).unwrap();
+        assert_eq!(re.len(), rg.len());
+        for (j, (a, b)) in re.iter().zip(rg.iter()).enumerate() {
+            let e = rel_err(a, b);
+            assert!(e < 5e-2, "graphed verify row {j} rel err {e}");
+        }
+        assert_eq!(
+            graphed.serve_graphs_captured(),
+            graphs_after_decode + 1,
+            "the (3, 1) verify bucket must be captured"
+        );
+
+        // Rollback through the graph: re-decode reproduces the row.
+        graphed.serve_rollback(1, chain.len()).unwrap();
+        eager.serve_rollback(1, chain.len()).unwrap();
+        let ae = eager.serve_decode(&[(1, chain[0])]).unwrap();
+        let ag = graphed.serve_decode(&[(1, chain[0])]).unwrap();
+        let e = rel_err(&ae[0], &ag[0]);
+        assert!(e < 5e-2, "post-rollback graphed decode rel err {e}");
+
+        // Disabling clears the table and restores the eager path.
+        graphed.enable_serve_graph(false).unwrap();
+        assert_eq!(graphed.serve_graphs_captured(), 0);
+        graphed.serve_detach(1).unwrap();
+        graphed.serve_attach(1).unwrap();
+        let lg3 = graphed.serve_prefill(1, &prompt).unwrap();
+        assert!(rel_err(&le, &lg3) < 5e-2, "eager prefill after disable");
+    }
+
     /// The GPU prefix cache: block-granular page sharing over the paged
     /// pools. Sequence 1 prefills a 130-token prompt (two full blocks);
     /// sequence 2 re-prefills the same prompt and must (a) register a
@@ -3342,6 +4011,52 @@ mod tests {
         // The forward still produces sane logits after the churn.
         let out = gpu.serve_decode(&[(3, 7)]).unwrap();
         assert!(out[0].iter().all(|v| v.is_finite()));
+    }
+
+    /// P1-6 hierarchical KV: a VRAM eviction **spills** to the host
+    /// tier, and a later re-prefill of the same prompt **pages back in**
+    /// instead of recomputing — the restored decode must match a
+    /// cold-prefill reference, the L2 counters must show the spill and
+    /// the page-in, and a disabled tier keeps the plain drop behavior.
+    #[test]
+    fn serve_prefix_l2_spill_and_page_in() {
+        let Some(dev) = gpu_device() else { return };
+        let cfg = ModelConfig::v41_tiny();
+        let mut gpu = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+        let a: Vec<u32> = (0..130u32).map(|t| (t * 37 + 5) % 250).collect();
+        // 4 pages total: A leases 3 (two full blocks + tail) and leaves 2
+        // with the tree; a second distinct prompt forces an eviction,
+        // which spills A's leaf to the host tier.
+        gpu.serve_configure(2, 256, 4).unwrap();
+        // Generous L2 budget (the tiny-config page footprint is small).
+        std::env::set_var("DEEPINFER_PREFIX_L2_BYTES", "134217728");
+        gpu.serve_prefix_configure(1 << 18).unwrap();
+        gpu.serve_attach(1).unwrap();
+        let cold = gpu.serve_prefill(1, &a).unwrap();
+        gpu.serve_detach(1).unwrap();
+        assert_eq!(gpu.serve_prefix_stats().nodes, 2);
+        // Force the eviction + spill with a distinct prompt.
+        let b: Vec<u32> = (0..130u32).map(|t| (t * 53 + 11) % 250).collect();
+        gpu.serve_attach(2).unwrap();
+        let _ = gpu.serve_prefill(2, &b).unwrap();
+        let st = gpu.serve_prefix_stats();
+        assert!(st.evictions > 0, "the pressure valve evicted a leaf");
+        assert!(st.l2_spills > 0, "the eviction spilled to the host tier");
+        assert!(st.l2_blobs > 0, "the host tier holds the spilled block");
+        assert!(st.l2_bytes > 0);
+        // Re-prefill the original prompt on a fresh sequence: the L2
+        // page-in path restores the block (a page-in counter bump) and
+        // the logits match the cold prefill.
+        gpu.serve_detach(2).unwrap();
+        gpu.serve_attach(3).unwrap();
+        let warm = gpu.serve_prefill(3, &a).unwrap();
+        let st = gpu.serve_prefix_stats();
+        assert!(st.l2_pageins > 0, "the re-prefill paged the block back in");
+        let e = rel_err(&cold, &warm);
+        assert!(e < 5e-2, "paged-in prefill rel err {e}");
+        let d = gpu.serve_decode(&[(3, 7)]).unwrap();
+        assert!(d[0].iter().all(|v| v.is_finite()));
+        std::env::remove_var("DEEPINFER_PREFIX_L2_BYTES");
     }
 
     /// The NVSHMEM-style symmetric-buffer EP against a host-computed

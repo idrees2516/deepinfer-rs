@@ -33,3 +33,4 @@ pub use device_model::{DeviceModel, Precision, DEVICE_MAX_PREFILL_TOKENS, MOE_CH
 pub use generate::{generate, GenerateOutput, GenerateRequest};
 pub use model::{DeepSeekModel, ForwardOut, PrefixState};
 pub use prefix_cache::PrefixCacheStats;
+pub use serve::{SampledOut, SampledStep};

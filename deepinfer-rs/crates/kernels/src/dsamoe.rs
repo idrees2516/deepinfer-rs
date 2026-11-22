@@ -585,6 +585,98 @@ impl Kernels {
         )
     }
 
+    /// **Bound-launched dispatch** — the graph-safe prefill-MoE variant of
+    /// [`Kernels::moe_dispatch`]: identical kernel sequence (count ->
+    /// aligned prefix -> scatter) with **no host readback**. The perm
+    /// buffer is zeroed up to `perm_bound_rows` (a capture-time constant
+    /// covering the worst-case padded total); the grouped GEMMs are then
+    /// launched at the same bound and exit per-segment from the device
+    /// `offsets`, so the whole MoE block is CUDA/HIP-graph capturable.
+    ///
+    /// `perm_bound_rows` must be `tokens * K + 127 * min(tokens * K, E)`
+    /// rounded up to the alignment — the same bound the eager path
+    /// computes (see `serve_moe_prefill`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_dispatch_bound(
+        &self,
+        x: &Buffer,
+        topk_idx: &Buffer,
+        counts: &Buffer,
+        offsets: &Buffer,
+        rank_counters: &Buffer,
+        perm: &Buffer,
+        map: &Buffer,
+        tokens: usize,
+        hidden: usize,
+        k: usize,
+        e: usize,
+        align: usize,
+        perm_bound_rows: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure!(
+            align % 128 == 0 || align == 1,
+            InvalidArgument,
+            "align must be a multiple of 128"
+        );
+        ensure!(
+            perm_bound_rows >= tokens * k,
+            InvalidArgument,
+            "perm bound {perm_bound_rows} below the raw pair count {}",
+            tokens * k
+        );
+        self.fill_zero(counts, e * 4, stream)?;
+        self.fill_zero(rank_counters, e * 4, stream)?;
+        self.launch1d(
+            "di_moe_count_kernel",
+            tokens * k,
+            256,
+            0,
+            KernelArgs::new()
+                .ptr(topk_idx)
+                .ptr(counts)
+                .i32(tokens as i32)
+                .i32(k as i32)
+                .i32(e as i32),
+            stream,
+        )?;
+        self.launch1d(
+            "di_moe_prefix_kernel",
+            256,
+            256,
+            0,
+            KernelArgs::new()
+                .ptr(counts)
+                .ptr(offsets)
+                .i32(e as i32)
+                .i32(align as i32),
+            stream,
+        )?;
+        // Zero the whole bound (fixed size, replay-safe); rows past the
+        // actual padded total stay zero and are skipped by the GEMMs.
+        self.fill_zero(perm, perm_bound_rows * hidden * 4, stream)?;
+        let f = self.f("di_moe_scatter_kernel")?;
+        f.launch(
+            self.device(),
+            Launch {
+                grid: ((tokens * k) as u32, 1, 1),
+                block: (256, 1, 1),
+                shared: 0,
+            },
+            &KernelArgs::new()
+                .ptr(x)
+                .ptr(topk_idx)
+                .ptr(offsets)
+                .ptr(rank_counters)
+                .ptr(perm)
+                .ptr(map)
+                .i32(tokens as i32)
+                .i32(hidden as i32)
+                .i32(k as i32),
+            stream,
+        )
+    }
+
     /// Dispatch orchestration: counts -> aligned offsets -> scatter. All
     /// scratch buffers are caller-allocated:
     /// * `counts`, `rank_counters`: `[E]` i32 (zeroed here)

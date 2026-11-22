@@ -45,6 +45,43 @@ const PAGE: usize = deepinfer_kernels::SERVE_PAGE;
 /// Prefill chunk of the serve engine (matches the MoE prefill chunk).
 pub const SERVE_CHUNK: usize = MOE_CHUNK_TOKENS;
 
+/// One device-sampled decode result: the sampled token plus the
+/// speculative-decoding anchor hidden row (the `[vocab]` logits never
+/// reach the host — see [`DeviceModel::serve_decode_sampled`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SampledOut {
+    /// The sampled token id.
+    pub token: u32,
+    /// Residual hidden state at the sampled position (the MTP draft
+    /// input; `[hidden]`).
+    pub hidden: Vec<f32>,
+}
+
+/// An in-flight device-sampled decode step (P0-5): the slim outputs are
+/// on their way back through asynchronous D2H copies guarded by an
+/// event, so the engine thread can queue further GPU work (the step's
+/// prefill chunks) before consuming them — the vLLM-V1 overlap shape,
+/// one step deep, without speculative scheduling. Produced by
+/// [`DeviceModel::serve_decode_sampled_stage`], consumed by
+/// [`DeviceModel::serve_decode_sampled_finish`].
+pub struct SampledStep {
+    toks: Vec<u32>,
+    status: Vec<i32>,
+    hidden: Vec<f32>,
+    event: deepinfer_gpu::Event,
+    slots: Vec<(u32, deepinfer_kernels::ServeCellIn)>,
+    tokens: Vec<u32>,
+}
+
+/// Worst-case aligned-contiguous MoE staging rows for `rows` tokens:
+/// every pair lands in some expert segment, each segment is padded up to
+/// `align` — the bound the graph path preallocates and the grouped GEMMs
+/// are launched at.
+fn moe_prefill_bound(rows: usize, ki: usize, e: usize, align: usize) -> usize {
+    let pairs = rows * ki;
+    (pairs + 127 * pairs.min(e)).next_multiple_of(align).max(align)
+}
+
 /// One pool: `[total_pages, PAGE, row_bytes]`.
 struct Pool {
     buf: Buffer,
@@ -164,6 +201,23 @@ struct ServeWs {
     topk_w: Buffer,
     topk_idx: Buffer,
     router_logits: Buffer,
+    // Device sampler workspace (P0-1): per-row parameter block, sampled
+    // tokens and statuses.
+    samp_params: Buffer,
+    samp_tok: Buffer,
+    samp_status: Buffer,
+    // Graph-safe prefill-MoE staging (P0-2): bound-sized persistent
+    // buffers so `serve_moe_prefill` never allocates or reads back —
+    // capturable end to end.
+    mpf_perm: Buffer,
+    mpf_aq: Option<Buffer>,
+    mpf_asf: Option<Buffer>,
+    mpf_a16: Option<Buffer>,
+    mpf_act: Buffer,
+    mpf_silu: Buffer,
+    mpf_aq2: Option<Buffer>,
+    mpf_asf2: Option<Buffer>,
+    mpf_down: Buffer,
 }
 
 /// The paged-cache state of a [`DeviceModel`].
@@ -185,6 +239,11 @@ pub(crate) struct PagedState {
     max_pages_per_seq: usize,
     total_pages: usize,
     ws: Option<ServeWs>,
+    /// P0-2: serve-graph switch and the captured `(sq, b)` bucket table.
+    serve_graph_on: bool,
+    graphs: std::collections::HashMap<(usize, usize), deepinfer_gpu::GraphExec>,
+    /// P1-6: the host-memory (L2) spill tier of the prefix cache.
+    pub(crate) l2: crate::prefix_cache::L2Tier,
 }
 
 impl PagedState {
@@ -201,6 +260,9 @@ impl PagedState {
             max_pages_per_seq: 0,
             total_pages: 0,
             ws: None,
+            serve_graph_on: false,
+            graphs: std::collections::HashMap::new(),
+            l2: crate::prefix_cache::L2Tier::new(0),
         }
     }
 }
@@ -269,6 +331,9 @@ impl DeviceModel {
             max_pages_per_seq: max_len.div_ceil(PAGE),
             total_pages: pages_per_layer,
             ws: None,
+            serve_graph_on: self.paged.serve_graph_on,
+            graphs: std::collections::HashMap::new(),
+            l2: crate::prefix_cache::L2Tier::new(0),
         };
         let ws = self.build_serve_ws(max_seqs)?;
         self.paged.ws = Some(ws);
@@ -296,6 +361,9 @@ impl DeviceModel {
         let ki = moe.num_activated;
         let cap = rows.max(1); // decode bound: a token's k experts are distinct
         let fp8 = self.prec == Precision::Auto && hidden % 128 == 0 && inter % 128 == 0;
+        // Prefill-MoE staging bound over the largest chunk this workspace
+        // can serve (score_rows tokens).
+        let mpf_bound = moe_prefill_bound(score_rows, ki, e, MOE_ALIGN);
         let f = |n: usize| -> Result<Buffer> {
             dev.alloc(n.max(1) * 4)
                 .map_err(|er| Error::CapacityExceeded(format!("serve workspace: {er}")))
@@ -379,6 +447,40 @@ impl DeviceModel {
             topk_w: f(score_rows * ki)?,
             topk_idx: b(score_rows * ki * 4)?,
             router_logits: f(score_rows * e)?,
+            samp_params: f(rows * 6)?,
+            samp_tok: b(rows * 4)?,
+            samp_status: b(rows * 4)?,
+            // Graph-safe prefill-MoE staging at the worst-case bound of
+            // the largest forward the workspace serves (score_rows).
+            mpf_perm: f(mpf_bound * hidden)?,
+            mpf_aq: if fp8 {
+                Some(b(mpf_bound * hidden)?)
+            } else {
+                None
+            },
+            mpf_asf: if fp8 {
+                Some(b(mpf_bound * (hidden / 128).max(1))?)
+            } else {
+                None
+            },
+            mpf_a16: if fp8 {
+                None
+            } else {
+                Some(f(mpf_bound * hidden)?)
+            },
+            mpf_act: f(mpf_bound * 2 * inter)?,
+            mpf_silu: f(mpf_bound * inter)?,
+            mpf_aq2: if fp8 {
+                Some(b(mpf_bound * inter)?)
+            } else {
+                None
+            },
+            mpf_asf2: if fp8 {
+                Some(b(mpf_bound * (inter / 128).max(1))?)
+            } else {
+                None
+            },
+            mpf_down: f(mpf_bound * hidden)?,
         })
     }
 
@@ -594,6 +696,15 @@ impl DeviceModel {
         self.paged
             .prefix
             .set_budget(budget_tokens.div_ceil(PAGE), ring_units);
+        // P1-6: the host-memory spill tier — `DEEPINFER_PREFIX_L2_BYTES`
+        // overrides; the default is 25% of the token budget's device
+        // footprint (the LMCache-style CPU-memory L2).
+        let default_l2 = (budget_tokens.div_ceil(PAGE)) * self.paged.page_units_bytes / 4;
+        let l2_budget = std::env::var("DEEPINFER_PREFIX_L2_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default_l2);
+        self.paged.l2.set_budget(l2_budget);
         for p in self.paged.prefix.evict_to_budget() {
             self.release_page(p);
         }
@@ -604,7 +715,14 @@ impl DeviceModel {
     /// evictions, live nodes, budget) — the GPU analogue of the CPU
     /// server's `PrefixIndex` gauges.
     pub fn serve_prefix_stats(&self) -> PrefixCacheStats {
-        self.paged.prefix.stats()
+        let mut st = self.paged.prefix.stats();
+        let (spills, pageins) = self.paged.l2.counters();
+        st.l2_spills = spills;
+        st.l2_pageins = pageins;
+        st.l2_blobs = self.paged.l2.len();
+        st.l2_bytes = self.paged.l2.bytes();
+        st.l2_budget_bytes = self.paged.l2.budget();
+        st
     }
 
     /// Drop every cached prefix (tree leases end; pages shared with
@@ -615,6 +733,55 @@ impl DeviceModel {
         for p in self.paged.prefix.clear() {
             self.release_page(p);
         }
+    }
+
+    /// Enables or disables **serve-graph capture** (P0-2): decode steps
+    /// at a bucketed batch width and single-slot prefill/verify chunks at
+    /// a bucketed length are captured once into a CUDA/HIP graph on
+    /// first use and replayed as a single launch afterwards — SGLang's
+    /// "breakable prefill graphs" shape, applied to the paged engine.
+    ///
+    /// Graph safety rests on the existing kernel contract: every
+    /// per-step scalar (positions, lengths, window bounds, page tables)
+    /// is read from device cells the kernels dereference at replay time,
+    /// the MoE prefill block stages into persistent bound-sized buffers
+    /// with device-resident segment offsets (no host readback), and the
+    /// token/cell uploads stay outside the captured region. Decode
+    /// batches are padded with inert cells (`active = 0`) up to the
+    /// bucket width — every pool-writing kernel guards on the active
+    /// flag, and pad slots borrow slot 0's page tables so no pointer is
+    /// ever stale.
+    ///
+    /// Non-bucketed shapes (mixed-batch prefill, tail chunks) keep the
+    /// eager path. Rollbacks stay exact: graphs read the position and
+    /// page tables from device memory every replay.
+    ///
+    /// # Errors
+    /// [`Error::Internal`] when enabling on a driver without graph
+    /// capture support.
+    pub fn enable_serve_graph(&mut self, on: bool) -> Result<()> {
+        if on && !deepinfer_gpu::graph_supported(&self.dev) {
+            return Err(Error::internal(
+                "serve graphs requested but the driver does not expose CUDA/HIP graph capture",
+            ));
+        }
+        self.paged.serve_graph_on = on;
+        if !on {
+            self.paged.graphs.clear();
+        }
+        Ok(())
+    }
+
+    /// Whether serve-graph capture is enabled (see
+    /// [`DeviceModel::enable_serve_graph`]).
+    pub fn serve_graph_enabled(&self) -> bool {
+        self.paged.serve_graph_on
+    }
+
+    /// Number of captured serve graphs (the `(sq, b)` bucket table size —
+    /// a capacity/telemetry gauge).
+    pub fn serve_graphs_captured(&self) -> usize {
+        self.paged.graphs.len()
     }
 
     /// Match and adopt a cached prefix for a **fresh** sequence: shares
@@ -636,7 +803,16 @@ impl DeviceModel {
         if limit == 0 {
             return Ok(0);
         }
-        let m = self.paged.prefix.match_blocks(&tokens[..limit * PAGE]);
+        let mut m = self.paged.prefix.match_blocks(&tokens[..limit * PAGE]);
+        if m < limit && self.paged.l2.enabled() && !self.paged.l2.is_empty() {
+            // P1-6: a VRAM miss (or a short match) consults the host
+            // tier — the deepest surviving spilled chain pages back in
+            // as fresh tree nodes, then the match runs again.
+            let restored = self.serve_prefix_l2_page_in(tokens, m, limit);
+            if restored > m {
+                m = self.paged.prefix.match_blocks(&tokens[..limit * PAGE]);
+            }
+        }
         if m == 0 {
             return Ok(0);
         }
@@ -704,9 +880,7 @@ impl DeviceModel {
         let nb = len / PAGE;
         if nb <= inserted / PAGE {
             if self.paged.prefix.holds_pages() {
-                for p in self.paged.prefix.evict_to_budget() {
-                    self.release_page(p);
-                }
+                self.serve_prefix_evict_to_budget()?;
             }
             return Ok(());
         }
@@ -788,10 +962,194 @@ impl DeviceModel {
             // (rollback kept them frozen); the freeze range only grows.
             s.shared = s.shared.max(done);
         }
-        for p in self.paged.prefix.evict_to_budget() {
+        self.serve_prefix_evict_to_budget()?;
+        Ok(())
+    }
+
+    /// Evict LRU leaves down to the tree budget, **spilling** each
+    /// victim to the host-memory L2 tier first (P1-6): the page content
+    /// of all five pools for every self layer, the `k_sf` segment and
+    /// the ring snapshots are read back once and stored under the
+    /// block's chained hash — a later VRAM miss pages them back in
+    /// instead of recomputing the prefill. A disabled tier drops the
+    /// pages exactly as before.
+    fn serve_prefix_evict_to_budget(&mut self) -> Result<()> {
+        while self.paged.prefix.over_budget() {
+            let Some(victim) = self.paged.prefix.lru_leaf_idx() else {
+                break;
+            };
+            if self.paged.l2.enabled() {
+                self.spill_l2(victim)?;
+            }
+            let Some(p) = self.paged.prefix.evict_lru_leaf() else {
+                break;
+            };
             self.release_page(p);
         }
         Ok(())
+    }
+
+    /// Read one victim node's page content back and store it in the L2
+    /// tier under its chained hash.
+    fn spill_l2(&mut self, victim: usize) -> Result<()> {
+        let hash = self.paged.prefix.node_hash(victim);
+        let page = self.paged.prefix.node_page(victim) as usize;
+        let block = self.paged.prefix.node_block(victim).to_vec();
+        let k_sf = self.paged.prefix.node_ksf(victim).to_vec();
+        // Pool content, layer-major, five kinds per layer.
+        self.stream.synchronize()?;
+        let mut pools: Vec<Vec<u8>> = Vec::with_capacity(self.paged.layers.len() * 5);
+        for lp in &self.paged.layers {
+            for pool in [&lp.kv, &lp.k_raw, &lp.k_norm, &lp.k_u8, &lp.feat] {
+                let bytes = PAGE * pool.row_bytes;
+                let view = pool.buf.slice(page * bytes, bytes)?;
+                let mut dst = vec![0u8; bytes];
+                self.dev.read(&view, &mut dst)?;
+                pools.push(dst);
+            }
+        }
+        // Ring snapshots (endpoints only).
+        let rings = match self.paged.prefix.node_rings(victim) {
+            Some(src) => {
+                let mut rs = Vec::with_capacity(src.len());
+                for buf in src {
+                    let mut dst = vec![0u8; buf.len()];
+                    self.dev.read(buf, &mut dst)?;
+                    rs.push(dst);
+                }
+                Some(rs)
+            }
+            None => None,
+        };
+        self.paged.l2.store(
+            hash,
+            crate::prefix_cache::L2Blob {
+                block,
+                k_sf,
+                pools,
+                rings,
+                last_used: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Page the deepest surviving L2 chain of `tokens` (starting at
+    /// block `from`, up to `limit` blocks) back into fresh VRAM pages,
+    /// re-creating the radix nodes so the normal restore path matches
+    /// them. Returns the number of blocks restored into the tree.
+    fn serve_prefix_l2_page_in(&mut self, tokens: &[u32], from: usize, limit: usize) -> usize {
+        if !self.paged.l2.enabled() || from >= limit {
+            return from;
+        }
+        let mut h = crate::prefix_cache::FNV_OFFSET;
+        for b in 0..from {
+            h = crate::prefix_cache::chain_block(h, &tokens[b * PAGE..(b + 1) * PAGE]);
+        }
+        let mut restored = from;
+        let mut blobs: Vec<crate::prefix_cache::L2Blob> = Vec::new();
+        for _b in from..limit {
+            let block = &tokens[_b * PAGE..(_b + 1) * PAGE];
+            h = crate::prefix_cache::chain_block(h, block);
+            let Some(blob) = self.paged.l2.get(h).cloned() else {
+                break;
+            };
+            if blob.block != block {
+                break; // hash collision: not the same tokens
+            }
+            blobs.push(blob);
+        }
+        if blobs.is_empty() {
+            return from;
+        }
+        let ring_bytes = self.cfg.swa_window.max(1) * self.cfg.hidden_size * 4;
+        for (i, blob) in blobs.into_iter().enumerate() {
+            let b = from + i;
+            // A fresh page per block; the tree holds its lease.
+            let Ok(page) = self.serve_alloc_page() else {
+                break;
+            };
+            // Restore the pool content.
+            let mut ok = true;
+            for (li, lp) in self.paged.layers.iter().enumerate() {
+                for (ki, pool) in [&lp.kv, &lp.k_raw, &lp.k_norm, &lp.k_u8, &lp.feat]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let idx = li * 5 + ki;
+                    let Some(bytes) = blob.pools.get(idx) else {
+                        ok = false;
+                        break;
+                    };
+                    let want = PAGE * pool.row_bytes;
+                    if bytes.len() != want {
+                        ok = false;
+                        break;
+                    }
+                    let view = match pool.buf.slice(page as usize * want, want) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    };
+                    if self
+                        .stream
+                        .write_async(&self.dev, &view, bytes)
+                        .is_err()
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            if !ok {
+                self.release_page(page);
+                break;
+            }
+            // The ring snapshots (device buffers, H2D).
+            let rings = match &blob.rings {
+                None => None,
+                Some(rs) => {
+                    let bufs: Result<Vec<Buffer>> =
+                        (0..rs.len()).map(|_| self.dev.alloc(ring_bytes)).collect();
+                    match bufs {
+                        Ok(dst) => {
+                            for (d, bytes) in dst.iter().zip(rs.iter()) {
+                                if self.stream.write_async(&self.dev, d, bytes).is_err() {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                Some(dst)
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                }
+            };
+            if !ok {
+                self.release_page(page);
+                break;
+            }
+            if self
+                .paged
+                .prefix
+                .insert_block(tokens, b, page, blob.k_sf.clone(), rings)
+                .is_err()
+            {
+                self.release_page(page);
+                break;
+            }
+            restored = b + 1;
+        }
+        restored
     }
 
     /// Copy-on-write guard: appends starting at `pos0` that would
@@ -1082,11 +1440,12 @@ impl DeviceModel {
                 sqnb,
             },
         )])?;
-        let ws = self.paged.ws.as_ref().expect("configured");
         let b = 1usize;
-        self.run_serve_forward(sq, b, Some(tokens), seq)?;
+        self.stage_serve_tokens(tokens)?;
+        self.serve_forward_step(sq, b)?;
         // Read every row's logits.
         self.stream.synchronize()?;
+        let ws = self.paged.ws.as_ref().expect("configured");
         let mut out = Vec::with_capacity(sq);
         for j in 0..sq {
             let mut logits = vec![0.0f32; cfg.vocab_size];
@@ -1185,12 +1544,30 @@ impl DeviceModel {
             );
             self.serve_ensure_pages(*seq, total)?;
         }
-        self.serve_begin_step(&slots)?;
-        let tokens: Vec<u32> = slots
+        // Graph padding: inert cells up to the bucketed width.
+        let b_eff = self.serve_graph_pad_width(b);
+        let mut padded = slots.clone();
+        let anchor_seq = padded[0].0;
+        while padded.len() < b_eff {
+            padded.push((
+                anchor_seq,
+                ServeCellIn {
+                    active: 0,
+                    pos: 0,
+                    len: 0,
+                    sq: 1,
+                    sqnb: 0,
+                },
+            ));
+        }
+        self.serve_begin_step(&padded)?;
+        let mut tokens: Vec<u32> = slots
             .iter()
             .map(|(seq, _)| batch.iter().find(|&&(s, _)| s == *seq).expect("present").1)
             .collect();
-        self.run_serve_forward(1, b, Some(&tokens), slots[0].0)?;
+        tokens.resize(b_eff, 0);
+        self.stage_serve_tokens(&tokens)?;
+        self.serve_forward_step(1, b_eff)?;
         // Read per-sequence logits and the anchor hidden rows.
         self.stream.synchronize()?;
         let ws = self.paged.ws.as_ref().expect("configured");
@@ -1218,6 +1595,278 @@ impl DeviceModel {
         Ok(out)
     }
 
+    /// One batched decode step with **on-device sampling** (P0-1): the
+    /// forward runs exactly like [`DeviceModel::serve_decode_out`], then
+    /// the device sampler consumes `ws.logits` in place and only the
+    /// `[B]` token ids, statuses and the per-sequence anchor hidden rows
+    /// come back — at DeepSeek vocabulary the per-step D2H traffic drops
+    /// from `[B, vocab]` f32 (~516 KB/seq) to `[B, hidden + 2]` (~28
+    /// KB/seq), removing the dominant host stall of the plain decode
+    /// path.
+    ///
+    /// The per-row `params` carry `{temperature, top_p, min_p, u, cap,
+    /// top_k}`; the uniform `u` must be pre-drawn by the caller from the
+    /// request's Philox stream (greedy rows should pass any value — no
+    /// host RNG is consumed for them, matching the CPU sampler's
+    /// contract). Grammar-constrained requests cannot use this path
+    /// (their masks live on the host); the caller falls back to
+    /// [`DeviceModel::serve_decode_out`].
+    ///
+    /// # Errors
+    /// Same as [`DeviceModel::serve_decode_out`], plus
+    /// [`Error::Numerical`] when a row's distribution is degenerate (the
+    /// CPU sampler's "no finite logit" / "no positive mass" cases).
+    pub fn serve_decode_sampled(
+        &mut self,
+        batch: &[(u32, u32)],
+        params: &[deepinfer_kernels::SampleParams],
+    ) -> Result<Vec<SampledOut>> {
+        let step = self.serve_decode_sampled_stage(batch, params)?;
+        self.serve_decode_sampled_finish(step)
+    }
+
+    /// [`DeviceModel::serve_decode_sampled`] split in two (P0-5): stage
+    /// launches the forward, the device sampler and the event-guarded
+    /// slim readback, then returns **without waiting** — the caller may
+    /// queue more GPU work (this step's prefill chunks) before
+    /// [`DeviceModel::serve_decode_sampled_finish`] consumes the
+    /// results. Dropping the staged step is safe (the granted pages are
+    /// simply re-used by the next forward), but the sequence lengths
+    /// only advance at finish.
+    ///
+    /// # Errors
+    /// Same as [`DeviceModel::serve_decode_sampled`], raised before any
+    /// GPU work for validation failures.
+    pub fn serve_decode_sampled_stage(
+        &mut self,
+        batch: &[(u32, u32)],
+        params: &[deepinfer_kernels::SampleParams],
+    ) -> Result<SampledStep> {
+        ensure!(!batch.is_empty(), InvalidArgument, "decode batch is empty");
+        ensure!(
+            params.len() == batch.len(),
+            InvalidArgument,
+            "serve_decode_sampled: {} param rows for a {}-row batch",
+            params.len(),
+            batch.len()
+        );
+        let cfg = self.cfg.clone();
+        for (i, &(seq, t)) in batch.iter().enumerate() {
+            ensure!(
+                self.paged.seqs.contains_key(&seq),
+                InvalidArgument,
+                "sequence {seq} is not attached to the serve engine"
+            );
+            ensure!(
+                (t as usize) < cfg.vocab_size,
+                OutOfRange,
+                "token {t} outside the vocabulary"
+            );
+            let p = &params[i];
+            // CPU `SamplingParams::validate` invariants (the host sampler
+            // rejects these before touching the stream).
+            ensure!(
+                p.top_p.is_finite() && p.top_p > 0.0 && p.top_p <= 1.0,
+                InvalidArgument,
+                "serve_decode_sampled: top_p must be in (0, 1] (got {})",
+                p.top_p
+            );
+            ensure!(
+                p.min_p.is_finite() && p.min_p >= 0.0 && p.min_p < 1.0,
+                InvalidArgument,
+                "serve_decode_sampled: min_p must be in [0, 1) (got {})",
+                p.min_p
+            );
+            ensure!(
+                p.cap <= cfg.vocab_size,
+                InvalidArgument,
+                "serve_decode_sampled: vocab cap {} exceeds the vocabulary ({})",
+                p.cap,
+                cfg.vocab_size
+            );
+            if !p.is_greedy() {
+                ensure!(
+                    p.u.is_finite() && p.u >= 0.0 && p.u < 1.0,
+                    InvalidArgument,
+                    "serve_decode_sampled: the uniform must lie in [0, 1) (got {})",
+                    p.u
+                );
+            }
+        }
+        // Same slot preparation as `serve_decode_out` (deduplicated rows,
+        // copy-on-write guard, page bounds).
+        let mut slots: Vec<(u32, ServeCellIn)> = Vec::with_capacity(batch.len());
+        for &(seq, _) in batch {
+            if slots.iter().any(|(s, _)| *s == seq) {
+                continue;
+            }
+            let len = self.paged.seqs[&seq].len;
+            slots.push((
+                seq,
+                ServeCellIn {
+                    active: 1,
+                    pos: len as i32,
+                    len: len as i32,
+                    sq: 1,
+                    sqnb: (len / cfg.dsa.quant_block) as i32,
+                },
+            ));
+        }
+        let b = slots.len();
+        // Params follow the deduplicated slot order (one row per sequence).
+        let mut slot_params: Vec<deepinfer_kernels::SampleParams> =
+            Vec::with_capacity(b);
+        for (seq, _) in &slots {
+            let idx = batch.iter().position(|&(s, _)| s == *seq).expect("present");
+            slot_params.push(params[idx]);
+        }
+        for (seq, cell) in &slots {
+            let total = cell.len as usize + 1;
+            self.serve_prefix_cow(*seq, cell.len as usize)?;
+            ensure!(
+                total <= self.paged.max_len,
+                CapacityExceeded,
+                "sequence {seq} would exceed the serve cache bound"
+            );
+            ensure!(
+                total <= cfg.max_position_embeddings,
+                CapacityExceeded,
+                "sequence {seq} exceeds max_position_embeddings"
+            );
+            self.serve_ensure_pages(*seq, total)?;
+        }
+        // Graph padding: inert cells up to the bucketed width.
+        let b_eff = self.serve_graph_pad_width(b);
+        let mut padded = slots.clone();
+        let anchor_seq = padded[0].0;
+        while padded.len() < b_eff {
+            padded.push((
+                anchor_seq,
+                ServeCellIn {
+                    active: 0,
+                    pos: 0,
+                    len: 0,
+                    sq: 1,
+                    sqnb: 0,
+                },
+            ));
+        }
+        self.serve_begin_step(&padded)?;
+        let mut tokens: Vec<u32> = Vec::with_capacity(b_eff);
+        for (seq, _) in slots.iter() {
+            tokens.push(batch.iter().find(|&&(s, _)| s == *seq).expect("present").1);
+        }
+        tokens.resize(b_eff, 0);
+        self.stage_serve_tokens(&tokens)?;
+        self.serve_forward_step(1, b_eff)?;
+        // Device sampler over the logits + the slim asynchronous readback
+        // (P0-5): the [B] tokens, statuses and anchor hidden rows travel
+        // back through event-guarded D2H copies, so the engine thread can
+        // queue the step's prefill work before consuming them.
+        {
+            let ws = self.paged.ws.as_ref().expect("configured");
+            let mut words = Vec::with_capacity(b * 6);
+            for p in &slot_params {
+                words.extend_from_slice(&p.words());
+            }
+            self.stream.write_async(&self.dev, &ws.samp_params, &words)?;
+            deepinfer_kernels::sampler::sample_topp(
+                &self.k,
+                &ws.logits,
+                &ws.samp_params,
+                &ws.samp_tok,
+                &ws.samp_status,
+                b,
+                cfg.vocab_size,
+                &self.stream,
+            )?;
+            let mut toks = vec![0u32; b];
+            let mut status = vec![0i32; b];
+            let mut hidden = vec![0.0f32; b * cfg.hidden_size];
+            self.stream
+                .read_async(&self.dev, &ws.samp_tok.slice(0, b * 4)?, &mut toks)?;
+            self.stream
+                .read_async(&self.dev, &ws.samp_status.slice(0, b * 4)?, &mut status)?;
+            for (i, chunk) in hidden.chunks_mut(cfg.hidden_size).enumerate() {
+                let hrow = ws.h.slice(i * cfg.hidden_size * 4, cfg.hidden_size * 4)?;
+                self.stream.read_async(&self.dev, &hrow, chunk)?;
+            }
+            let event = self.dev.event()?;
+            event.record(&self.stream)?;
+            Ok(SampledStep {
+                toks,
+                status,
+                hidden,
+                event,
+                slots,
+                tokens,
+            })
+        }
+    }
+
+    /// The consuming half of [`DeviceModel::serve_decode_sampled_stage`]:
+    /// wait on the readback event, validate the sampler statuses,
+    /// assemble the results and apply the sequence bookkeeping.
+    ///
+    /// # Errors
+    /// [`deepinfer_core::Error::Numerical`] on a degenerate row (the
+    /// CPU sampler's error cases).
+    pub fn serve_decode_sampled_finish(&mut self, step: SampledStep) -> Result<Vec<SampledOut>> {
+        let SampledStep {
+            toks,
+            status,
+            hidden,
+            event,
+            slots,
+            tokens,
+        } = step;
+        let cfg = self.cfg.clone();
+        let b = slots.len();
+        event.synchronize()?;
+        for &st in status.iter() {
+            match st {
+                0 => {}
+                1 => {
+                    return Err(Error::Numerical(
+                        "serve_decode_sampled: no finite logit survives masking".into(),
+                    ))
+                }
+                2 => {
+                    return Err(Error::Numerical(
+                        "serve_decode_sampled: filtered distribution has no positive mass"
+                            .into(),
+                    ))
+                }
+                3 => {
+                    return Err(Error::Numerical(
+                        "serve_decode_sampled: invalid uniform".into(),
+                    ))
+                }
+                other => {
+                    return Err(Error::internal(format!(
+                        "serve_decode_sampled: unknown sampler status {other}"
+                    )))
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(b);
+        for (i, chunk) in hidden.chunks(cfg.hidden_size).enumerate().take(b) {
+            out.push(SampledOut {
+                token: toks[i],
+                hidden: chunk.to_vec(),
+            });
+        }
+        for ((seq, cell), tok) in slots.iter().zip(tokens.iter()) {
+            let s = self.paged.seqs.get_mut(seq).expect("attached");
+            s.len = cell.len as usize + 1;
+            s.tokens.push(*tok);
+        }
+        for (seq, _) in &slots {
+            self.serve_prefix_insert(*seq)?;
+        }
+        Ok(out)
+    }
+
     // ------------------------------------------------------------------
     // The shared forward (sq rows per slot, B slots)
     // ------------------------------------------------------------------
@@ -1228,14 +1877,92 @@ impl DeviceModel {
     /// pools. `anchor` is any attached sequence (unused except for the
     /// cross-layer pools which read the LAST self layer of each slot's own
     /// caches — the page tables carry the indirection).
+    /// Stage this step's input tokens into the workspace (outside any
+    /// graph capture — an H2D memcpy must not be baked into a replay).
+    fn stage_serve_tokens(&self, tokens: &[u32]) -> Result<()> {
+        let ws = self
+            .paged
+            .ws
+            .as_ref()
+            .ok_or_else(|| Error::internal("serve ws"))?;
+        self.stream.write_async(&self.dev, &ws.tokens, tokens)
+    }
+
+    /// Whether `(sq, b)` has a serve-graph bucket: decode steps at a
+    /// bucketed batch width (powers of two above 8, every width up to 8,
+    /// plus `max_seqs`), and single-slot prefill/verify chunks at a
+    /// bucketed `sq` (the `SERVE_CHUNK` ladder plus the DSpark chain
+    /// lengths). Everything else runs eager.
+    fn serve_graph_bucket(sq: usize, b: usize, max_seqs: usize) -> bool {
+        if sq == 1 {
+            // Decode family: b is its own bucket when small, a power of
+            // two when large, or exactly max_seqs.
+            if b <= 8 || b == max_seqs {
+                return true;
+            }
+            return b > 8 && b.is_power_of_two() && b < max_seqs;
+        }
+        if b != 1 {
+            return false;
+        }
+        // Prefill chunks (the SERVE_CHUNK ladder) and DSpark verify
+        // chains (2..=8 tokens).
+        const PREFILL_BUCKETS: [usize; 4] = [64, 128, 256, 512];
+        sq == 2
+            || sq == 3
+            || sq == 4
+            || sq == 5
+            || sq == 6
+            || sq == 7
+            || sq == 8
+            || PREFILL_BUCKETS.contains(&sq)
+    }
+
+    /// The decode batch width to run at when serve graphs are on: the
+    /// smallest bucketed width `>= b` (padding cells are inert — every
+    /// pool-writing kernel guards on `active == 0`, and the pad slots
+    /// borrow slot 0's page tables so no pointer is ever stale).
+    fn serve_graph_pad_width(&self, b: usize) -> usize {
+        if !self.paged.serve_graph_on || b > self.paged.max_seqs {
+            return b;
+        }
+        if b <= 8 || b == self.paged.max_seqs {
+            return b;
+        }
+        let mut w = b.next_power_of_two();
+        if w > self.paged.max_seqs {
+            w = self.paged.max_seqs;
+        }
+        w
+    }
+
+    /// Run one serve forward, replaying the captured graph for `(sq, b)`
+    /// when one exists and capturing it on first use (the capture call
+    /// itself records; the immediate launch executes it). Cell, page-table
+    /// and token staging must already be on the device — only kernel
+    /// launches live in the graph.
+    fn serve_forward_step(&mut self, sq: usize, b: usize) -> Result<()> {
+        if self.paged.serve_graph_on
+            && Self::serve_graph_bucket(sq, b, self.paged.max_seqs)
+            && deepinfer_gpu::graph_supported(&self.dev)
+        {
+            let key = (sq, b);
+            if let Some(exec) = self.paged.graphs.get(&key) {
+                exec.launch(&self.stream)?;
+                return Ok(());
+            }
+            let guard = self.dev.begin_capture(&self.stream)?;
+            self.run_serve_forward(sq, b)?;
+            let exec = guard.end()?;
+            exec.launch(&self.stream)?;
+            self.paged.graphs.insert(key, exec);
+            return Ok(());
+        }
+        self.run_serve_forward(sq, b)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn run_serve_forward(
-        &self,
-        sq: usize,
-        b: usize,
-        tokens: Option<&[u32]>,
-        _anchor: u32,
-    ) -> Result<()> {
+    fn run_serve_forward(&self, sq: usize, b: usize) -> Result<()> {
         let cfg = &self.cfg;
         let s = &self.stream;
         let ws = self
@@ -1257,10 +1984,8 @@ impl DeviceModel {
         let sm_eff = cfg.sm_scale() * deepinfer_dsa::mscale(cfg.dsa.topk_tokens);
         let max_cols = self.paged.max_len;
 
-        // Embedding gather + positions.
-        if let Some(toks) = tokens {
-            self.stream.write_async(&self.dev, &ws.tokens, toks)?;
-        }
+        // Embedding gather + positions (tokens already staged by the
+        // caller — the staging memcpy stays outside graph captures).
         self.k
             .gather_indexed(&self.root.embed, &ws.h, &ws.tokens, rows, hidden * 4, s)?;
         self.k
@@ -1727,9 +2452,13 @@ impl DeviceModel {
     // ------------------------------------------------------------------
 
     /// Aligned-contiguous MoE for prefill rows (the arena `moe_prefill`
-    /// flow — router, aligned dispatch with a segment readback, grouped
-    /// FP8 or per-expert dense GEMMs, combine — over the serve workspace;
-    /// staging is per call, prefill not being the hot loop).
+    /// flow — router, aligned dispatch, grouped GEMMs, combine) over the
+    /// **persistent bound-sized staging** in the serve workspace: no
+    /// per-call allocations and no host readback, so the whole block is
+    /// CUDA/HIP-graph capturable (P0-2). The dispatch zeroes the perm
+    /// buffer up to the worst-case bound; the grouped GEMMs launch at the
+    /// same bound and exit per-segment from the device-resident offsets,
+    /// so replays never depend on the actual per-expert counts.
     #[allow(clippy::too_many_arguments)]
     fn serve_moe_prefill(&self, m: &MoeW, rows: usize, ws: &ServeWs) -> Result<()> {
         let cfg = &self.cfg;
@@ -1739,6 +2468,11 @@ impl DeviceModel {
         let ki = cfg.moe.num_activated;
         let s = &self.stream;
         let align = MOE_ALIGN;
+        let bound = moe_prefill_bound(rows, ki, e, align);
+        let perm = ws.mpf_perm.slice(0, bound * hidden * 4)?;
+        let act = ws.mpf_act.slice(0, bound * 2 * inter * 4)?;
+        let silu = ws.mpf_silu.slice(0, bound * inter * 4)?;
+        let down = ws.mpf_down.slice(0, bound * hidden * 4)?;
         self.gemm(&m.router, &ws.x, &ws.router_logits, rows)?;
         self.k.moe_route(
             &ws.router_logits,
@@ -1750,13 +2484,7 @@ impl DeviceModel {
             ki,
             s,
         )?;
-        let bound = rows
-            .checked_mul(ki)
-            .and_then(|v| v.checked_add(127 * v.min(e)))
-            .ok_or_else(|| Error::CapacityExceeded("moe row bound overflows".into()))?
-            .next_multiple_of(align);
-        let perm = self.dev.alloc(bound.max(1) * hidden * 4)?;
-        let m_total = self.k.moe_dispatch(
+        self.k.moe_dispatch_bound(
             &ws.x,
             &ws.topk_idx,
             &ws.moe_counters,
@@ -1769,135 +2497,145 @@ impl DeviceModel {
             ki,
             e,
             align,
+            bound,
             s,
         )?;
-        self.stream.synchronize()?;
-        let mut counts = vec![0i32; e];
-        self.dev.read(&ws.moe_counters, &mut counts)?;
-        let act = self.dev.alloc(m_total.max(1) * 2 * inter * 4)?;
-        let silu = self.dev.alloc(m_total.max(1) * inter * 4)?;
-        let down = self.dev.alloc(m_total.max(1) * hidden * 4)?;
         match m.routed_gate_up.dtype {
             GemmDType::Fp8 => {
-                let aq = self.dev.alloc(m_total.max(1) * hidden)?;
-                let asf = self.dev.alloc(m_total.max(1) * (hidden / 128).max(1))?;
+                let aq = ws.mpf_aq.as_ref().unwrap();
+                let asf = ws.mpf_asf.as_ref().unwrap();
                 self.k
-                    .quant_per_token_group(&perm, &aq, &asf, m_total, hidden, 128, s)?;
+                    .quant_per_token_group(&perm, aq, asf, bound, hidden, 128, s)?;
                 self.k.gemm_fp8_grouped_nt(
-                    &aq,
-                    &asf,
+                    aq,
+                    asf,
                     m.routed_gate_up.q.as_ref().unwrap(),
                     m.routed_gate_up.sf.as_ref().unwrap(),
                     &ws.moe_offsets,
                     &act,
-                    m_total,
+                    bound,
                     2 * inter,
                     hidden,
                     e,
                     s,
                 )?;
             }
-            dtype => {
-                let mut off = 0usize;
-                for ex in 0..e {
-                    let cnt = counts[ex].max(0) as usize;
-                    if cnt > 0 {
-                        let a = perm.slice(off * hidden * 4, cnt * hidden * 4)?;
-                        let d = act.slice(off * 2 * inter * 4, cnt * 2 * inter * 4)?;
-                        match dtype {
-                            GemmDType::Fp8 => unreachable!(),
-                            GemmDType::Bf16 => {
-                                let a16 = self.dev.alloc(cnt * hidden * 2)?;
-                                self.k.f32_to_bf16(&a, &a16, cnt * hidden, s)?;
-                                self.k.gemm_bf16_nt(
-                                    &a16,
-                                    m.routed_gate_up.raw.as_ref().unwrap(),
-                                    None,
-                                    &d,
-                                    cnt,
-                                    2 * inter,
-                                    hidden,
-                                    s,
-                                )?;
-                            }
-                            GemmDType::F32 => {
-                                self.k.gemm_f32_nt(
-                                    &a,
-                                    m.routed_gate_up.raw.as_ref().unwrap(),
-                                    None,
-                                    &d,
-                                    cnt,
-                                    2 * inter,
-                                    hidden,
-                                    s,
-                                )?;
-                            }
-                        }
-                    }
-                    off += cnt.next_multiple_of(align);
-                }
+            GemmDType::Nvfp4 => {
+                self.k.gemm_grouped_nt_bound(
+                    &perm,
+                    m.routed_gate_up.q.as_ref().unwrap(),
+                    m.routed_gate_up.sf.as_ref(),
+                    &ws.moe_offsets,
+                    &act,
+                    bound,
+                    2 * inter,
+                    hidden,
+                    e,
+                    GemmDType::Nvfp4,
+                    s,
+                )?;
+            }
+            GemmDType::Bf16 => {
+                let a16 = ws.mpf_a16.as_ref().unwrap();
+                self.k.f32_to_bf16(&perm, a16, bound * hidden, s)?;
+                self.k.gemm_grouped_nt_bound(
+                    a16,
+                    m.routed_gate_up.raw.as_ref().unwrap(),
+                    None,
+                    &ws.moe_offsets,
+                    &act,
+                    bound,
+                    2 * inter,
+                    hidden,
+                    e,
+                    GemmDType::Bf16,
+                    s,
+                )?;
+            }
+            GemmDType::F32 => {
+                self.k.gemm_grouped_nt_bound(
+                    &perm,
+                    m.routed_gate_up.raw.as_ref().unwrap(),
+                    None,
+                    &ws.moe_offsets,
+                    &act,
+                    bound,
+                    2 * inter,
+                    hidden,
+                    e,
+                    GemmDType::F32,
+                    s,
+                )?;
             }
         }
-        self.k.silu_mul_fused(&act, &silu, m_total, inter, s)?;
+        self.k.silu_mul_fused(&act, &silu, bound, inter, s)?;
         match m.routed_down.dtype {
             GemmDType::Fp8 => {
-                let aq = self.dev.alloc(m_total.max(1) * inter)?;
-                let asf = self.dev.alloc(m_total.max(1) * (inter / 128).max(1))?;
+                let aq = ws.mpf_aq2.as_ref().unwrap();
+                let asf = ws.mpf_asf2.as_ref().unwrap();
                 self.k
-                    .quant_per_token_group(&silu, &aq, &asf, m_total, inter, 128, s)?;
+                    .quant_per_token_group(&silu, aq, asf, bound, inter, 128, s)?;
                 self.k.gemm_fp8_grouped_nt(
-                    &aq,
-                    &asf,
+                    aq,
+                    asf,
                     m.routed_down.q.as_ref().unwrap(),
                     m.routed_down.sf.as_ref().unwrap(),
                     &ws.moe_offsets,
                     &down,
-                    m_total,
+                    bound,
                     hidden,
                     inter,
                     e,
                     s,
                 )?;
             }
-            dtype => {
-                let mut off = 0usize;
-                for ex in 0..e {
-                    let cnt = counts[ex].max(0) as usize;
-                    if cnt > 0 {
-                        let a = silu.slice(off * inter * 4, cnt * inter * 4)?;
-                        let d = down.slice(off * hidden * 4, cnt * hidden * 4)?;
-                        match dtype {
-                            GemmDType::Fp8 => unreachable!(),
-                            GemmDType::Bf16 => {
-                                let a16 = self.dev.alloc(cnt * inter * 2)?;
-                                self.k.f32_to_bf16(&a, &a16, cnt * inter, s)?;
-                                self.k.gemm_bf16_nt(
-                                    &a16,
-                                    m.routed_down.raw.as_ref().unwrap(),
-                                    None,
-                                    &d,
-                                    cnt,
-                                    hidden,
-                                    inter,
-                                    s,
-                                )?;
-                            }
-                            GemmDType::F32 => {
-                                self.k.gemm_f32_nt(
-                                    &a,
-                                    m.routed_down.raw.as_ref().unwrap(),
-                                    None,
-                                    &d,
-                                    cnt,
-                                    hidden,
-                                    inter,
-                                    s,
-                                )?;
-                            }
-                        }
-                    }
-                    off += cnt.next_multiple_of(align);
-                }
+            GemmDType::Nvfp4 => {
+                self.k.gemm_grouped_nt_bound(
+                    &silu,
+                    m.routed_down.q.as_ref().unwrap(),
+                    m.routed_down.sf.as_ref(),
+                    &ws.moe_offsets,
+                    &down,
+                    bound,
+                    hidden,
+                    inter,
+                    e,
+                    GemmDType::Nvfp4,
+                    s,
+                )?;
+            }
+            GemmDType::Bf16 => {
+                let a16 = ws.mpf_a16.as_ref().unwrap();
+                let a16_down = a16.slice(0, bound * inter * 2)?;
+                self.k.f32_to_bf16(&silu, &a16_down, bound * inter, s)?;
+                self.k.gemm_grouped_nt_bound(
+                    &a16_down,
+                    m.routed_down.raw.as_ref().unwrap(),
+                    None,
+                    &ws.moe_offsets,
+                    &down,
+                    bound,
+                    hidden,
+                    inter,
+                    e,
+                    GemmDType::Bf16,
+                    s,
+                )?;
+            }
+            GemmDType::F32 => {
+                self.k.gemm_grouped_nt_bound(
+                    &silu,
+                    m.routed_down.raw.as_ref().unwrap(),
+                    None,
+                    &ws.moe_offsets,
+                    &down,
+                    bound,
+                    hidden,
+                    inter,
+                    e,
+                    GemmDType::F32,
+                    s,
+                )?;
             }
         }
         self.k.moe_combine(
@@ -1910,10 +2648,12 @@ impl DeviceModel {
             ki,
             s,
         )?;
+        // Shared experts reuse the routed staging's head rows as scratch
+        // (combine has already consumed them).
         for (gu, dn) in &m.shared {
-            let su = self.dev.alloc(rows * 2 * inter * 4)?;
-            let so = self.dev.alloc(rows * inter * 4)?;
-            let sd = self.dev.alloc(rows * hidden * 4)?;
+            let su = act.slice(0, rows * 2 * inter * 4)?;
+            let so = silu.slice(0, rows * inter * 4)?;
+            let sd = down.slice(0, rows * hidden * 4)?;
             self.gemm(gu, &ws.x, &su, rows)?;
             self.k.silu_mul_fused(&su, &so, rows, inter, s)?;
             self.gemm(dn, &so, &sd, rows)?;
@@ -1958,6 +2698,22 @@ impl DeviceModel {
             s,
         )?;
         match m.routed_gate_up.dtype {
+            GemmDType::Nvfp4 => {
+                self.k.gemm_grouped_masked_nt(
+                    &ws.moe_perm,
+                    None,
+                    m.routed_gate_up.q.as_ref().unwrap(),
+                    m.routed_gate_up.sf.as_ref(),
+                    &ws.moe_counters,
+                    &ws.moe_act,
+                    cap,
+                    2 * inter,
+                    hidden,
+                    e,
+                    GemmDType::Nvfp4,
+                    s,
+                )?;
+            }
             GemmDType::Fp8 => {
                 let aq = ws.moe_aq.as_ref().unwrap();
                 let asf = ws.moe_asf.as_ref().unwrap();
@@ -2023,6 +2779,22 @@ impl DeviceModel {
             s,
         )?;
         match m.routed_down.dtype {
+            GemmDType::Nvfp4 => {
+                self.k.gemm_grouped_masked_nt(
+                    &ws.moe_silu,
+                    None,
+                    m.routed_down.q.as_ref().unwrap(),
+                    m.routed_down.sf.as_ref(),
+                    &ws.moe_counters,
+                    &ws.moe_down,
+                    cap,
+                    hidden,
+                    inter,
+                    e,
+                    GemmDType::Nvfp4,
+                    s,
+                )?;
+            }
             GemmDType::Fp8 => {
                 let aq = ws.moe_aq2.as_ref().unwrap();
                 let asf = ws.moe_asf2.as_ref().unwrap();

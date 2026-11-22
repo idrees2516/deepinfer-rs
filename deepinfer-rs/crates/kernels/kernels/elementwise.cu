@@ -290,3 +290,24 @@ di_copy_cols_kernel(const float* __restrict__ src,
             src[(long long)r * src_stride + src_col0 + c];
     }
 }
+
+// GEMV: y[r] = sum_c w[r * cols + c] * x[c] — one warp per output row,
+// fixed-order warp-tree reduction (deterministic). The DSpark draft step
+// is GEMV-shaped end to end; this kernel carries every projection except
+// the fused head pick (di_draft_pick_*).
+extern "C" __global__ void __launch_bounds__(256)
+di_gemv_nt_kernel(const float* __restrict__ w,
+                  const float* __restrict__ x,
+                  float* __restrict__ y,
+                  int rows,
+                  int cols) {
+    int warp = (int)(threadIdx.x / DI_WARP);
+    int nw = (int)(blockDim.x / DI_WARP);
+    int r = blockIdx.x * nw + warp;
+    if (r >= rows) return;
+    const float* row = w + (u64)r * (u64)cols;
+    float acc = 0.0f;
+    for (int c = di_lane_id(); c < cols; c += DI_WARP) acc += row[c] * x[c];
+    acc = di_warp_reduce_sum(acc);
+    if (di_lane_id() == 0) y[r] = acc;
+}

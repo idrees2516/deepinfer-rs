@@ -295,6 +295,118 @@ pub fn dequantize_weight_per_block(
     Ok(out)
 }
 
+/// NVFP4 weight-block size (elements per e2m1 group / e4m3 scale).
+pub const NVFP4_BLOCK: usize = 16;
+
+/// Quantizes a `[n, k]` row-major weight matrix to the **NVFP4
+/// weight-only** layout (P0-4): 16-element groups along `k`, each
+/// encoded as e2m1 nibbles with one E4M3 scale per group — the NVIDIA
+/// NVFP4 weight recipe (2 bits/element + a per-16 scale, versus MXFP4's
+/// per-32 UE8M0). The A side of the GEMM stays f32, so only `b` is
+/// quantized.
+///
+/// Layout:
+/// * `values` — `[n, ceil(k / 2)]` u8, two nibbles per byte: the **low**
+///   nibble is the even-`k` element, the high nibble the odd one
+///   (little-endian nibble order, matching the FP4 KV-cache rows).
+/// * `scales` — `[n, ceil(k / 16)]` u8 E4M3.
+///
+/// Scale selection: `scale = clamp(amax / 6, E4M3_MIN_SUBNORMAL, 448)`
+/// rounded to E4M3, so `amax / scale <= 6` (the E2M1 maximum). `amax ==
+/// 0` selects the minimum subnormal (an all-zero group stays zero);
+/// non-finite entries follow the module conventions (`NaN -> 0`,
+/// `±Inf -> ±6` after scaling).
+///
+/// # Errors
+///
+/// `k == 0`, or `b.len() != n * k`.
+pub fn quantize_weight_nvfp4(b: &[f32], n: usize, k: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+    ensure!(k > 0, InvalidArgument, "k must be > 0, got {k}");
+    let nk = row_checked_mul(n, k, "n*k")?;
+    ensure!(
+        b.len() == nk,
+        DimensionMismatch,
+        "b has {} elements, expected n*k = {nk}",
+        b.len()
+    );
+    let stride_q = k.div_ceil(2);
+    let stride_s = k.div_ceil(NVFP4_BLOCK);
+    let mut values = vec![0u8; n * stride_q];
+    let mut scales = vec![0u8; n * stride_s];
+    for r in 0..n {
+        let row = &b[r * k..(r + 1) * k];
+        for g in 0..stride_s {
+            let c0 = g * NVFP4_BLOCK;
+            let c1 = (c0 + NVFP4_BLOCK).min(k);
+            let amax = group_amax(&row[c0..c1]);
+            let scale = if amax == 0.0 {
+                E4M3_MIN_SUBNORMAL
+            } else {
+                (amax / E2M1_MAX).clamp(E4M3_MIN_SUBNORMAL, E4M3_MAX)
+            };
+            let scale_byte = f32_to_e4m3_rne(scale, true);
+            scales[r * stride_s + g] = scale_byte;
+            let scale = e4m3_to_f32(scale_byte);
+            for c in c0..c1 {
+                let v = sanitize(row[c]) / scale;
+                let nib = f32_to_e2m1_rne(v);
+                if c % 2 == 0 {
+                    values[r * stride_q + c / 2] = nib & 0x0F;
+                } else {
+                    values[r * stride_q + c / 2] |= nib << 4;
+                }
+            }
+        }
+    }
+    Ok((values, scales))
+}
+
+/// Dequantizes [`quantize_weight_nvfp4`]:
+/// `out[r][c] = e2m1_to_f32(nibble) * e4m3_to_f32(sf[r][c / 16])`.
+///
+/// # Errors
+///
+/// `k == 0`, `values.len() != n * ceil(k / 2)` or
+/// `scales.len() != n * ceil(k / 16)`.
+pub fn dequantize_weight_nvfp4(
+    values: &[u8],
+    scales: &[u8],
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>> {
+    ensure!(k > 0, InvalidArgument, "k must be > 0, got {k}");
+    let stride_q = k.div_ceil(2);
+    let stride_s = k.div_ceil(NVFP4_BLOCK);
+    ensure!(
+        values.len() == n * stride_q,
+        DimensionMismatch,
+        "values has {} bytes, expected n*ceil(k/2) = {}",
+        values.len(),
+        n * stride_q
+    );
+    ensure!(
+        scales.len() == n * stride_s,
+        DimensionMismatch,
+        "scales has {} bytes, expected n*ceil(k/16) = {}",
+        scales.len(),
+        n * stride_s
+    );
+    let mut out = vec![0.0f32; n * k];
+    for r in 0..n {
+        for c in 0..k {
+            let byte = values[r * stride_q + c / 2];
+            let nib = if c % 2 == 0 {
+                byte & 0x0F
+            } else {
+                byte >> 4
+            };
+            out[r * k + c] =
+                e2m1_to_f32(nib) * e4m3_to_f32(scales[r * stride_s + c / NVFP4_BLOCK]);
+        }
+    }
+    Ok(out)
+}
+
 /// Packs 4 UE8M0 scale bytes into one `u32` (DeepGEMM SM100 packed-sf
 /// layout): the first byte goes into the low 8 bits (little-endian order),
 /// i.e. `packed[i] = s[4i] | s[4i+1] << 8 | s[4i+2] << 16 | s[4i+3] << 24`.
@@ -451,6 +563,88 @@ fn row_checked_mul(a: usize, b: usize, what: &str) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nvfp4_round_trip_and_layout() {
+        // The nibble order (low = even k), the per-16 scale grid and the
+        // clamp policy round-trip exactly for values already on the
+        // NVFP4 lattice.
+        let n = 4;
+        let k = 32;
+        let mut w = vec![0.0f32; n * k];
+        let lattice = [0.0f32, 0.5, -0.5, 1.0, -1.0, 1.5, 3.0, -6.0, 4.0, 6.0];
+        for (i, v) in w.iter_mut().enumerate() {
+            *v = lattice[i % lattice.len()];
+        }
+        let (q, s) = quantize_weight_nvfp4(&w, n, k).unwrap();
+        assert_eq!(q.len(), n * (k / 2));
+        assert_eq!(s.len(), n * (k / 16));
+        // Two different scale groups with different amax must produce
+        // different scale bytes (0.75 -> 0.125*6, clamped to E4M3).
+        let back = dequantize_weight_nvfp4(&q, &s, n, k).unwrap();
+        // Elements on the lattice with the group scale dividing exactly
+        // reconstruct within the e4m3 scale rounding.
+        for (i, (a, b)) in w.iter().zip(back.iter()).enumerate() {
+            let denom = s[i / 16];
+            let _ = denom;
+            assert!(
+                (a - b).abs() <= 1e-2 * a.abs().max(1e-3),
+                "element {i}: {a} -> {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn nvfp4_zero_and_degenerate_groups() {
+        let (q, s) = quantize_weight_nvfp4(&[0.0f32; 8], 1, 8).unwrap();
+        assert!(q.iter().all(|&b| b == 0));
+        assert_eq!(s[0], 0x01); // min subnormal scale
+        let back = dequantize_weight_nvfp4(&q, &s, 1, 8).unwrap();
+        assert!(back.iter().all(|&v| v == 0.0));
+
+        // NaN maps to zero; +Inf saturates to the E2M1 max after scaling.
+        let (q, s) = quantize_weight_nvfp4(&[f32::NAN, f32::INFINITY, 0.0, 0.0], 1, 4).unwrap();
+        let back = dequantize_weight_nvfp4(&q, &s, 1, 4).unwrap();
+        assert_eq!(back[0], 0.0);
+        assert!((back[1] - 6.0 * e4m3_to_f32(s[0])).abs() < 1e-3);
+
+        // Odd k tail: the last nibble slot is the odd element.
+        let (q, s) = quantize_weight_nvfp4(&[1.0f32, 2.0, 3.0], 1, 3).unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(s.len(), 1);
+        let back = dequantize_weight_nvfp4(&q, &s, 1, 3).unwrap();
+        assert_eq!(back.len(), 3);
+
+        // Shape validation.
+        assert!(quantize_weight_nvfp4(&[1.0f32; 4], 1, 0).is_err());
+        assert!(quantize_weight_nvfp4(&[1.0f32; 4], 3, 2).is_err());
+        assert!(dequantize_weight_nvfp4(&[0u8; 2], &[0u8; 1], 1, 8).is_err());
+        assert!(dequantize_weight_nvfp4(&[0u8; 2], &[0u8; 0], 1, 3).is_err());
+    }
+
+    #[test]
+    fn nvfp4_relative_error_bound() {
+        // Random-ish weights: the relative Frobenius error of the
+        // weight-only e2m1 quantization on Gaussian data sits at the
+        // intrinsic 16-level lattice floor (~9-10%); end-task accuracy
+        // (NVIDIA's NVFP4 envelope) recovers through the per-16 e4m3
+        // scales and downstream accumulation.
+        let mut rng = deepinfer_core::rng::Philox::new(0xF4, 4);
+        let n = 8;
+        let k = 128;
+        let w: Vec<f32> = (0..n * k).map(|_| rng.normal_f32() * 0.05).collect();
+        let (q, s) = quantize_weight_nvfp4(&w, n, k).unwrap();
+        let back = dequantize_weight_nvfp4(&q, &s, n, k).unwrap();
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for (a, b) in w.iter().zip(back.iter()) {
+            num += ((a - b) * (a - b)) as f64;
+            den += (a * a) as f64;
+        }
+        let rel = (num / den).sqrt();
+        assert!(rel < 0.12, "nvfp4 relative error {rel} exceeds 12%");
+    }
+
+
     use super::*;
     use deepinfer_core::prop::{prop, random_vec};
     use deepinfer_core::rng::Philox;

@@ -1,6 +1,6 @@
 //! GEMM launchers (DeepGEMM semantics; see kernels/gemm.cu).
 
-use deepinfer_core::{ensure, Result};
+use deepinfer_core::{ensure, Error, Result};
 use deepinfer_gpu::{
     Buffer, KernelArgs, Launch, Stream, TensorMapDType as TmDType, TensorMapSwizzle as TmSw,
 };
@@ -23,11 +23,13 @@ const SM100_TM_CACHE_CAP: usize = 256;
 /// source-name sanity test).
 #[cfg(test)]
 pub(crate) const KERNEL_NAMES: &[&str] = &[
+    "di_gemm_nvfp4_nt_kernel",
     "di_gemm_bf16_nt_kernel",
     "di_gemm_f32_nt_kernel",
     "di_gemm_fp8_nt_kernel",
     "di_gemm_fp8_grouped_nt_kernel",
     "di_gemm_grouped_masked_nt_kernel",
+    "di_gemm_grouped_nt_bound_kernel",
 ];
 
 /// Kernel entry points defined in `kernels/gemm_sm100.cu`.
@@ -49,6 +51,10 @@ pub enum GemmDType {
     Bf16 = 1,
     /// FP8 e4m3 operands with ue8m0 block scales (DeepGEMM recipe).
     Fp8 = 2,
+    /// NVFP4 **weight-only** operands (P0-4): the B side is e2m1 nibbles
+    /// with per-16 E4M3 scales
+    /// (`deepinfer_fp8::quantize_weight_nvfp4`); the A side stays f32.
+    Nvfp4 = 3,
 }
 
 impl Kernels {
@@ -382,6 +388,123 @@ impl Kernels {
         )
     }
 
+    /// **Bound-launched grouped-contiguous NT GEMM** (BF16/F32) — the
+    /// graph-safe prefill-MoE path for unquantized checkpoints. Same
+    /// segment contract as [`Kernels::gemm_fp8_grouped_nt`] (device
+    /// `m_offsets`, cumulative 128-aligned segments) but the grid
+    /// covers `m_bound` — a capture-time constant — and every CTA exits
+    /// at or past its segment end, so replays never read the actual
+    /// per-expert counts on the host.
+    ///
+    /// `a`: `[m_bound, k]`; `b`: `[g, n, k]`; `m_offsets`: `[g + 1]`
+    /// i32 (device); `d`: `[m_bound, n]` f32. `dtype` picks bf16 (`1`)
+    /// or f32 (`0`) operands.
+    pub fn gemm_grouped_nt_bound(
+        &self,
+        a: &Buffer,
+        b: &Buffer,
+        b_sf: Option<&Buffer>,
+        m_offsets: &Buffer,
+        d: &Buffer,
+        m_bound: usize,
+        n: usize,
+        k: usize,
+        g: usize,
+        dtype: GemmDType,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure!(
+            g > 0 && n > 0 && k > 0 && m_bound > 0,
+            InvalidArgument,
+            "bound grouped gemm bad shape"
+        );
+        let dtype_id = match dtype {
+            GemmDType::F32 => 0,
+            GemmDType::Bf16 => 1,
+            GemmDType::Fp8 => {
+                return Err(Error::invalid(
+                    "gemm_grouped_nt_bound: fp8 uses gemm_fp8_grouped_nt",
+                ))
+            }
+            GemmDType::Nvfp4 => {
+                ensure!(
+                    k % 2 == 0,
+                    InvalidArgument,
+                    "nvfp4 grouped gemm needs an even K (got {k})"
+                );
+                3
+            }
+        };
+        // The scale pointer is only dereferenced for nvfp4; other dtypes
+        // pass the (never-read) A pointer to satisfy the ABI.
+        let sf = b_sf.unwrap_or(a);
+        let f = self.f("di_gemm_grouped_nt_bound_kernel")?;
+        f.launch(
+            self.device(),
+            gemm_launch(n, m_bound),
+            &KernelArgs::new()
+                .ptr(a)
+                .ptr(b)
+                .ptr(sf)
+                .ptr(m_offsets)
+                .ptr(d)
+                .i32(m_bound as i32)
+                .i32(n as i32)
+                .i32(k as i32)
+                .i32(g as i32)
+                .i32(dtype_id),
+            stream,
+        )
+    }
+
+    /// Dense **NVFP4 weight-only** NT GEMM: `D = C + A @ B^T` with the
+    /// A side `[m, k]` f32 and the B side in the NVFP4 weight layout
+    /// (`b_q`: `[n, k / 2]` e2m1 nibbles, low nibble = even `k`;
+    /// `b_sf`: `[n, ceil(k / 16)]` E4M3 scales). Halves the weight
+    /// traffic versus FP8; numerics golden-testable against
+    /// `deepinfer_fp8::dequantize_weight_nvfp4`.
+    pub fn gemm_nvfp4_nt(
+        &self,
+        a: &Buffer,
+        b_q: &Buffer,
+        b_sf: &Buffer,
+        c: Option<&Buffer>,
+        d: &Buffer,
+        m: usize,
+        n: usize,
+        k: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure!(
+            m > 0 && n > 0 && k > 0 && k % 2 == 0,
+            InvalidArgument,
+            "nvfp4 gemm needs m/n > 0 and an even k (got k={k})"
+        );
+        ensure!(
+            b_q.len() >= n * (k / 2) && b_sf.len() >= n * k.div_ceil(16),
+            InvalidArgument,
+            "nvfp4 gemm: payload {} + scales {} too small for {n}x{k}",
+            b_q.len(),
+            b_sf.len()
+        );
+        let cc = c.unwrap_or(a);
+        let f = self.f("di_gemm_nvfp4_nt_kernel")?;
+        f.launch(
+            self.device(),
+            gemm_launch(n, m),
+            &KernelArgs::new()
+                .ptr(a)
+                .ptr(b_q)
+                .ptr(b_sf)
+                .ptr(cc)
+                .ptr(d)
+                .i32(m as i32)
+                .i32(n as i32)
+                .i32(k as i32),
+            stream,
+        )
+    }
+
     /// **Masked grouped NT GEMM** — the CUDA-graph / low-latency-EP MoE
     /// path (DeepGEMM `m_grouped_gemm_nt_masked` semantics).
     ///
@@ -427,6 +550,18 @@ impl Kernels {
                 a_sf.is_some() && b_sf.is_some(),
                 InvalidArgument,
                 "fp8 needs scale buffers"
+            );
+        }
+        if dtype == GemmDType::Nvfp4 {
+            ensure!(
+                k % 2 == 0,
+                InvalidArgument,
+                "nvfp4 gemm requires an even k (got {k})"
+            );
+            ensure!(
+                b_sf.is_some(),
+                InvalidArgument,
+                "nvfp4 needs the weight-scale buffer"
             );
         }
         let m_tiles = cap.div_ceil(BM);

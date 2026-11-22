@@ -445,3 +445,124 @@ the pressure valve; the `golden_run --record/--verify` battery gained a
 Known follow-up (tracked): the SWA rings are snapshotted per node
 rather than paged into the pools — a hybrid vLLM-style paged ring would
 remove the per-node ring cost and make the budget purely page-based.
+
+## Device-side sampling (implemented — the P0 batch, Nov 2026)
+
+`di_sample_topp_kernel` (`kernels/sampler.cu`) is the serve engine's
+on-device sampler — vLLM-V1's "sampler on device" shape. One CTA per
+logits row reproduces the `deepinfer-sampler` pipeline in place:
+cap-mask → sanitize → temperature → greedy argmax (ties → lowest id,
+bit-identical to the CPU rule) → top-k → softmax → top-p → min-p →
+renormalize → categorical over a host-pre-drawn uniform. The per-row
+parameters ride a `[B, 6]` f32 block (`SampleParams`); the uniform is
+pre-drawn from the request's own Philox stream host-side, so
+batch-invariance and RNG parity with the CPU path are preserved exactly.
+Threshold selection needs no sort: a monotone f32→u32 key map turns
+"the k-th value" and "the smallest descending prefix with mass ≥ p" into
+fixed-order bit-descents (32 passes each, tie boundaries by id-descent),
+with the `-inf` sentinel contributing zero mass — the CPU fill's exact
+semantics.
+
+Stochastic rows match the CPU sampler up to `expf` rounding (the
+documented tolerance; golden tests assert distributional agreement ≥ 90%
+plus replay bit-determinism, greedy rows exactly).
+
+**Runtime surface**: `serve_decode_sampled` returns `(token, anchor
+hidden)` per row — at DeepSeek vocabulary the per-step D2H drops from
+`[B, vocab]` f32 (~516 KB/seq) to `[B, hidden + 2]` (~28 KB/seq). The
+server's decode flush takes this fast path whenever every row is a
+plain grammar-free decode; grammar rows and spec bonus anchors keep the
+logits path (the vLLM/SGLang fallback split).
+
+## Async step loop (implemented)
+
+`serve_decode_sampled_stage` / `serve_decode_sampled_finish` split the
+sampled decode into launch and consume halves (P0-5): the slim outputs
+return through event-guarded asynchronous D2H copies, and the engine
+thread queues the step's prefill chunks between staging and consuming —
+decode-result processing overlaps prefill GPU time (one step of the
+vLLM-V1 overlap shape, no speculative scheduling: the next plan still
+waits for this step's tokens). The server's `execute()` runs decodes
+first, stages flush-1, prefills, runs the prefills' bonus flush-2, then
+consumes flush-1.
+
+## Serve graphs — prefill, verify and decode buckets (implemented)
+
+`enable_serve_graph(true)` (env `DEEPINFER_SERVE_GRAPH=1` at the
+server) captures the paged serve forward into CUDA/HIP graphs at
+bucketed shapes and replays them as single launches — SGLang's
+"breakable prefill graphs" applied to the paged engine:
+
+* **Prefill chunks** at `{64, 128, 256, 512}` tokens (the
+  `SERVE_CHUNK` ladder) and **DSpark verify chains** at `sq ∈ [2, 8]`.
+* **Decode batches** at bucketed widths (every width ≤ 8, powers of two
+  above, plus `max_seqs`); sub-bucket batches pad with inert cells
+  (`active = 0`) — every pool-writing kernel guards on the flag and pad
+  slots borrow slot 0's page tables, so no pointer is ever stale.
+* Graph safety rests on the existing kernel contract (per-step scalars
+  in device cells) plus a **readback-free MoE prefill**: the
+  aligned-contiguous dispatch launches at the worst-case row bound
+  (`moe_dispatch_bound`), zeroes the persistent staging buffers
+  (`mpf_*` in the serve workspace), and the grouped GEMMs
+  (`di_gemm_grouped_nt_bound_kernel` bf16/f32, the fp8 contiguous
+  kernel at the bound) exit per-segment from the device-resident
+  offsets — the host never sees `m_total` at all.
+* Token/cell uploads stay outside the captured region; rollbacks stay
+  exact (graphs read positions and page tables from device memory every
+  replay).
+
+## Fused DSpark drafting (implemented)
+
+`draft_step_fused` (P0-3, SGLang's `MarkovSampleStep` shape) runs the
+whole MTP module on the GPU — eh_proj GEMV, the shared/depth norms, the
+degenerate single-head block (the length-1 context's 1×1 softmax is
+exactly 1, so the Q/K projections cancel bit-exactly), the SwiGLU MLP,
+and the fused head pick (`di_draft_pick_part/final`: an
+online-rescaled argmax + top-1 confidence over the tied head, no
+`[vocab]` logits ever materialized). Eight bytes come back. The server
+drafts through it whenever no grammar mask or vocabulary cap needs the
+draft logits; `DEEPINFER_SERVER_SPEC_GREEDY=1` forces the one-hot argmax
+verification rule even for stochastic requests
+(`ServeTuning::spec_greedy`), and `verify_greedy_blockwise` segments
+verification for bucketed chain graphs.
+
+## NVFP4 weight-only precision (implemented)
+
+`Precision::Nvfp4` (`--precision nvfp4`) quantizes every GEMM's B side
+to the NVFP4 weight layout — e2m1 nibbles (two per byte, low nibble =
+even k) with one E4M3 scale per 16-element group
+(`deepinfer_fp8::quantize_weight_nvfp4`) — while the A side stays f32:
+weight traffic halves versus FP8 and the numerics are CPU-golden
+(`dequantize_weight_nvfp4`). The portable kernels decode B tiles on the
+fly: dense `di_gemm_nvfp4_nt_kernel`, the bound grouped kernel, and the
+masked grouped kernel (dtype 3) — dense GEMMs, the arena MoE paths and
+the serve MoE paths all route through them.
+
+Follow-up (tracked): the tcgen05 `kind::mxf4nvf4` variant — e2m1
+operands natively with UE4M3 16-element scales in Tensor Memory — needs
+on-hardware validation on a Blackwell device before it replaces the
+scalar core (the AMD MFMA precedent: opt-in env until the first golden
+run).
+
+## Hierarchical KV — host-memory L2 tier (implemented)
+
+The radix tree's evictions now **spill** instead of dropping (P1-6, the
+LMCache/Mooncake shape): `serve_prefix_evict_to_budget` reads each LRU
+leaf's page content (all five pools, every self layer), `k_sf` segment
+and ring snapshots back once and stores them under the block's chained
+hash in the `L2Tier` — a byte-budget-bounded host arena
+(`DEEPINFER_PREFIX_L2_BYTES`, default 25% of the token budget's device
+footprint). A VRAM miss (or short match) walks the hash chain deeper
+into the tier and **pages in** the surviving blocks — fresh pages, H2D
+restores, re-created tree nodes — before falling back to a cold
+prefill. Counters surface as `l2_spills` / `l2_pageins` /
+`l2_blobs` / `l2_bytes` in `PrefixCacheStats`.
+
+## Parallel checkpoint loader (implemented)
+
+`load_weights` decodes per-layer tensors on a scoped worker pool
+(`parallel_map`: `available_parallelism` threads over contiguous
+chunks, zero-dependency `std::thread::scope`, zero unsafe) — the MLA
+projections, indexer tensors and the routed experts that dominate the
+tensor count read in parallel from the page cache (P1-10). Order and
+error semantics are preserved (first failing chunk wins).

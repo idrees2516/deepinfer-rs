@@ -89,6 +89,62 @@ pub trait TokenEngine: Send {
             .map(|&(seq, tok)| self.decode(seq, tok))
             .collect()
     }
+    /// Whether [`TokenEngine::decode_batch_sampled`] is available (the
+    /// GPU paged-serve engine with its device sampler).
+    fn supports_device_sampling(&self) -> bool {
+        false
+    }
+    /// One batched decode with **on-device sampling**: per-row
+    /// `{temperature, top_p, min_p, u, cap, top_k}` (the uniform
+    /// pre-drawn from the request's Philox stream — greedy rows pass any
+    /// value and consume nothing), returning the sampled token plus the
+    /// anchor hidden row without ever reading the `[B, vocab]` logits
+    /// back. Only valid for grammar-free plain decodes (masks live on
+    /// the host); the engine falls back to [`TokenEngine::decode_batch`]
+    /// otherwise.
+    ///
+    /// # Errors
+    /// [`deepinfer_core::Error::InvalidArgument`] when unsupported or on
+    /// shape mismatches; [`deepinfer_core::Error::Numerical`] on a
+    /// degenerate row.
+    fn decode_batch_sampled(
+        &mut self,
+        _batch: &[(u32, u32)],
+        _params: &[deepinfer_kernels::SampleParams],
+    ) -> Result<Vec<deepinfer_runtime::SampledOut>> {
+        Err(Error::invalid(
+            "this engine cannot sample on device (use decode_batch)",
+        ))
+    }
+    /// The staged half of [`TokenEngine::decode_batch_sampled`] (P0-5):
+    /// launch the forward + sampler + event-guarded slim readback and
+    /// return **without waiting**, so the engine thread can queue this
+    /// step's prefill work before consuming the results. Only valid
+    /// under the same conditions as the synchronous variant.
+    ///
+    /// # Errors
+    /// [`deepinfer_core::Error::InvalidArgument`] when unsupported.
+    fn decode_batch_sampled_stage(
+        &mut self,
+        _batch: &[(u32, u32)],
+        _params: &[deepinfer_kernels::SampleParams],
+    ) -> Result<deepinfer_runtime::SampledStep> {
+        Err(Error::invalid(
+            "this engine cannot sample on device (use decode_batch)",
+        ))
+    }
+    /// The consuming half of [`TokenEngine::decode_batch_sampled_stage`].
+    ///
+    /// # Errors
+    /// [`deepinfer_core::Error::Numerical`] on a degenerate row.
+    fn decode_batch_sampled_finish(
+        &mut self,
+        _step: deepinfer_runtime::SampledStep,
+    ) -> Result<Vec<deepinfer_runtime::SampledOut>> {
+        Err(Error::invalid(
+            "this engine cannot sample on device (use decode_batch)",
+        ))
+    }
     /// Releases the sequence slot and its cached rows for reuse.
     fn detach(&mut self, seq: u32) -> Result<()>;
     /// Vocabulary size (for token validation).
@@ -109,6 +165,15 @@ pub trait TokenEngine: Send {
     /// `(last_token, hidden)` (greedy argmax + softmax confidence).
     fn draft_step(&mut self, _last_token: u32, _hidden: &[f32]) -> Result<DraftToken> {
         Err(Error::invalid("this engine cannot draft (no MTP weights)"))
+    }
+    /// One MTP draft step on the **fused path** (P0-3): the GPU engine
+    /// runs the whole draft module on device and reads back only
+    /// `(token, confidence)` — the returned `DraftToken` carries empty
+    /// `logits`. Only valid when the caller needs no draft logits
+    /// (no grammar mask, no vocabulary cap); the default falls back to
+    /// [`TokenEngine::draft_step`] with the full distribution.
+    fn draft_step_fused(&mut self, last_token: u32, hidden: &[f32]) -> Result<DraftToken> {
+        self.draft_step(last_token, hidden)
     }
     /// Speculative verification: runs the whole draft chain through the
     /// target, returning one logit row per position — row `j` is the
@@ -250,6 +315,18 @@ impl TokenEngine for GpuTokenEngine {
             .unwrap_or(want.clamp(1, 4096));
         self.model.serve_configure(max_seqs, max_len, pages)?;
         self.model.serve_prefix_configure(self.prefix_tokens)?;
+        // P0-2 serve graphs (decode batch buckets + prefill/verify chunk
+        // buckets), SGLang's breakable-prefill-graph shape. Opt-in via
+        // the environment; drivers without capture support keep the
+        // eager path (enable_serve_graph errors are swallowed).
+        if std::env::var("DEEPINFER_SERVE_GRAPH")
+            .ok()
+            .as_deref()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            let _ = self.model.enable_serve_graph(true);
+        }
         Ok(())
     }
     fn attach(&mut self, seq: u32) -> Result<()> {
@@ -267,6 +344,29 @@ impl TokenEngine for GpuTokenEngine {
     fn decode_batch(&mut self, batch: &[(u32, u32)]) -> Result<Vec<ForwardOut>> {
         self.model.serve_decode_out(batch)
     }
+    fn supports_device_sampling(&self) -> bool {
+        true
+    }
+    fn decode_batch_sampled(
+        &mut self,
+        batch: &[(u32, u32)],
+        params: &[deepinfer_kernels::SampleParams],
+    ) -> Result<Vec<deepinfer_runtime::SampledOut>> {
+        self.model.serve_decode_sampled(batch, params)
+    }
+    fn decode_batch_sampled_stage(
+        &mut self,
+        batch: &[(u32, u32)],
+        params: &[deepinfer_kernels::SampleParams],
+    ) -> Result<deepinfer_runtime::SampledStep> {
+        self.model.serve_decode_sampled_stage(batch, params)
+    }
+    fn decode_batch_sampled_finish(
+        &mut self,
+        step: deepinfer_runtime::SampledStep,
+    ) -> Result<Vec<deepinfer_runtime::SampledOut>> {
+        self.model.serve_decode_sampled_finish(step)
+    }
     fn detach(&mut self, seq: u32) -> Result<()> {
         self.model.serve_detach(seq)
     }
@@ -281,6 +381,9 @@ impl TokenEngine for GpuTokenEngine {
     }
     fn draft_step(&mut self, last_token: u32, hidden: &[f32]) -> Result<DraftToken> {
         self.model.draft_step(last_token, hidden)
+    }
+    fn draft_step_fused(&mut self, last_token: u32, hidden: &[f32]) -> Result<DraftToken> {
+        self.model.draft_step_fused(last_token, hidden)
     }
     fn verify(&mut self, seq: u32, tokens: &[u32]) -> Result<Vec<Vec<f32>>> {
         self.model.serve_verify(seq, tokens)
@@ -517,6 +620,12 @@ pub struct ServeTuning {
     /// it is smaller than the model's (byte-mode serving on a full
     /// checkpoint); 0 = uncapped.
     pub sample_vocab_cap: usize,
+    /// DSpark greedy-draft mode (SGLang's `SGLANG_DSPARK_USE_GREEDY`):
+    /// verification always applies the argmax one-hot rule — even for
+    /// stochastic requests — so the draft chain's argmax proposals are
+    /// accepted as-is wherever the target agrees. Removes the
+    /// resampling pass from every round.
+    pub spec_greedy: bool,
 }
 
 impl ServeTuning {
@@ -526,6 +635,7 @@ impl ServeTuning {
         spec_adaptive: false,
         prefix_cache_tokens: 0,
         sample_vocab_cap: 0,
+        spec_greedy: false,
     };
 
     /// Speculation at the given depth (adaptive on), everything else
@@ -536,6 +646,7 @@ impl ServeTuning {
             spec_adaptive: depth > 0,
             prefix_cache_tokens: 0,
             sample_vocab_cap: 0,
+            spec_greedy: false,
         }
     }
 }
@@ -578,6 +689,13 @@ pub fn start<E: TokenEngine + 'static>(
     } else {
         0
     };
+    // P0-3 greedy-draft mode: env override on top of the tuning knob.
+    let spec_greedy = tuning.spec_greedy
+        || std::env::var("DEEPINFER_SERVER_SPEC_GREEDY")
+            .ok()
+            .as_deref()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
     let mut engine = engine;
     engine.prepare(sched_cfg.max_running_requests)?;
     let (cmd_tx, cmd_rx) = channel::<Command>();
@@ -603,6 +721,7 @@ pub fn start<E: TokenEngine + 'static>(
                 eos_id,
                 spec_len,
                 spec_adaptive,
+                spec_greedy,
                 vocab_cap,
                 engine_index,
                 engine_metrics,
@@ -643,6 +762,7 @@ fn engine_thread<E: TokenEngine>(
     eos_id: u32,
     spec_len: usize,
     spec_adaptive: bool,
+    spec_greedy: bool,
     vocab_cap: usize,
     index: Arc<Mutex<PrefixIndex>>,
     metrics: SharedMetrics,
@@ -652,6 +772,7 @@ fn engine_thread<E: TokenEngine>(
         ctxs: HashMap::new(),
         spec_len,
         spec_adaptive,
+        spec_greedy,
         vocab_cap,
         index,
         metrics,
@@ -694,6 +815,8 @@ struct EngineState<E: TokenEngine> {
     /// Whether the per-request draft depth adapts to the observed
     /// acceptance rate (see [`ServeTuning::spec_adaptive`]).
     spec_adaptive: bool,
+    /// DSpark greedy-draft mode (see [`ServeTuning::spec_greedy`]).
+    spec_greedy: bool,
     /// Hard cap on sampled token ids (byte-mode serving); 0 = off.
     vocab_cap: usize,
     /// The shared prefix index (insert/restore side).
@@ -820,9 +943,149 @@ impl<E: TokenEngine> EngineState<E> {
         };
         let mut out: Vec<(u64, TokOut)> =
             Vec::with_capacity(decode_reqs.len() + prefill_reqs.len());
+        // Flush-1: the decode requests' plain decodes and spec-round
+        // bonuses. Flush-2: the prefilled requests' bonuses.
         let mut pending: Vec<PendingDecode> = Vec::new();
+        let mut pending2: Vec<PendingDecode> = Vec::new();
 
-        // ---- prefill chunks ------------------------------------------------
+        // ---- decodes first (spec rounds + plain pending) ------------------
+        // Decode requests run before the step's prefills so the batched
+        // decode flush can be *staged* (launched + event-guarded slim
+        // readback) and consumed while the prefill chunks execute on the
+        // GPU — one step of overlap, no speculative scheduling.
+        for &id in decode_reqs {
+            let spec = self.spec_len > 0
+                && self
+                    .ctxs
+                    .get(&id)
+                    .map(|c| c.anchor.is_some())
+                    .unwrap_or(false);
+            if spec {
+                self.spec_round(id, &mut out, &mut pending)?;
+            } else {
+                let tok = self.ctxs.get(&id).map(|c| c.last_tok).unwrap_or(0);
+                pending.push(PendingDecode {
+                    id,
+                    token: tok,
+                    bonus: false,
+                });
+            }
+        }
+
+        // ---- flush-1: the decode requests' batched flush ---------------
+        // Plain grammar-free decodes on a device-sampling engine launch
+        // forward + sampler + slim event-guarded readback and are
+        // consumed AFTER the prefill section (the overlap). Anything
+        // needing logits (grammar rows, spec bonus anchors) takes the
+        // synchronous path here.
+        let mut staged: Option<deepinfer_runtime::SampledStep> = None;
+        if !pending.is_empty() {
+            let batch: Vec<(u32, u32)> = pending
+                .iter()
+                .map(|p| (self.ctxs.get(&p.id).map(|c| c.seq).unwrap_or(0), p.token))
+                .collect();
+            let fast_ok = self.engine.supports_device_sampling()
+                && pending.iter().all(|p| {
+                    !p.bonus
+                        && self
+                            .ctxs
+                            .get(&p.id)
+                            .map(|c| c.grammar.is_none())
+                            .unwrap_or(false)
+                });
+            if fast_ok {
+                // Pre-draw the uniforms from each request's own Philox
+                // stream (greedy rows consume nothing — the CPU
+                // sampler's contract), then stage the sampled flush.
+                let mut params: Vec<deepinfer_kernels::SampleParams> =
+                    Vec::with_capacity(batch.len());
+                for p in &pending {
+                    let ctx = self
+                        .ctxs
+                        .get_mut(&p.id)
+                        .ok_or_else(|| Error::internal("pending decode lost its context"))?;
+                    let sp = ctx.sampler.params();
+                    let greedy = sp.temperature.is_nan() || sp.temperature < 1e-8;
+                    let u = if greedy { 0.0 } else { ctx.rng.next_f32() };
+                    let vocab = self.engine.vocab_size();
+                    let cap = if self.vocab_cap > 0 && self.vocab_cap < vocab {
+                        self.vocab_cap
+                    } else {
+                        0
+                    };
+                    params.push(deepinfer_kernels::SampleParams {
+                        temperature: sp.temperature,
+                        top_p: sp.top_p,
+                        min_p: sp.min_p,
+                        u,
+                        cap,
+                        top_k: sp.top_k,
+                    });
+                }
+                match self.engine.decode_batch_sampled_stage(&batch, &params) {
+                    Ok(step) => staged = Some(step),
+                    Err(e) if is_per_request(&e) => {
+                        // Fall through to the logits path below; only
+                        // the offending rows fail there.
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if staged.is_none() && !pending.is_empty() {
+                let mut results: Vec<Option<ForwardOut>> =
+                    match self.engine.decode_batch(&batch) {
+                        Ok(rs) => rs.into_iter().map(Some).collect(),
+                        Err(e) if is_per_request(&e) => {
+                            let mut rs = Vec::with_capacity(batch.len());
+                            for &(seq, tok) in &batch {
+                                match self.engine.decode(seq, tok) {
+                                    Ok(o) => rs.push(Some(o)),
+                                    Err(e2) if is_per_request(&e2) => rs.push(None),
+                                    Err(e2) => return Err(e2),
+                                }
+                            }
+                            rs
+                        }
+                        Err(e) => return Err(e),
+                    };
+                for (p, res) in pending.iter().zip(results.drain(..)) {
+                    let Some(fo) = res else {
+                        out.push((
+                            p.id,
+                            TokOut::Err("decode failed for this request".to_string()),
+                        ));
+                        continue;
+                    };
+                    if p.bonus {
+                        // Anchor refresh: the bonus token's forward becomes
+                        // the next round's (token, logits, hidden) anchor.
+                        if let Some(ctx) = self.ctxs.get_mut(&p.id) {
+                            ctx.anchor = Some(SpecAnchor {
+                                tok: p.token,
+                                logits: fo.logits,
+                                hidden: fo.hidden,
+                            });
+                            ctx.last_tok = p.token;
+                        }
+                    } else {
+                        let t = self.sample(p.id, &fo.logits);
+                        if let TokOut::Tok(tok) = t {
+                            if let Some(ctx) = self.ctxs.get_mut(&p.id) {
+                                ctx.last_tok = tok;
+                                ctx.generated += 1;
+                            }
+                        }
+                        out.push((p.id, t));
+                    }
+                }
+            }
+        }
+
+        // ---- prefill chunks (queued behind the staged decode readback) -----
+        // The decode flush's slim D2H copies are already ordered on the
+        // stream, so these forwards run after them; the host processes
+        // the decode results (finish_sampled below) while this GPU work
+        // executes — the P0-5 overlap.---------------------------------------------
         for &(id, cs, cl) in prefill_reqs {
             let (seq, prompt, prompt_len, last_prompt_tok, first_chunk) = {
                 let Some(ctx) = self.ctxs.get(&id) else {
@@ -902,7 +1165,7 @@ impl<E: TokenEngine> EngineState<E> {
                 }
                 let Some(fo) = last else { continue };
                 if end >= prompt_len {
-                    self.prompt_complete(id, fo, last_prompt_tok, &mut out, &mut pending)?;
+                    self.prompt_complete(id, fo, last_prompt_tok, &mut out, &mut pending2)?;
                 }
                 continue;
             }
@@ -945,56 +1208,35 @@ impl<E: TokenEngine> EngineState<E> {
                 ctx.prefilled = cs + cl;
             }
             if cs + cl >= prompt_len {
-                self.prompt_complete(id, fo, last_prompt_tok, &mut out, &mut pending)?;
+                self.prompt_complete(id, fo, last_prompt_tok, &mut out, &mut pending2)?;
             }
         }
 
-        // ---- decodes ---------------------------------------------------------
-        for &id in decode_reqs {
-            let spec = self.spec_len > 0
-                && self
-                    .ctxs
-                    .get(&id)
-                    .map(|c| c.anchor.is_some())
-                    .unwrap_or(false);
-            if spec {
-                self.spec_round(id, &mut out, &mut pending)?;
-            } else {
-                let tok = self.ctxs.get(&id).map(|c| c.last_tok).unwrap_or(0);
-                pending.push(PendingDecode {
-                    id,
-                    token: tok,
-                    bonus: false,
-                });
-            }
-        }
-
-        // ---- the step's single batched decode flush --------------------------
-        // Plain decodes and every spec round's bonus token run through
-        // ONE `decode_batch` call (one `serve_decode` launch on the GPU
-        // engine). A batch-level per-request failure falls back to
-        // sequential decodes so only the offending request fails.
-        if !pending.is_empty() {
-            let batch: Vec<(u32, u32)> = pending
+        // ---- flush-2: the prefilled requests' bonus/first decodes -------
+        // These need the full logits path (spec anchors); they run after
+        // the prefill chunks that produced them.
+        if !pending2.is_empty() {
+            let batch: Vec<(u32, u32)> = pending2
                 .iter()
                 .map(|p| (self.ctxs.get(&p.id).map(|c| c.seq).unwrap_or(0), p.token))
                 .collect();
-            let mut results: Vec<Option<ForwardOut>> = match self.engine.decode_batch(&batch) {
-                Ok(rs) => rs.into_iter().map(Some).collect(),
-                Err(e) if is_per_request(&e) => {
-                    let mut rs = Vec::with_capacity(batch.len());
-                    for &(seq, tok) in &batch {
-                        match self.engine.decode(seq, tok) {
-                            Ok(o) => rs.push(Some(o)),
-                            Err(e2) if is_per_request(&e2) => rs.push(None),
-                            Err(e2) => return Err(e2),
+            let mut results: Vec<Option<ForwardOut>> =
+                match self.engine.decode_batch(&batch) {
+                    Ok(rs) => rs.into_iter().map(Some).collect(),
+                    Err(e) if is_per_request(&e) => {
+                        let mut rs = Vec::with_capacity(batch.len());
+                        for &(seq, tok) in &batch {
+                            match self.engine.decode(seq, tok) {
+                                Ok(o) => rs.push(Some(o)),
+                                Err(e2) if is_per_request(&e2) => rs.push(None),
+                                Err(e2) => return Err(e2),
+                            }
                         }
+                        rs
                     }
-                    rs
-                }
-                Err(e) => return Err(e),
-            };
-            for (p, res) in pending.iter().zip(results.drain(..)) {
+                    Err(e) => return Err(e),
+                };
+            for (p, res) in pending2.iter().zip(results.drain(..)) {
                 let Some(fo) = res else {
                     out.push((
                         p.id,
@@ -1023,6 +1265,30 @@ impl<E: TokenEngine> EngineState<E> {
                     }
                     out.push((p.id, t));
                 }
+            }
+        }
+
+        // ---- consume the staged decode flush (P0-5 overlap) --------------
+        if let Some(step) = staged.take() {
+            match self.engine.decode_batch_sampled_finish(step) {
+                Ok(rs) => {
+                    for (p, r) in pending.iter().zip(rs) {
+                        if let Some(ctx) = self.ctxs.get_mut(&p.id) {
+                            ctx.last_tok = r.token;
+                            ctx.generated += 1;
+                        }
+                        out.push((p.id, TokOut::Tok(r.token)));
+                    }
+                }
+                Err(e) if is_per_request(&e) => {
+                    for p in &pending {
+                        out.push((
+                            p.id,
+                            TokOut::Err(format!("sampled decode failed: {e}")),
+                        ));
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(out)
@@ -1110,6 +1376,7 @@ impl<E: TokenEngine> EngineState<E> {
         let metrics = &self.metrics;
         let spec_len = self.spec_len;
         let spec_adaptive = self.spec_adaptive;
+        let spec_greedy = self.spec_greedy;
         let vocab_cap = self.vocab_cap;
         let Some(ctx) = ctxs.get_mut(&id) else {
             return Ok(());
@@ -1158,11 +1425,18 @@ impl<E: TokenEngine> EngineState<E> {
         }
 
         // 2. Draft chain (grammar-masked argmax when a grammar is set).
+        //    The fused device path (P0-3) skips the [vocab] draft logits
+        //    whenever no mask needs them.
+        let use_fused = ctx.grammar.is_none() && cap_mask.is_none();
         let mut drafts: Vec<DraftToken> = Vec::new();
         let mut states: Vec<u32> = vec![ctx.gstate];
         let mut last = anchor.tok;
         while drafts.len() < k && dspark.should_verify(&drafts) == Decision::ContinueDraft {
-            let d = match engine.draft_step(last, &anchor.hidden) {
+            let d = match if use_fused {
+                engine.draft_step_fused(last, &anchor.hidden)
+            } else {
+                engine.draft_step(last, &anchor.hidden)
+            } {
                 Ok(d) => d,
                 Err(e) => {
                     out.push((id, TokOut::Err(format!("draft failed: {e}"))));
@@ -1265,8 +1539,10 @@ impl<E: TokenEngine> EngineState<E> {
             }
         }
 
-        // 5. Verify (greedy argmax rule or stochastic resample).
-        let outcome = if ctx.stochastic {
+        // 5. Verify (greedy argmax rule or stochastic resample). The
+        // greedy-draft mode forces the one-hot argmax rule even for
+        // stochastic requests (SGLang's `SGLANG_DSPARK_USE_GREEDY`).
+        let outcome = if ctx.stochastic && !spec_greedy {
             let temp = ctx.sampler.params().temperature;
             match verify_stochastic(&drafts, &rows, &mut ctx.rng, temp) {
                 Ok(o) => o,
@@ -2127,6 +2403,79 @@ mod tests {
             12,
             "accepted drafts + bonuses must equal the emitted tokens"
         );
+    }
+
+    /// P0-3 greedy-draft mode (`spec_greedy`): a **stochastic** request
+    /// served with speculation under the forced one-hot verification rule
+    /// produces exactly the greedy stream (the argmax rule makes
+    /// verification temperature-independent), and the bookkeeping stays
+    /// consistent.
+    #[test]
+    fn spec_greedy_mode_forces_argmax_verification() {
+        let cfg = ModelConfig::v41_tiny();
+        let eos = 0u32;
+        let prompt = vec![9u32, 9, 9, 9];
+
+        let stochastic = SamplingParams {
+            temperature: 1.4,
+            top_p: 0.95,
+            ..greedy_params(12)
+        };
+
+        // (a) Greedy reference (plain, no speculation).
+        let m = metrics::shared();
+        let model_a = DeepSeekModel::random_init(&cfg, 21).unwrap();
+        let handle = start(
+            CpuTokenEngine::new(model_a),
+            eos,
+            SchedulerConfig::default(),
+            Arc::clone(&m),
+            0,
+        )
+        .unwrap();
+        let (greedy_toks, fin, n) = collect(
+            handle
+                .submit(Submit {
+                    prompt: prompt.clone(),
+                    params: greedy_params(12),
+                })
+                .unwrap(),
+        );
+        handle.shutdown();
+        assert_eq!((fin, n), (Finish::Length, 12));
+
+        // (b) Stochastic + spec + greedy-draft mode: the one-hot rule
+        // makes the emitted stream identical to (a).
+        let model_b = DeepSeekModel::random_init(&cfg, 21).unwrap();
+        let handle = start(
+            CpuTokenEngine::new(model_b),
+            eos,
+            SchedulerConfig::default(),
+            Arc::clone(&m),
+            ServeTuning {
+                spec_draft_len: 3,
+                spec_adaptive: true,
+                prefix_cache_tokens: 0,
+                sample_vocab_cap: 0,
+                spec_greedy: true,
+            },
+        )
+        .unwrap();
+        let (mode_toks, fin2, n2) = collect(
+            handle
+                .submit(Submit {
+                    prompt: prompt.clone(),
+                    params: stochastic.clone(),
+                })
+                .unwrap(),
+        );
+        handle.shutdown();
+        assert_eq!((fin2, n2), (Finish::Length, 12));
+        assert_eq!(
+            mode_toks, greedy_toks,
+            "spec_greedy must force the argmax stream for stochastic requests"
+        );
+        assert!(m.spec_rounds.get() > 0);
     }
 
     /// Grammar-aware speculation: greedy serve-with-spec under a regex

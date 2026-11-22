@@ -126,6 +126,53 @@ fn cross_prefixes(n_self: usize, j: usize) -> Vec<String> {
     ]
 }
 
+/// Maps `f` over `items` on a small scoped worker pool (P1-10: the
+/// parallel checkpoint loader's decode stage — zero-dependency
+/// `std::thread::scope`, `available_parallelism` workers pulling from an
+/// atomic work index). Order-preserving; the first error wins (workers
+/// drain without picking more work). Falls back to the serial map for
+/// single-item or single-core loads.
+fn parallel_map<T, R, F>(items: &[T], f: F) -> Result<Vec<R>>
+where
+    F: Fn(&T) -> Result<R> + Sync,
+    T: Sync,
+    R: Send,
+{
+    let n = items.len();
+    let workers = std::thread::available_parallelism()
+        .map(|w| w.get())
+        .unwrap_or(1)
+        .min(n)
+        .max(1);
+    if workers <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    // Contiguous chunks, one owned output Vec per worker (zero unsafe:
+    // disjoint ownership; the scope joins before anyone concatenates).
+    let chunk = n.div_ceil(workers);
+    let results: Vec<Result<Vec<R>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                let lo = (w * chunk).min(n);
+                let hi = (lo + chunk).min(n);
+                let f = &f;
+                s.spawn(move || items[lo..hi].iter().map(f).collect::<Result<Vec<R>>>())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err(Error::internal("loader worker panicked"))))
+            .collect()
+    });
+    // First failing chunk wins (the serial order's error for any
+    // single-tensor failure).
+    let mut out = Vec::with_capacity(n);
+    for r in results {
+        out.extend(r?);
+    }
+    Ok(out)
+}
+
 /// Loads the full weight set for `cfg` from an opened checkpoint
 /// directory.
 pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<ModelWeights> {
@@ -416,8 +463,7 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
         })
     };
 
-    let mut self_layers = Vec::with_capacity(cfg.n_self_layers);
-    for plan in &self_plans {
+    let build_self = |plan: &SelfPlan| -> Result<SelfLayerWeights> {
         let idx = cfg.dsa.num_heads * cfg.dsa.head_dim;
         let mut conv_weights = Vec::with_capacity(plan.conv.len());
         for (c, n) in plan.conv.iter().enumerate() {
@@ -479,7 +525,7 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
             )?,
             conv_weights,
         };
-        self_layers.push(SelfLayerWeights {
+        Ok(SelfLayerWeights {
             mla,
             indexer,
             moe: load_moe(&plan.layer.moe)?,
@@ -490,12 +536,15 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
                 h,
                 "post-attention norm",
             )?,
-        });
-    }
+        })
+    };
+    // P1-10: layers decode in parallel on the scoped worker pool (the
+    // per-layer reads — MLA projections, the indexer, and the routed
+    // experts that dominate the tensor count — are independent).
+    let self_layers: Vec<SelfLayerWeights> = parallel_map(&self_plans, build_self)?;
 
-    let mut cross_layers = Vec::with_capacity(cfg.n_cross_layers);
-    for plan in &cross_plans {
-        cross_layers.push(CrossLayerWeights {
+    let build_cross = |plan: &CrossPlan| -> Result<CrossLayerWeights> {
+        Ok(CrossLayerWeights {
             q_proj: tensor_f32(
                 cp,
                 plan.q_proj.as_ref().unwrap(),
@@ -516,8 +565,9 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
                 h,
                 "post-attention norm",
             )?,
-        });
-    }
+        })
+    };
+    let cross_layers: Vec<CrossLayerWeights> = parallel_map(&cross_plans, build_cross)?;
 
     let mtp = match &mtp_plan {
         Some(names) => {

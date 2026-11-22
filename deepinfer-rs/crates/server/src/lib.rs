@@ -118,6 +118,7 @@ impl Server {
                 spec_adaptive,
                 prefix_cache_tokens,
                 sample_vocab_cap,
+                spec_greedy: false,
             },
         )?;
         let ctx = Arc::new(ApiCtx::new(

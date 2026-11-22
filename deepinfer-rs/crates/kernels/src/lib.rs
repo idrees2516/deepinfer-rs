@@ -52,6 +52,7 @@ mod elementwise;
 mod gemm;
 mod peer;
 mod peer_ll;
+pub mod sampler;
 mod serve;
 
 pub use attention::DECODE_CHUNK;
@@ -61,6 +62,7 @@ pub use gemm::GemmDType;
 pub use peer::{build_send_plan, PeerMesh, SendPlan};
 pub use peer_ll::{SymmetricEp, SymmetricHeap};
 pub use serve::{ServeCellIn, SERVE_CELL_FIELDS, SERVE_PAGE};
+pub use sampler::SampleParams;
 
 /// Embedded kernel sources (one translation unit per group).
 pub mod source {
@@ -89,6 +91,8 @@ pub mod source {
     pub const PEER_LL: &str = include_str!("../kernels/peer_ll.cu");
     /// The paged-cache multi-sequence serving kernel family.
     pub const SERVE: &str = include_str!("../kernels/serve.cu");
+    /// Device-side sampling (serve top-k/top-p/min-p + fused DSpark pick).
+    pub const SAMPLER: &str = include_str!("../kernels/sampler.cu");
 }
 
 /// Compile a module group for `device` (goes through the JIT disk cache).
@@ -159,6 +163,8 @@ pub struct Kernels {
     m_peer_ll: Module,
     /// Paged multi-sequence serving module.
     m_serve: Module,
+    /// Device-side sampling module.
+    m_samp: Module,
     cache: Mutex<HashMap<&'static str, Function>>,
     /// Tensor maps for the tcgen05 GEMM, keyed by
     /// `(a_ptr, b_ptr, m, n, k)`; bounded, cleared on overflow.
@@ -194,6 +200,7 @@ impl Kernels {
         );
         let cpl = format!("{}\n{}", source::COMMON, source::PEER_LL);
         let csv = format!("{}\n{}", source::COMMON, source::SERVE);
+        let csa = format!("{}\n{}", source::COMMON, source::SAMPLER);
         // The tcgen05 module targets the architecture-specific family
         // (`sm_100a` / `sm_103a`); it is built only on Blackwell-class CUDA
         // devices, and its absence is not an error anywhere else.
@@ -207,6 +214,7 @@ impl Kernels {
             m_dec: build_module(device, "decode", &ck)?,
             m_peer_ll: build_module(device, "peer_ll", &cpl)?,
             m_serve: build_module(device, "serve", &csv)?,
+            m_samp: build_module(device, "sampler", &csa)?,
             m_gemm100,
             device: device.clone(),
             cache: Mutex::new(HashMap::new()),
@@ -253,6 +261,8 @@ impl Kernels {
             }
             n if n.starts_with("di_ep_") => &self.m_peer_ll,
             n if n.starts_with("di_serve_") => &self.m_serve,
+            n if n.starts_with("di_sample_") || n.starts_with("di_draft_pick_") => &self.m_samp,
+            n if n.starts_with("di_gemv") => &self.m_elem,
             n if n.starts_with("di_rmsnorm")
                 || n.starts_with("di_rope")
                 || n.starts_with("di_silu")
@@ -341,6 +351,7 @@ mod tests {
             ("dsa", source::DSA),
             ("moe", source::MOE),
             ("decode", source::DECODE),
+            ("sampler", source::SAMPLER),
         ] {
             assert!(s.len() > 1000, "{name} source suspiciously short");
             assert!(
@@ -363,6 +374,7 @@ mod tests {
             source::MOE,
             source::DECODE_PARAMS,
             source::DECODE,
+            source::SAMPLER,
         ] {
             assert!(!s.contains("size_t"), "size_t leaked into device source");
         }
@@ -437,6 +449,7 @@ mod tests {
             (gemm::KERNEL_NAMES_MFMA, source::GEMM),
             (peer_ll::KERNEL_NAMES, source::PEER_LL),
             (serve::KERNEL_NAMES, source::SERVE),
+            (sampler::KERNEL_NAMES, source::SAMPLER),
         ];
         for (names, src) in rust_sources {
             for k in names {

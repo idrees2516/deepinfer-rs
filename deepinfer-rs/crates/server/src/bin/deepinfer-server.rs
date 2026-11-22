@@ -205,6 +205,10 @@ fn main() {
             println!("loading checkpoint onto the device ...");
             let prec = match value("--precision").as_deref() {
                 Some("f32") => Precision::F32,
+                // P0-4: NVFP4 weight-only quantization (e2m1 nibbles +
+                // per-16 E4M3 scales on every GEMM's B side; the A side
+                // stays f32). Halves the weight memory versus FP8.
+                Some("nvfp4") => Precision::Nvfp4,
                 _ => Precision::Auto,
             };
             let mut model = match DeviceModel::load_checkpoint(&dir, &model_cfg, &dev, prec) {

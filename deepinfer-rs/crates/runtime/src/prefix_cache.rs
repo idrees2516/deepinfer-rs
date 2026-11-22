@@ -49,13 +49,14 @@ use deepinfer_gpu::Buffer;
 /// Tokens per radix block (kept in lockstep with the serve page size).
 const PAGE: usize = deepinfer_kernels::SERVE_PAGE;
 
-/// FNV-1a 64-bit constants (the block hash; fast, dependency-free, and
-/// collision-guarded by exact token comparison on every walk).
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a 64-bit offset basis (the chain seed; the L2 page-in walk
+/// re-derives chains with it).
+pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a 64-bit prime.
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Mixes one 64-token block into the running chained hash.
-fn chain_block(h: u64, block: &[u32]) -> u64 {
+pub(crate) fn chain_block(h: u64, block: &[u32]) -> u64 {
     let mut x = h;
     for &t in block {
         x ^= u64::from(t);
@@ -122,6 +123,16 @@ pub struct PrefixCacheStats {
     pub cached_tokens: usize,
     /// The token budget (0 = disabled).
     pub budget_tokens: usize,
+    /// Host-tier (L2) blocks spilled.
+    pub l2_spills: u64,
+    /// Host-tier blocks paged back in.
+    pub l2_pageins: u64,
+    /// Live host-tier blocks.
+    pub l2_blobs: usize,
+    /// Live host-tier bytes.
+    pub l2_bytes: usize,
+    /// The host-tier byte budget (0 = disabled).
+    pub l2_budget_bytes: usize,
 }
 
 /// The radix tree (host metadata; device payloads ride in the nodes).
@@ -191,6 +202,12 @@ impl GpuPrefixTree {
         self.nodes.iter().filter(|n| n.alive).count() - 1 // minus the root
     }
 
+    /// Whether the live cost exceeds the budget (the spill hook's loop
+    /// condition).
+    pub(crate) fn over_budget(&self) -> bool {
+        self.cached_units > self.budget_units
+    }
+
     /// Whether any node holds a page lease.
     pub(crate) fn holds_pages(&self) -> bool {
         self.nodes.iter().any(|n| n.alive && !n.block.is_empty())
@@ -206,7 +223,51 @@ impl GpuPrefixTree {
             nodes: self.nodes(),
             cached_tokens: self.nodes() * PAGE,
             budget_tokens: self.budget_units * PAGE,
+            l2_spills: 0,
+            l2_pageins: 0,
+            l2_blobs: 0,
+            l2_bytes: 0,
+            l2_budget_bytes: 0,
         }
+    }
+
+    /// The LRU leaf's identity for the spill hook (P1-6): the node's
+    /// arena index, without removing it. `None` when no evictable leaf
+    /// exists. The caller reads back the page content and ring buffers
+    /// through the dedicated accessors, then removes the node with
+    /// [`Self::evict_lru_leaf`].
+    pub(crate) fn lru_leaf_idx(&self) -> Option<usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| *i > 0 && n.alive && n.children.is_empty())
+            .min_by_key(|(_, n)| n.last_used)
+            .map(|(i, _)| i)
+    }
+
+    /// The leaf's block tokens (collision guard for the spill key).
+    pub(crate) fn node_block(&self, idx: usize) -> &[u32] {
+        &self.nodes[idx].block
+    }
+
+    /// The leaf's chained hash (the L2 store key).
+    pub(crate) fn node_hash(&self, idx: usize) -> u64 {
+        self.nodes[idx].hash
+    }
+
+    /// The leaf's `k_sf` segment bytes.
+    pub(crate) fn node_ksf(&self, idx: usize) -> &[u8] {
+        &self.nodes[idx].k_sf
+    }
+
+    /// The leaf's physical page id.
+    pub(crate) fn node_page(&self, idx: usize) -> u32 {
+        self.nodes[idx].page
+    }
+
+    /// The leaf's ring-snapshot buffers (the device source of a spill).
+    pub(crate) fn node_rings(&self, idx: usize) -> Option<&[Buffer]> {
+        self.nodes[idx].rings.as_deref()
     }
 
     /// Advance the LRU clock one step.
@@ -503,6 +564,160 @@ impl GpuPrefixTree {
             self.nodes[parent].children.remove(&hash);
         }
         Some(page)
+    }
+}
+
+/// One spilled block in the host-memory tier: the page content of all
+/// five pools for every self layer, the `k_sf` segment, the block's
+/// tokens (the collision guard) and — for match endpoints — the SWA-ring
+/// snapshots. Owned by [`L2Tier`]; keyed by the block's chained hash.
+#[derive(Clone)]
+pub(crate) struct L2Blob {
+    /// The block's tokens (exact-match guard against hash collisions).
+    pub(crate) block: Vec<u32>,
+    /// Scale bytes completing inside this block (see [`ksf_seg_range`]).
+    pub(crate) k_sf: Vec<u8>,
+    /// Pool content, layer-major: `[layer][kind]` with `kind` in
+    /// `{kv, k_raw, k_norm, k_u8, feat}` order (the spill code's layout).
+    pub(crate) pools: Vec<Vec<u8>>,
+    /// Ring snapshot bytes per cross layer (`None` = walk-through node;
+    /// empty vec per layer is a valid zero-cross-layer endpoint).
+    pub(crate) rings: Option<Vec<Vec<u8>>>,
+    /// LRU stamp.
+    pub(crate) last_used: u64,
+}
+
+/// The host-memory (L2) tier of the hierarchical prefix cache (P1-6,
+/// the LMCache/Mooncake shape): VRAM evictions **spill** their page
+/// bytes here instead of dropping them, and a VRAM miss **pages in**
+/// the deepest surviving chain before falling back to a cold prefill.
+/// Byte-budget bounded with LRU eviction; page-granular blobs keyed by
+/// the radix hash chain (the same key shape NIXL/Mooncake transfers
+/// would carry).
+pub(crate) struct L2Tier {
+    map: HashMap<u64, L2Blob>,
+    bytes: usize,
+    budget: usize,
+    tick: u64,
+    spills: u64,
+    pageins: u64,
+}
+
+impl L2Tier {
+    /// A disabled tier (zero byte budget).
+    pub(crate) fn new(budget: usize) -> L2Tier {
+        L2Tier {
+            map: HashMap::new(),
+            bytes: 0,
+            budget,
+            tick: 0,
+            spills: 0,
+            pageins: 0,
+        }
+    }
+
+    /// Whether the tier accepts spills.
+    pub(crate) fn enabled(&self) -> bool {
+        self.budget > 0
+    }
+
+    /// Retarget the byte budget (existing entries stay; eviction trims).
+    pub(crate) fn set_budget(&mut self, budget: usize) {
+        self.budget = budget;
+    }
+
+    /// Store one blob under `hash`, evicting LRU blobs to fit. A blob
+    /// replacing its own key first frees the old bytes.
+    pub(crate) fn store(&mut self, hash: u64, blob: L2Blob) {
+        let add = blob.pools.iter().map(|p| p.len()).sum::<usize>()
+            + blob.k_sf.len()
+            + blob.block.len() * 4
+            + blob
+                .rings
+                .as_ref()
+                .map(|r| r.iter().map(|v| v.len()).sum::<usize>())
+                .unwrap_or(0);
+        if let Some(old) = self.map.remove(&hash) {
+            self.bytes = self.bytes
+                .saturating_sub(
+                    old.pools.iter().map(|p| p.len()).sum::<usize>()
+                        + old.k_sf.len()
+                        + old.block.len() * 4
+                        + old
+                            .rings
+                            .as_ref()
+                            .map(|r| r.iter().map(|v| v.len()).sum::<usize>())
+                            .unwrap_or(0),
+                );
+        }
+        if add > self.budget {
+            return; // a blob larger than the whole tier: never store
+        }
+        self.tick += 1;
+        let stamp = self.tick;
+        while self.bytes + add > self.budget {
+            match self
+                .map
+                .iter()
+                .min_by_key(|(_, b)| b.last_used)
+                .map(|(h, _)| *h)
+            {
+                Some(h) => {
+                    if let Some(old) = self.map.remove(&h) {
+                        self.bytes = self.bytes.saturating_sub(
+                            old.pools.iter().map(|p| p.len()).sum::<usize>()
+                                + old.k_sf.len()
+                                + old.block.len() * 4
+                                + old
+                                    .rings
+                                    .as_ref()
+                                    .map(|r| r.iter().map(|v| v.len()).sum::<usize>())
+                                    .unwrap_or(0),
+                        );
+                    }
+                }
+                None => break,
+            }
+        }
+        self.bytes += add;
+        let mut blob = blob;
+        blob.last_used = stamp;
+        self.map.insert(hash, blob);
+        self.spills += 1;
+    }
+
+    /// Look up a blob (LRU-touched) and count the page-in.
+    pub(crate) fn get(&mut self, hash: u64) -> Option<&L2Blob> {
+        let hit = self.map.get_mut(&hash)?;
+        self.tick += 1;
+        hit.last_used = self.tick;
+        self.pageins += 1;
+        Some(hit)
+    }
+
+    /// Live blob count.
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the tier holds nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Live byte usage.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The byte budget (0 = disabled).
+    pub(crate) fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// Counters for the stats surface.
+    pub(crate) fn counters(&self) -> (u64, u64) {
+        (self.spills, self.pageins)
     }
 }
 

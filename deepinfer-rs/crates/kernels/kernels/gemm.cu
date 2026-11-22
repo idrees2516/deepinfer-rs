@@ -485,6 +485,63 @@ di_gemm_f32_nt_kernel(const float* __restrict__ a,
 }
 
 // ---------------------------------------------------------------------------
+// NVFP4 weight-only NT GEMM (P0-4): D = C + A @ B^T with the A side in
+// f32 and the B side in the NVFP4 weight layout — e2m1 nibbles (two per
+// byte, low nibble = even k) with one E4M3 scale per 16-element group
+// (deepinfer_fp8::quantize_weight_nvfp4). The scalar reference core
+// decodes B tiles to f32 during staging; the weight traffic halves
+// versus FP8 and the numerics are CPU-golden-testable against
+// dequantize_weight_nvfp4.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(GEMM_THREADS)
+di_gemm_nvfp4_nt_kernel(const float* __restrict__ a,
+                        const u8* __restrict__ b_q,
+                        const u8* __restrict__ b_sf,
+                        const float* __restrict__ c,
+                        float* __restrict__ d,
+                        int M, int N, int K) {
+    __shared__ u8 smem[GEMM_F32_SMEM];
+    float* as = (float*)smem;
+    float* bs = (float*)(smem + GEMM_BM * GEMM_BK * 4);
+    int m0 = (int)blockIdx.y * GEMM_BM;
+    int n0 = (int)blockIdx.x * GEMM_BN;
+    const u64 q_stride = (u64)(K >> 1);
+    const u64 sf_stride = (u64)((K + 15) >> 4);
+    float acc[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
+        // A tile [BM, BK] f32 (same layout as gemm_stage_tile_f32).
+        for (int idx = (int)threadIdx.x; idx < GEMM_BM * GEMM_BK; idx += GEMM_THREADS) {
+            int r = idx / GEMM_BK;
+            int cc = idx - r * GEMM_BK;
+            int gm = m0 + r;
+            int gk = k0 + cc;
+            as[idx] = (gm < M && gk < K) ? a[(u64)gm * K + gk] : 0.0f;
+        }
+        // B tile [BN, BK] decoded from nibbles + e4m3 scales.
+        for (int idx = (int)threadIdx.x; idx < GEMM_BN * GEMM_BK; idx += GEMM_THREADS) {
+            int r = idx / GEMM_BK;
+            int cc = idx - r * GEMM_BK;
+            int gn = n0 + r;
+            int gk = k0 + cc;
+            float v = 0.0f;
+            if (gn < N && gk < K) {
+                u8 byte = b_q[(u64)gn * q_stride + (gk >> 1)];
+                u8 nib = (gk & 1) ? (u8)(byte >> 4) : (u8)(byte & 0x0Fu);
+                v = di_e2m1_to_f32(nib)
+                  * di_e4m3_to_f32(b_sf[(u64)gn * sf_stride + (gk >> 4)]);
+            }
+            bs[idx] = v;
+        }
+        __syncthreads();
+        gemm_core_f32(as, bs, acc);
+        __syncthreads();
+    }
+    gemm_store_f32(acc, c, d, m0, n0, M, N);
+}
+
+// ---------------------------------------------------------------------------
 // MASKED grouped NT GEMM — the CUDA-graph / low-latency-EP MoE path
 // (DeepGEMM `m_grouped_gemm_nt_masked` semantics).
 //
@@ -554,6 +611,38 @@ di_gemm_grouped_masked_nt_kernel(const void* __restrict__ a,
 #else
             gemm_rescale_nv(acc, blk, a_sf, bsf_g, m0, n0, kb, kb_blocks);
 #endif
+        }
+    } else if (dtype == 3) {
+        // NVFP4 weights: nibbles + per-16 e4m3 scales; A stays f32.
+        float* as = (float*)smem;
+        float* bs = (float*)(smem + GEMM_BM * GEMM_BK * 4);
+        const u8* bgq = (const u8*)b + (u64)g * N * (u64)(K >> 1);
+        const u8* bsf_g = b_sf + (u64)g * N * (u64)((K + 15) >> 4);
+        for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
+            for (int idx = (int)threadIdx.x; idx < GEMM_BM * GEMM_BK; idx += GEMM_THREADS) {
+                int r = idx / GEMM_BK;
+                int cc = idx - r * GEMM_BK;
+                int gm = m0 + r;
+                int gk = k0 + cc;
+                as[idx] = (gm < M_eff && gk < K) ? ((const float*)a)[(u64)gm * K + gk] : 0.0f;
+            }
+            for (int idx = (int)threadIdx.x; idx < GEMM_BN * GEMM_BK; idx += GEMM_THREADS) {
+                int r = idx / GEMM_BK;
+                int cc = idx - r * GEMM_BK;
+                int gn = n0 + r;
+                int gk = k0 + cc;
+                float v = 0.0f;
+                if (gn < N && gk < K) {
+                    u8 byte = bgq[(u64)gn * (u64)(K >> 1) + (gk >> 1)];
+                    u8 nib = (gk & 1) ? (u8)(byte >> 4) : (u8)(byte & 0x0Fu);
+                    v = di_e2m1_to_f32(nib)
+                      * di_e4m3_to_f32(bsf_g[(u64)gn * (u64)((K + 15) >> 4) + (gk >> 4)]);
+                }
+                bs[idx] = v;
+            }
+            __syncthreads();
+            gemm_core_f32(as, bs, acc);
+            __syncthreads();
         }
     } else {
         // f32 / bf16: scalar reference core (decode m is small; exactness
@@ -641,6 +730,87 @@ di_gemm_fp8_grouped_nt_kernel(const void* __restrict__ a,
 #endif
 }
 
+
+// ---------------------------------------------------------------------------
+// Grouped-contiguous BF16/F32 GEMM, bound-launched (graph-safe prefill MoE).
+// Same segment contract as the FP8 contiguous kernel, but the grid covers
+// the caller's row BOUND (a capture-time constant): every CTA binary-
+// searches its segment from the device-resident `m_offsets` and exits when
+// its tile starts at or past the segment end, so replays never depend on
+// the actual per-expert counts. dtype: 0 = f32, 1 = bf16 (scalar core —
+// the masked kernel's reference path).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(GEMM_THREADS)
+di_gemm_grouped_nt_bound_kernel(const void* __restrict__ a,
+                                const void* __restrict__ b,
+                                const u8* __restrict__ b_sf,
+                                const int* __restrict__ m_offsets,
+                                float* __restrict__ d,
+                                int M_bound, int N, int K, int G, int dtype) {
+    __shared__ u8 smem[GEMM_F32_SMEM];
+    int m0 = (int)blockIdx.y * GEMM_BM;
+    int n0 = (int)blockIdx.x * GEMM_BN;
+    if (m0 >= M_bound) return;
+    // Binary search the segment containing row m0 (offsets ascending, G+1).
+    int lo = 0, hi = G - 1, g = 0;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        if (m_offsets[mid] <= m0) {
+            g = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    int seg_end = m_offsets[g + 1];
+    if (m0 >= seg_end) return; // padding / unwritten tail rows
+    int M_eff = seg_end;
+    float* as = (float*)smem;
+    float* bs = (float*)(smem + GEMM_BM * GEMM_BK * 4);
+    float acc[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+    if (dtype == 3) {
+        // NVFP4 weights: nibbles + per-16 e4m3 scales, group stride
+        // ceil(K/2) / ceil(K/16); A stays f32.
+        const u8* bg = (const u8*)b + (u64)g * N * (u64)(K >> 1);
+        const u8* bsf_g = b_sf + (u64)g * N * (u64)((K + 15) >> 4);
+        for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
+            for (int idx = (int)threadIdx.x; idx < GEMM_BM * GEMM_BK; idx += GEMM_THREADS) {
+                int r = idx / GEMM_BK;
+                int cc = idx - r * GEMM_BK;
+                int gm = m0 + r;
+                int gk = k0 + cc;
+                as[idx] = (gm < M_eff && gk < K) ? ((const float*)a)[(u64)gm * K + gk] : 0.0f;
+            }
+            for (int idx = (int)threadIdx.x; idx < GEMM_BN * GEMM_BK; idx += GEMM_THREADS) {
+                int r = idx / GEMM_BK;
+                int cc = idx - r * GEMM_BK;
+                int gn = n0 + r;
+                int gk = k0 + cc;
+                float v = 0.0f;
+                if (gn < N && gk < K) {
+                    u8 byte = bg[(u64)gn * (u64)(K >> 1) + (gk >> 1)];
+                    u8 nib = (gk & 1) ? (u8)(byte >> 4) : (u8)(byte & 0x0Fu);
+                    v = di_e2m1_to_f32(nib)
+                      * di_e4m3_to_f32(bsf_g[(u64)gn * (u64)((K + 15) >> 4) + (gk >> 4)]);
+                }
+                bs[idx] = v;
+            }
+            __syncthreads();
+            gemm_core_f32(as, bs, acc);
+            __syncthreads();
+        }
+    } else {
+        const u8* bg = (const u8*)b + (u64)g * N * K * (dtype == 1 ? 2 : 4);
+        for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
+            gemm_stage_tile_f32(a, bg, dtype, m0, n0, k0, M_eff, N, K, K, as, bs);
+            gemm_core_f32(as, bs, acc);
+            __syncthreads();
+        }
+    }
+    gemm_store_f32(acc, NULL, d, m0, n0, M_eff, N);
+}
 
 // ---------------------------------------------------------------------------
 // AMD MFMA FP8 NT GEMM (CDNA3+ / gfx940-950), the MI335X counterpart of

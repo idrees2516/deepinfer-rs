@@ -9,6 +9,7 @@ use crate::Kernels;
 /// source-name sanity test).
 #[cfg(test)]
 pub(crate) const KERNEL_NAMES: &[&str] = &[
+    "di_gemv_nt_kernel",
     "di_rmsnorm_kernel",
     "di_rope_kernel",
     "di_silu_mul_kernel",
@@ -146,6 +147,47 @@ impl Kernels {
             256,
             0,
             KernelArgs::new().ptr(g).ptr(u).ptr(out).i32(n as i32),
+            stream,
+        )
+    }
+
+    /// GEMV `y[r] = sum_c w[r * cols + c] * x[c]` — one warp per output
+    /// row, deterministic tree reduction. The DSpark draft projections.
+    pub fn gemv_nt(
+        &self,
+        w: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure!(
+            rows > 0 && cols > 0,
+            InvalidArgument,
+            "gemv needs rows/cols > 0"
+        );
+        // One warp per output row: the grid covers rows / warps-per-CTA
+        // (8 on NVIDIA's 32-lane warps, 4 on AMD's 64-lane wavefronts).
+        let warp = match self.device().backend() {
+            deepinfer_gpu::Backend::Hip => 64usize,
+            _ => 32usize,
+        };
+        let warps_per_cta = 256 / warp;
+        let f = self.f("di_gemv_nt_kernel")?;
+        f.launch(
+            self.device(),
+            deepinfer_gpu::Launch {
+                grid: (rows.div_ceil(warps_per_cta).max(1) as u32, 1, 1),
+                block: (256, 1, 1),
+                shared: 0,
+            },
+            &KernelArgs::new()
+                .ptr(w)
+                .ptr(x)
+                .ptr(y)
+                .i32(rows as i32)
+                .i32(cols as i32),
             stream,
         )
     }

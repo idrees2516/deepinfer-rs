@@ -243,6 +243,99 @@ pub fn backtrack_steps(drafts: &[DraftToken], outcome: &VerificationOutcome) -> 
     drafts.len().saturating_sub(outcome.accepted)
 }
 
+/// **Block-wise greedy verification** (SGLang v0.5.23's DSpark block
+/// verify, P0-3): the chain is verified in `block`-sized segments — the
+/// shape that pairs with bucketed verify graphs (chain length == bucket
+/// → one graph replay per block). Acceptance follows the same global
+/// prefix rule as [`verify_greedy`] (a block is only reachable when every
+/// earlier block fully accepted), so the outcome is identical for any
+/// `block >= 1`; the segmentation matters to the *caller*, which can
+/// stop producing target rows after the first rejecting block instead of
+/// materialising the whole chain's rows up front.
+///
+/// `target_logits` holds the rows produced so far, in chain order
+/// (the anchor row first). Rows beyond the first rejecting block are
+/// neither required nor consulted; `drafts.len() + 1` rows must still be
+/// *accepted* by the shape validation only when every block accepts.
+///
+/// # Errors
+/// Same shape rules as [`verify_greedy`], relaxed to the reachable
+/// prefix: at least `min(drafts.len() + 1, accepted_prefix_rows)` rows.
+pub fn verify_greedy_blockwise(
+    drafts: &[DraftToken],
+    target_logits: &[Vec<f32>],
+    block: usize,
+) -> Result<VerificationOutcome> {
+    ensure!(
+        block >= 1,
+        InvalidArgument,
+        "verify_greedy_blockwise: block must be >= 1 (got {block})"
+    );
+    ensure!(
+        !target_logits.is_empty(),
+        DimensionMismatch,
+        "verify_greedy_blockwise: at least the anchor row is required"
+    );
+    let vocab = target_logits[0].len();
+    ensure!(
+        vocab >= 1,
+        InvalidArgument,
+        "verify_greedy_blockwise: target logit rows must be non-empty"
+    );
+    for (i, row) in target_logits.iter().enumerate() {
+        ensure!(
+            row.len() == vocab,
+            DimensionMismatch,
+            "verify_greedy_blockwise: target logit row {i} has length {} != {vocab}",
+            row.len()
+        );
+        ensure!(
+            row.iter().any(|v| v.is_finite()),
+            Numerical,
+            "verify_greedy_blockwise: target logit row {i} has no finite entry"
+        );
+    }
+    // Walk block by block; stop at the first block that rejects (or the
+    // row supply runs dry). Row `i` is the target distribution over
+    // `drafts[i]` (the anchor row first), so the consumed-row index
+    // always equals the accepted-draft count.
+    let mut accepted = 0usize;
+    let mut consumed = 0usize;
+    'outer: while accepted < drafts.len() {
+        let hi = (accepted + block).min(drafts.len());
+        while accepted < hi {
+            if consumed >= target_logits.len() {
+                break 'outer;
+            }
+            match greedy_pick(&target_logits[consumed]) {
+                Some(t) if t == drafts[accepted].token => {
+                    accepted += 1;
+                    consumed += 1;
+                }
+                _ => break 'outer,
+            }
+        }
+    }
+    // The continuation row is the first unconsumed row — for a fully
+    // accepting walk that is exactly `target_logits[accepted]`, the
+    // plain verify_greedy rule.
+    let next_row = target_logits.get(consumed).ok_or_else(|| {
+        Error::DimensionMismatch(format!(
+            "verify_greedy_blockwise: continuation row {consumed} missing \
+             (supplied {} rows for a chain of {} drafts)",
+            target_logits.len(),
+            drafts.len()
+        ))
+    })?;
+    let next_token = greedy_pick(next_row)
+        .ok_or_else(|| Error::internal("verify_greedy_blockwise: argmax over a valid row"))?;
+    Ok(VerificationOutcome {
+        accepted,
+        next_token,
+        target_logits: target_logits.to_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,7 +419,6 @@ mod tests {
         assert_eq!(out.next_token, 9);
         assert_eq!(out.target_logits.len(), 4);
         assert_eq!(backtrack_steps(&drafts, &out), 0);
-
         // First mismatch: accept nothing, correct immediately.
         let rows = vec![spiked(5, 10), spiked(2, 10), spiked(3, 10), spiked(9, 10)];
         let out = verify_greedy(&drafts, &rows).unwrap();
@@ -363,6 +455,72 @@ mod tests {
             verify_greedy(&[], &[]).is_err(),
             "zero rows for zero drafts"
         );
+    }
+
+    #[test]
+    fn blockwise_matches_plain_for_every_block_size() {
+        // The block segmentation never changes the outcome — only how
+        // many rows the caller must produce before the walk can stop.
+        prop("mtp-blockwise-equivalence", 0xB10C, 150, |i, rng| {
+            let vocab = 3 + (i as usize % 6);
+            let ndraft = 1 + (rng.next_u32() as usize % 7);
+            let drafts: Vec<DraftToken> = (0..ndraft)
+                .map(|_| DraftToken {
+                    token: rng.next_u32() % vocab as u32,
+                    confidence: rng.next_f32(),
+                    logits: vec![0.0; vocab],
+                })
+                .collect();
+            let rows: Vec<Vec<f32>> = (0..ndraft + 1)
+                .map(|_| (0..vocab).map(|_| rng.normal_f32()).collect())
+                .collect();
+            let plain = verify_greedy(&drafts, &rows)?;
+            for block in 1..=ndraft + 2 {
+                let bw = verify_greedy_blockwise(&drafts, &rows, block)?;
+                ensure!(
+                    bw.accepted == plain.accepted && bw.next_token == plain.next_token,
+                    Internal,
+                    "block {block} diverged from the plain prefix rule"
+                );
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn blockwise_stops_early_without_later_rows() {
+        let drafts = [dt(1, 0.9), dt(2, 0.8), dt(3, 0.7), dt(4, 0.6), dt(5, 0.5)];
+        // Target rejects at position 1: rows beyond the rejecting block
+        // are unnecessary — supply exactly rows 0..=2 (anchor + two).
+        let rows = vec![spiked(1, 8), spiked(6, 8), spiked(0, 8)];
+        let out = verify_greedy_blockwise(&drafts, &rows, 2).unwrap();
+        assert_eq!(out.accepted, 1);
+        assert_eq!(out.next_token, 6);
+        // The plain rule over the same truncated supply agrees (the
+        // missing rows are past the rejection).
+        let plain = verify_greedy(&drafts[..1], &rows[..2]).unwrap();
+        assert_eq!((plain.accepted, plain.next_token), (1, 6));
+
+        // A fully accepting walk needs the continuation row.
+        let full = vec![
+            spiked(1, 8),
+            spiked(2, 8),
+            spiked(3, 8),
+            spiked(4, 8),
+            spiked(5, 8),
+            spiked(7, 8),
+        ];
+        let out = verify_greedy_blockwise(&drafts, &full, 2).unwrap();
+        assert_eq!(out.accepted, 5);
+        assert_eq!(out.next_token, 7);
+        // ... and errors cleanly when it is missing.
+        assert!(verify_greedy_blockwise(&drafts, &full[..5], 2).is_err());
+        // Degenerate block sizes.
+        assert!(verify_greedy_blockwise(&drafts, &full, 0).is_err());
+        assert!(verify_greedy_blockwise(&drafts, &[], 2).is_err());
+        // Single-token blocks walk the whole chain.
+        let out = verify_greedy_blockwise(&drafts, &full, 1).unwrap();
+        assert_eq!((out.accepted, out.next_token), (5, 7));
     }
 
     #[test]
