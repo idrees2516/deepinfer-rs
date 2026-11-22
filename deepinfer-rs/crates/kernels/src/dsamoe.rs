@@ -124,7 +124,10 @@ impl Kernels {
             nblocks,
             256,
             0,
-            KernelArgs::new().ptr(amax_bits).ptr(sf_u8).i32(nblocks as i32),
+            KernelArgs::new()
+                .ptr(amax_bits)
+                .ptr(sf_u8)
+                .i32(nblocks as i32),
             stream,
         )?;
         // 4) quantize the complete blocks
@@ -435,7 +438,11 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         ensure!(s_q > 0, InvalidArgument, "select needs s_q > 0");
-        ensure!(block <= 1024, InvalidArgument, "preselect block must be <= 1024");
+        ensure!(
+            block <= 1024,
+            InvalidArgument,
+            "preselect block must be <= 1024"
+        );
         let num_blocks = ceil_div(s_kv, block);
         ensure!(
             cands_cap >= num_blocks * per,
@@ -544,8 +551,16 @@ impl Kernels {
         k: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(tokens > 0 && e > 0 && k > 0, InvalidArgument, "route needs positive dims");
-        ensure!(e <= 1024, InvalidArgument, "route supports up to 1024 experts");
+        ensure!(
+            tokens > 0 && e > 0 && k > 0,
+            InvalidArgument,
+            "route needs positive dims"
+        );
+        ensure!(
+            e <= 1024,
+            InvalidArgument,
+            "route supports up to 1024 experts"
+        );
         ensure!(k <= e, InvalidArgument, "k must be <= E");
         let pow2 = e.next_power_of_two();
         let shared = pow2 * 8 + e * 4;
@@ -594,7 +609,11 @@ impl Kernels {
         align: usize,
         stream: &Stream,
     ) -> Result<usize> {
-        ensure!(align % 128 == 0 || align == 1, InvalidArgument, "align must be a multiple of 128");
+        ensure!(
+            align % 128 == 0 || align == 1,
+            InvalidArgument,
+            "align must be a multiple of 128"
+        );
         self.fill_zero(counts, e * 4, stream)?;
         self.fill_zero(rank_counters, e * 4, stream)?;
         self.launch1d(
@@ -734,7 +753,11 @@ impl Kernels {
         cap: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(tokens > 0 && hidden > 0 && k > 0 && e > 0 && cap > 0, InvalidArgument, "masked dispatch needs positive dims");
+        ensure!(
+            tokens > 0 && hidden > 0 && k > 0 && e > 0 && cap > 0,
+            InvalidArgument,
+            "masked dispatch needs positive dims"
+        );
         self.fill_zero(counters, e * 4, stream)?;
         self.fill_zero(drops, 4, stream)?;
         let f = self.f("di_moe_scatter_masked_kernel")?;
@@ -774,11 +797,17 @@ impl Kernels {
         row_elems: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(cap > 0 && groups > 0 && row_elems > 0, InvalidArgument, "masked silu needs positive dims");
+        ensure!(
+            cap > 0 && groups > 0 && row_elems > 0,
+            InvalidArgument,
+            "masked silu needs positive dims"
+        );
         let total = groups
             .checked_mul(cap)
             .and_then(|v| v.checked_mul(row_elems))
-            .ok_or_else(|| deepinfer_core::Error::CapacityExceeded("silu total overflows".into()))?;
+            .ok_or_else(|| {
+                deepinfer_core::Error::CapacityExceeded("silu total overflows".into())
+            })?;
         self.launch1d(
             "di_silu_mul_masked_kernel",
             total,
@@ -806,7 +835,11 @@ impl Kernels {
         row_elems: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(rows > 0 && row_elems > 0, InvalidArgument, "silu needs rows/row_elems > 0");
+        ensure!(
+            rows > 0 && row_elems > 0,
+            InvalidArgument,
+            "silu needs rows/row_elems > 0"
+        );
         self.launch1d(
             "di_silu_mul_fused_kernel",
             rows * row_elems,

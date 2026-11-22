@@ -90,8 +90,7 @@ pub fn f32_to_f16_rne(x: f32) -> u16 {
     let half = 0x1000u32; // 2^12: halfway of the 13 dropped mantissa bits
     let m13 = mant >> 13;
     let rem = mant & 0x1FFF;
-    let mut m16 = m13
-        + u32::from(rem > half || (rem == half && (m13 & 1) == 1));
+    let mut m16 = m13 + u32::from(rem > half || (rem == half && (m13 & 1) == 1));
     if m16 == 0x400 {
         m16 = 0;
         e16 += 1;
@@ -392,7 +391,7 @@ mod tests {
         assert_eq!(f32_to_f16_rne(65520.0), 0x7C00); // overflow -> inf
         assert_eq!(f32_to_f16_rne(65519.0), 0x7BFF);
         assert_eq!(f32_to_f16_rne(5.960_464_5e-8), 0x0001); // min subnormal
-        assert_eq!(f32_to_f16_rne(2.9802322e-08), 0x0000); // below half of min subnormal
+        assert_eq!(f32_to_f16_rne(2.98e-8), 0x0000); // below half of min subnormal
         assert_eq!(f16_to_f32(0x0001), 5.960_464_5e-8);
         assert!(f16_to_f32(f32_to_f16_rne(f32::NAN)).is_nan());
     }

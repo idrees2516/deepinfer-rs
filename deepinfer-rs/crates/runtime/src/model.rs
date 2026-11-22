@@ -27,24 +27,26 @@
 //! * MoE runs **locally** (`deepinfer_moe::moe_forward`, no expert
 //!   parallelism) — the single-process CPU path; the `deepinfer-ep`
 //!   crate provides dispatch/combine for distributed deployments.
-//! * MTP rollback rebuilds the per-layer paged caches from the exact f32
-//!   shadow rows (the public `MlaPagedCache` has no removal API), so a
-//!   rejected draft leaves the model bit-identical to the state the
-//!   plain autoregressive path would have reached.
+//! * MTP rollback truncates the per-layer paged caches in place
+//!   ([`MlaPagedCache::truncate`], with page recycling), so a rejected
+//!   draft leaves the model bit-identical to the state the plain
+//!   autoregressive path would have reached — the foundation both the
+//!   offline DSpark loop and the batched serving spec path rely on.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use deepinfer_core::math::dot;
 use deepinfer_core::norm::rmsnorm;
+use deepinfer_core::rope::Rope;
 use deepinfer_core::tokenizer::Tokenizer;
 use deepinfer_core::{ensure, Error, Result};
 use deepinfer_dsa::mscale;
 use deepinfer_mla::{flash_mla_decode, flash_mla_sparse_prefill, o_rope_conjugate, MlaPagedCache};
-use deepinfer_core::math::dot;
-use deepinfer_core::rope::Rope;
 use deepinfer_swa::{swa_attention, SwaRingCache};
 
 use crate::config::{ModelConfig, PAGE_SIZE};
+use crate::generate::draft_token;
 use crate::loader;
 use crate::weights::{
     matvec, matvec_into, zeros, CrossLayerWeights, ModelWeights, SelfLayerWeights,
@@ -54,6 +56,35 @@ use crate::weights::{
 /// chunk bound; longer prompts must be chunked by the caller — the
 /// scheduler crate implements chunked prefill for service deployments).
 pub const MAX_PREFILL_TOKENS: usize = 8192;
+
+/// One forward result for the speculative-decoding surface: the
+/// next-token logits at a position together with the residual (pre-norm)
+/// hidden state of that position — the two signals a DSpark draft step
+/// consumes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForwardOut {
+    /// Next-token logits `[vocab]` at the forwarded position.
+    pub logits: Vec<f32>,
+    /// Residual hidden state `[hidden]` at the forwarded position (the
+    /// MTP draft module's input).
+    pub hidden: Vec<f32>,
+}
+
+/// A reusable snapshot of one sequence's first `len` tokens — the
+/// prefix-cache materialization (see [`DeepSeekModel::snapshot_prefix`]
+/// / [`DeepSeekModel::restore_prefix`]). Plain data: cheap to `Arc`
+/// and share across the serving threads.
+#[derive(Debug, Clone)]
+pub struct PrefixState {
+    /// Snapshot length in tokens.
+    pub len: usize,
+    /// `[n_self][len * head_dim]` — exact f32 KV shadow rows.
+    pub kv_shadow: Vec<Vec<f32>>,
+    /// `[n_self][len * hidden]` — DSA indexer key rows (residual).
+    pub indexer_k: Vec<Vec<f32>>,
+    /// `[n_cross]` — SWA rings rolled back to `len`.
+    pub rings: Vec<deepinfer_swa::SwaRingCache>,
+}
 
 /// Per-sequence runtime state: the logical length, per-self-layer caches
 /// (exact f32 KV shadow rows for rollback + residual rows feeding the DSA
@@ -208,11 +239,13 @@ impl DeepSeekModel {
         self.vocab_bytes.as_deref()
     }
 
-    /// Derives a vocabulary byte table from a tokenizer:
-    /// * `vocab == 256` — byte-level table (`id t` ↔ byte `t`), matching
+    /// Derives a vocabulary byte table from a tokenizer using
+    /// [`Tokenizer::decode_token_bytes`] (exact bytes, never lossy):
+    /// * `vocab == 256` with no specials — the byte-level table
+    ///   (`id t` ↔ byte `t`), matching a plain
     ///   [`deepinfer_core::tokenizer::ByteTokenizer`];
-    /// * otherwise — the decoded bytes of each single-token id (matching
-    ///   byte-level BPE).
+    /// * otherwise — the exact decoded bytes of each single-token id
+    ///   (byte-level BPE or a byte tokenizer with special pieces).
     ///
     /// The EOS token's bytes are emptied so the grammar mask can gate EOS
     /// on accepting states only.
@@ -234,10 +267,10 @@ impl DeepSeekModel {
             }
         } else {
             for t in 0..vocab as u32 {
-                let s = tok.decode(&[t]).map_err(|e| {
+                let bytes = tok.decode_token_bytes(t).map_err(|e| {
                     Error::Checkpoint(format!("decoding token {t} for vocab bytes: {e}"))
                 })?;
-                out.push(s.into_bytes());
+                out.push(bytes);
             }
         }
         out[eos_id as usize] = Vec::new();
@@ -282,6 +315,98 @@ impl DeepSeekModel {
     pub fn decode_step(&mut self, seq: u32, token: u32) -> Result<Vec<f32>> {
         let (logits, _) = self.forward_tokens(seq, &[token])?;
         Ok(logits)
+    }
+
+    /// Prefill variant returning the full speculative-decoding anchor:
+    /// the next-token logits **and** the residual hidden state of the
+    /// final position (see [`ForwardOut`]).
+    ///
+    /// # Errors
+    /// Same as [`DeepSeekModel::prefill`].
+    pub fn prefill_out(&mut self, seq: u32, tokens: &[u32]) -> Result<ForwardOut> {
+        ensure!(
+            !tokens.is_empty(),
+            InvalidArgument,
+            "prefill requires at least one prompt token"
+        );
+        let (logits, hidden) = self.forward_tokens(seq, tokens)?;
+        Ok(ForwardOut { logits, hidden })
+    }
+
+    /// Decode variant returning the full speculative-decoding anchor
+    /// (logits + residual hidden, see [`ForwardOut`]).
+    ///
+    /// # Errors
+    /// Same as [`DeepSeekModel::decode_step`].
+    pub fn decode_out(&mut self, seq: u32, token: u32) -> Result<ForwardOut> {
+        let (logits, hidden) = self.forward_tokens(seq, &[token])?;
+        Ok(ForwardOut { logits, hidden })
+    }
+
+    /// Speculative-verification forward: processes the draft chain
+    /// `tokens` and returns the per-position logit rows. Row `j` is the
+    /// distribution over the token after `tokens[j]` — the verification
+    /// contract `deepinfer_mtp::verify_greedy` / `verify_stochastic`
+    /// expect when prefixed with the anchor row.
+    ///
+    /// **Golden-path semantics**: each position is forwarded with the
+    /// same single-token kernel the plain autoregressive decode path
+    /// uses, so the rows are *bit-identical* to sequential
+    /// [`DeepSeekModel::decode_step`] calls — the property the DSpark
+    /// greedy-parity contract (spec output == plain output) is pinned
+    /// against. The GPU serve path (`DeviceModel::serve_verify`) makes
+    /// the same contract one chunked multi-row forward instead; on the
+    /// CPU the multi-token prefill kernel accumulates in a different
+    /// order than the decode kernel and is not bit-comparable.
+    ///
+    /// The sequence advances by `tokens.len()` positions; rejected
+    /// tails are rolled back with [`DeepSeekModel::rollback_seq`].
+    ///
+    /// # Errors
+    /// Same as [`DeepSeekModel::prefill`].
+    pub fn verify_tokens(&mut self, seq: u32, tokens: &[u32]) -> Result<Vec<Vec<f32>>> {
+        ensure!(
+            !tokens.is_empty(),
+            InvalidArgument,
+            "verify_tokens requires at least one draft token"
+        );
+        let mut rows = Vec::with_capacity(tokens.len());
+        for &t in tokens {
+            let (logits, _) = self.forward_tokens(seq, &[t])?;
+            rows.push(logits);
+        }
+        Ok(rows)
+    }
+
+    /// One MTP draft step: proposes the token following
+    /// `(last_token, hidden)` with the checkpoint's MTP (NEXTN) module —
+    /// the exact semantics of `deepinfer_mtp::NextNetDraft::draft_step`
+    /// over the model's shared embedding table. Greedy argmax with
+    /// softmax confidence (ties resolve to the lowest id).
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] when the model has no MTP weights;
+    /// [`Error::OutOfRange`] on an out-of-vocabulary anchor token;
+    /// shape/numerical errors from the MTP forward.
+    pub fn draft_step(
+        &mut self,
+        last_token: u32,
+        hidden: &[f32],
+    ) -> Result<deepinfer_mtp::DraftToken> {
+        let vocab = self.config.vocab_size;
+        let mtp = self
+            .weights
+            .mtp
+            .as_ref()
+            .ok_or_else(|| Error::invalid("draft_step: the model has no MTP weights"))?;
+        draft_token(
+            mtp,
+            &self.weights.embed,
+            vocab,
+            self.config.hidden_size,
+            last_token,
+            hidden,
+        )
     }
 
     /// Shared forward path: embeds `tokens`, runs the layer stack and the
@@ -394,11 +519,34 @@ impl DeepSeekModel {
         Ok((logits, residual))
     }
 
+    /// Frees every cached row of `seq`, leaving the sequence id reusable
+    /// as if freshly created (the serving engine's slot-recycling call).
+    /// The per-layer paged caches are truncated in place with page
+    /// recycling, so a re-prefill writes the rows a cold start would.
+    ///
+    /// # Errors
+    /// Cache-truncation errors. No-op for an unknown sequence.
+    pub fn free_seq(&mut self, seq: u32) -> Result<()> {
+        if self.seqs.remove(&seq).is_none() {
+            return Ok(());
+        }
+        for cache in &mut self.self_caches {
+            cache.truncate(seq, 0)?;
+        }
+        Ok(())
+    }
+
     /// Rolls back the newest `n` tokens of `seq` (MTP rejection): drops
-    /// shadow/indexer rows, rolls back the SWA rings and rebuilds the
-    /// paged caches from the surviving exact f32 rows so the model is
-    /// bit-identical to the state before the rejected tokens.
-    pub(crate) fn rollback_seq(&mut self, seq: u32, n: usize) -> Result<()> {
+    /// shadow/indexer rows, rolls back the SWA rings and truncates the
+    /// per-layer paged caches in place (freed pages return to their
+    /// layer's free list), so the model is bit-identical to the state
+    /// before the rejected tokens — the invariant the offline DSpark
+    /// loop and the batched serving spec path both rely on.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] on an unknown sequence or when `n`
+    /// exceeds the stored length; cache-truncation errors.
+    pub fn rollback_seq(&mut self, seq: u32, n: usize) -> Result<()> {
         let cfg = &self.config;
         let hd = cfg.head_dim;
         let hidden = cfg.hidden_size;
@@ -420,26 +568,118 @@ impl DeepSeekModel {
         for l in 0..cfg.n_cross_layers {
             st.rings[l].rollback(n)?;
         }
-        // Rebuild the paged caches from the shadows (same rows in the
-        // same order ⇒ identical quantized contents; only the physical
-        // page layout may differ, which no kernel observes).
-        let mut fresh = (0..cfg.n_self_layers)
-            .map(|_| MlaPagedCache::new(cfg.cache, PAGE_SIZE, cfg.max_pages()))
-            .collect::<Vec<_>>();
-        for (&sid, state) in &self.seqs {
-            for l in 0..cfg.n_self_layers {
-                for t in 0..state.len {
-                    fresh[l].append(sid, &state.kv_shadow[l][t * hd..(t + 1) * hd])?;
-                }
-            }
+        for cache in &mut self.self_caches {
+            cache.truncate(seq, st.len)?;
         }
-        self.self_caches = fresh;
         Ok(())
     }
 
     /// The MTP weights (speculative path).
     pub(crate) fn mtp(&self) -> Option<&deepinfer_mtp::MtpWeights> {
         self.weights.mtp.as_ref()
+    }
+
+    /// Snapshots the first `n` tokens of `seq` as a reusable prefix
+    /// state — the serving layer's **prefix cache** materialization
+    /// (SGLang RadixAttention / vLLM automatic prefix caching, at
+    /// state-copy granularity): the exact f32 KV shadow rows, the DSA
+    /// indexer key rows and the SWA rings of positions `[0, n)`.
+    ///
+    /// A later [`DeepSeekModel::restore_prefix`] on a fresh sequence
+    /// id rebuilds that state bit-identically (rows re-quantize the
+    /// same on re-append), so a prompt sharing the prefix prefills
+    /// only its suffix — a memory-bound copy instead of a full
+    /// compute-bound forward.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] on an unknown sequence or `n` beyond
+    /// the stored length.
+    pub fn snapshot_prefix(&self, seq: u32, n: usize) -> Result<PrefixState> {
+        let st = self
+            .seqs
+            .get(&seq)
+            .ok_or_else(|| Error::invalid("snapshot_prefix on unknown sequence {seq}"))?;
+        ensure!(
+            n <= st.len,
+            InvalidArgument,
+            "cannot snapshot {n} tokens: sequence {seq} only holds {}",
+            st.len
+        );
+        let hd = self.config.head_dim;
+        let hidden = self.config.hidden_size;
+        let kv_shadow = st
+            .kv_shadow
+            .iter()
+            .map(|rows| rows[..n * hd].to_vec())
+            .collect();
+        let indexer_k = st
+            .indexer_k
+            .iter()
+            .map(|rows| rows[..n * hidden].to_vec())
+            .collect();
+        // The SWA rings hold the *newest* rows, so a prefix shorter than
+        // the live sequence must roll the rings back to length `n` (the
+        // same primitive `rollback_seq` uses).
+        let mut rings = st.rings.clone();
+        if n < st.len {
+            for r in &mut rings {
+                r.rollback(st.len - n)?;
+            }
+        }
+        Ok(PrefixState {
+            len: n,
+            kv_shadow,
+            indexer_k,
+            rings,
+        })
+    }
+
+    /// Restores a snapshotted prefix into `seq` (which must hold no
+    /// tokens): rebuilds the per-layer paged cache rows by re-appending
+    /// the shadow rows (deterministic re-quantization — the restored
+    /// cache is bit-identical to a cold prefill of the same tokens),
+    /// then installs the indexer rows, the SWA rings and the length.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] when `seq` is not empty or the
+    /// snapshot's geometry disagrees with the model configuration;
+    /// cache-capacity errors on append.
+    pub fn restore_prefix(&mut self, seq: u32, snap: &PrefixState) -> Result<()> {
+        let cfg = &self.config;
+        let n = snap.len;
+        ensure!(
+            self.seqs.get(&seq).map(|s| s.len).unwrap_or(0) == 0,
+            InvalidArgument,
+            "restore_prefix needs an empty sequence (seq {seq} holds tokens)"
+        );
+        ensure!(
+            snap.kv_shadow.len() == cfg.n_self_layers
+                && snap.indexer_k.len() == cfg.n_self_layers
+                && snap.rings.len() == cfg.n_cross_layers,
+            InvalidArgument,
+            "prefix snapshot geometry disagrees with the model config"
+        );
+        let hd = cfg.head_dim;
+        let hidden = cfg.hidden_size;
+        let mut st = SeqState::new(cfg);
+        for l in 0..cfg.n_self_layers {
+            ensure!(
+                snap.kv_shadow[l].len() == n * hd && snap.indexer_k[l].len() == n * hidden,
+                InvalidArgument,
+                "prefix snapshot row lengths disagree with the model config"
+            );
+            let cache = &mut self.self_caches[l];
+            for pos in 0..n {
+                let row = &snap.kv_shadow[l][pos * hd..(pos + 1) * hd];
+                cache.append(seq, row)?;
+            }
+            st.kv_shadow[l] = snap.kv_shadow[l].clone();
+            st.indexer_k[l] = snap.indexer_k[l].clone();
+        }
+        st.rings = snap.rings.clone();
+        st.len = n;
+        self.seqs.insert(seq, st);
+        Ok(())
     }
 
     /// Resolves the vocabulary byte table for structured outputs: the
@@ -489,7 +729,11 @@ fn self_layer_forward(
     // 1. Pre-attention RMSNorm.
     let mut x = h_in.to_vec();
     for i in 0..s {
-        rmsnorm(&mut x[i * hidden..(i + 1) * hidden], &w.attn_norm, cfg.rms_eps);
+        rmsnorm(
+            &mut x[i * hidden..(i + 1) * hidden],
+            &w.attn_norm,
+            cfg.rms_eps,
+        );
     }
 
     // 2. KV projection (latent slice normed inside), rope, cache append.
@@ -556,8 +800,17 @@ fn self_layer_forward(
             kv_all[p * hd..(p + 1) * hd].copy_from_slice(&row);
         }
         let (out, _max_logits, _lse) = flash_mla_sparse_prefill(
-            &q, &kv_all, &sel, s, cfg.n_heads, hd, total, topk, sm_eff,
-            w.mla.attn_sink.as_deref(), None,
+            &q,
+            &kv_all,
+            &sel,
+            s,
+            cfg.n_heads,
+            hd,
+            total,
+            topk,
+            sm_eff,
+            w.mla.attn_sink.as_deref(),
+            None,
         )?;
         attn.copy_from_slice(&out);
     }
@@ -575,7 +828,11 @@ fn self_layer_forward(
     //    + residual.
     let mut x2 = h_out.clone();
     for i in 0..s {
-        rmsnorm(&mut x2[i * hidden..(i + 1) * hidden], &w.ffn_norm, cfg.rms_eps);
+        rmsnorm(
+            &mut x2[i * hidden..(i + 1) * hidden],
+            &w.ffn_norm,
+            cfg.rms_eps,
+        );
     }
     let moe_out = deepinfer_moe::moe_forward(&w.moe, &cfg.moe, &x2, s)?;
     for (o, m) in h_out.iter_mut().zip(moe_out.iter()) {
@@ -606,7 +863,11 @@ fn cross_layer_forward(
     // 1. Pre-attention RMSNorm (the ring stores the normed rows).
     let mut x = h_in.to_vec();
     for i in 0..s {
-        rmsnorm(&mut x[i * hidden..(i + 1) * hidden], &w.attn_norm, cfg.rms_eps);
+        rmsnorm(
+            &mut x[i * hidden..(i + 1) * hidden],
+            &w.attn_norm,
+            cfg.rms_eps,
+        );
     }
 
     // 2. SWA local self-attention over the ring.
@@ -692,7 +953,11 @@ fn cross_layer_forward(
     // 5. Pre-FFN norm + MoE + residual.
     let mut x2 = h_out.clone();
     for i in 0..s {
-        rmsnorm(&mut x2[i * hidden..(i + 1) * hidden], &w.ffn_norm, cfg.rms_eps);
+        rmsnorm(
+            &mut x2[i * hidden..(i + 1) * hidden],
+            &w.ffn_norm,
+            cfg.rms_eps,
+        );
     }
     let moe_out = deepinfer_moe::moe_forward(&w.moe, &cfg.moe, &x2, s)?;
     for (o, m) in h_out.iter_mut().zip(moe_out.iter()) {
@@ -839,7 +1104,7 @@ mod tests {
         assert!(m.prefill(0, &[]).is_err());
         assert!(m.prefill(0, &[256]).is_err()); // vocab
         assert!(m.decode_step(0, 999).is_err()); // vocab
-        // Position bound: max_position_embeddings = 256.
+                                                 // Position bound: max_position_embeddings = 256.
         let long: Vec<u32> = vec![1; 250];
         m.prefill(0, &long).unwrap();
         for _ in 0..6 {
@@ -872,6 +1137,97 @@ mod tests {
     }
 
     #[test]
+    fn verify_tokens_rows_match_sequential_decodes() {
+        // The spec-decode correctness core: one chunked multi-position
+        // forward must produce exactly the logit rows the sequential
+        // single-token decodes produce, for every position.
+        let prompt: Vec<u32> = (0..6u32).map(|t| (t * 23) % 256).collect();
+        let mut chunked = tiny_model(5);
+        let mut seq = tiny_model(5);
+        chunked.prefill(1, &prompt).unwrap();
+        seq.prefill(1, &prompt).unwrap();
+        let drafts = [140u32, 12, 201, 7];
+        let rows = chunked.verify_tokens(1, &drafts).unwrap();
+        assert_eq!(rows.len(), drafts.len());
+        for (j, &d) in drafts.iter().enumerate() {
+            let expect = seq.decode_step(1, d).unwrap();
+            assert_eq!(
+                rows[j], expect,
+                "verify row {j} must equal the sequential decode logits"
+            );
+        }
+        assert_eq!(chunked.seq_len(1), seq.seq_len(1));
+        // A rejected tail rolls back to the exact pre-verify state.
+        chunked.rollback_seq(1, drafts.len()).unwrap();
+        assert_eq!(chunked.seq_len(1), prompt.len());
+        let after = chunked.decode_step(1, 140).unwrap();
+        let direct = {
+            let mut m = tiny_model(5);
+            m.prefill(1, &prompt).unwrap();
+            m.decode_step(1, 140).unwrap()
+        };
+        assert_eq!(after, direct, "rollback must restore the pre-verify state");
+        // Empty draft chains are rejected.
+        assert!(chunked.verify_tokens(1, &[]).is_err());
+    }
+
+    #[test]
+    fn prefill_decode_out_expose_hidden_anchor() {
+        let mut m = tiny_model(9);
+        let out = m.prefill_out(2, &[3, 4, 5]).unwrap();
+        assert_eq!(out.logits.len(), m.config.vocab_size);
+        assert_eq!(out.hidden.len(), m.config.hidden_size);
+        assert!(out.hidden.iter().all(|v| v.is_finite()));
+        // The plain paths agree on logits.
+        let mut plain = tiny_model(9);
+        assert_eq!(plain.prefill(2, &[3, 4, 5]).unwrap(), out.logits);
+        let d = m.decode_out(2, 77).unwrap();
+        assert_eq!(d.logits, plain.decode_step(2, 77).unwrap());
+        assert_eq!(d.hidden.len(), m.config.hidden_size);
+    }
+
+    #[test]
+    fn draft_step_matches_the_mtp_module() {
+        // The runtime draft step must equal the mtp crate's concrete
+        // draft network on the same weights — the offline DSpark loop
+        // and the serving spec path share it.
+        let mut m = tiny_model(13);
+        assert!(m.has_mtp(), "v41_tiny must carry MTP weights");
+        let hidden: Vec<f32> = (0..m.config.hidden_size)
+            .map(|i| (i as f32 * 0.11) - 0.5)
+            .collect();
+        let a = m.draft_step(30, &hidden).unwrap();
+        let b = m.draft_step(30, &hidden).unwrap();
+        assert_eq!(a.token, b.token);
+        assert_eq!(a.logits, b.logits, "draft_step must be deterministic");
+        assert!((a.token as usize) < m.config.vocab_size);
+        assert!(a.confidence > 0.0 && a.confidence <= 1.0 + 1e-5);
+        // Validation.
+        assert!(m.draft_step(256, &hidden).is_err(), "token == vocab");
+        assert!(m
+            .draft_step(0, &hidden[..m.config.hidden_size - 1])
+            .is_err());
+    }
+
+    #[test]
+    fn free_seq_with_page_recycling_roundtrip() {
+        // free_seq must leave the slot exactly as cold: same logits on a
+        // re-prefill (the truncate-based teardown keeps this contract).
+        let prompt: Vec<u32> = (0..7u32).map(|t| (t * 29) % 256).collect();
+        let mut m = tiny_model(21);
+        m.prefill(3, &prompt).unwrap();
+        m.decode_step(3, 99).unwrap();
+        m.decode_step(3, 98).unwrap();
+        m.free_seq(3).unwrap();
+        assert_eq!(m.seq_len(3), 0);
+        let re = m.prefill(3, &prompt).unwrap();
+        let cold = tiny_model(21).prefill(3, &prompt).unwrap();
+        assert_eq!(re, cold, "re-prefill after free must match a cold start");
+        // free_seq on an unknown sequence is a no-op.
+        m.free_seq(777).unwrap();
+    }
+
+    #[test]
     fn rollback_restores_exact_state() {
         // Appending 3 tokens then rolling back 2 must equal appending 1:
         // the next decode after rollback reproduces the pre-rollback
@@ -898,6 +1254,77 @@ mod tests {
     }
 
     #[test]
+    fn prefix_snapshot_restore_is_bit_identical() {
+        // The prefix-cache contract: restore + suffix prefill must equal
+        // a cold prefill of the prefix + the same suffix prefill,
+        // bit-for-bit, and subsequent decodes must stay identical too.
+        // (Comparing against a single unchunked prefill of the whole
+        // prompt would be wrong: the CPU multi-token kernel is not
+        // chunk-invariant — the DSA indexer's chunk-relative
+        // quantization — which is exactly why the comparison pins the
+        // chunk boundary.)
+        let prompt: Vec<u32> = (0..9u32).map(|t| (t * 31) % 256).collect();
+        let mut m = tiny_model(5);
+        let cold_prefix = m.prefill(0, &prompt[..6]).unwrap();
+        let snap = m.snapshot_prefix(0, 6).unwrap();
+        assert_eq!(snap.len, 6);
+        // Restore into a fresh sequence of the SAME model (page pools
+        // shared, rows re-appended) and prefill only the suffix.
+        m.restore_prefix(1, &snap).unwrap();
+        assert_eq!(m.seq_len(1), 6);
+        let warm = m.prefill(1, &prompt[6..]).unwrap();
+        let cold = {
+            let mut m2 = tiny_model(5);
+            let p = m2.prefill(0, &prompt[..6]).unwrap();
+            assert_eq!(p, cold_prefix, "determinism");
+            m2.prefill(0, &prompt[6..]).unwrap()
+        };
+        assert_eq!(warm, cold, "restored suffix prefill must match cold logits");
+        // Bring seq 0 to the same 9-token state, then verify subsequent
+        // decodes stay identical.
+        m.prefill(0, &prompt[6..]).unwrap();
+        for k in 0..4u32 {
+            let a = m.decode_step(0, 40 + k).unwrap();
+            let b = m.decode_step(1, 40 + k).unwrap();
+            assert_eq!(a, b, "decode {k} diverges after a restored prefill");
+        }
+    }
+
+    #[test]
+    fn prefix_snapshot_of_head_and_validation() {
+        let prompt: Vec<u32> = (0..6u32).map(|t| (t * 13) % 256).collect();
+        let mut m = tiny_model(9);
+        m.prefill(2, &prompt).unwrap();
+        // Validation first (before any decode grows the sequence):
+        // over-long snapshot, restore into a non-empty seq.
+        assert!(m.snapshot_prefix(2, 7).is_err());
+        assert!(m.snapshot_prefix(99, 1).is_err(), "unknown sequence");
+        // Head snapshot (n == len) keeps the rings as they are.
+        let head = m.snapshot_prefix(2, 6).unwrap();
+        assert!(
+            m.restore_prefix(2, &head).is_err(),
+            "restore into a non-empty sequence"
+        );
+        m.restore_prefix(3, &head).unwrap();
+        assert_eq!(m.seq_len(3), 6);
+        let a = m.decode_step(2, 7).unwrap();
+        let b = m.decode_step(3, 7).unwrap();
+        assert_eq!(a, b, "head snapshot must restore exactly");
+        // A snapshot from another geometry is rejected.
+        let bad = PrefixState {
+            len: 1,
+            kv_shadow: vec![vec![0.0; 7]],
+            indexer_k: vec![vec![0.0; 64]; 2],
+            rings: Vec::new(),
+        };
+        assert!(m.restore_prefix(4, &bad).is_err());
+        // Zero-length snapshot restores as a no-op.
+        let zero = m.snapshot_prefix(2, 0).unwrap();
+        m.restore_prefix(5, &zero).unwrap();
+        assert_eq!(m.seq_len(5), 0);
+    }
+
+    #[test]
     fn cross_attention_dense_is_causal_and_normalized() {
         // 1 head, d = 2; keys at positions [0, 1, 2], queries at [1, 2].
         let q = vec![1.0, 0.0, 1.0, 0.0];
@@ -920,9 +1347,7 @@ mod tests {
         cross_attention_dense(&q[..2], &kv[2..], &[1, 2], &[0], 1, 2, 1.0, &mut z).unwrap();
         assert_eq!(z, vec![0.0f32; 2]);
         // Shape validation.
-        assert!(
-            cross_attention_dense(&q, &kv, &[0, 1, 2], &[1, 2], 1, 3, 1.0, &mut out).is_err()
-        );
+        assert!(cross_attention_dense(&q, &kv, &[0, 1, 2], &[1, 2], 1, 3, 1.0, &mut out).is_err());
     }
 
     #[test]

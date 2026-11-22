@@ -188,8 +188,13 @@ fn upload_grouped_gemm(
             let mut q_all = Vec::with_capacity(g * nk);
             let mut sf_all = Vec::new();
             for e in 0..g {
-                let (q, sf) =
-                    deepinfer_fp8::quantize_weight_per_block(&w[e * nk..(e + 1) * nk], n, k, 128, 128)?;
+                let (q, sf) = deepinfer_fp8::quantize_weight_per_block(
+                    &w[e * nk..(e + 1) * nk],
+                    n,
+                    k,
+                    128,
+                    128,
+                )?;
                 q_all.extend_from_slice(&q);
                 sf_all.extend_from_slice(&sf);
             }
@@ -517,7 +522,11 @@ impl DeviceModel {
             "head_dim {hd} cannot be served by the quantized cache formats"
         );
         if fmt != DevCacheFormat::F32 {
-            ensure!(hd == 512, InvalidArgument, "FlashMLA V4.1 quantized cache rows require head_dim 512");
+            ensure!(
+                hd == 512,
+                InvalidArgument,
+                "FlashMLA V4.1 quantized cache rows require head_dim 512"
+            );
         }
         let stream = dev.stream()?;
         let k = Kernels::new(dev)?;
@@ -579,10 +588,20 @@ impl DeviceModel {
                 attn_norm: dev.alloc_from(&sw.attn_norm)?,
                 ffn_norm: dev.alloc_from(&sw.ffn_norm)?,
                 kv_norm: dev.alloc_from(&mla.kv_norm)?,
-                sink: mla.attn_sink.as_ref().map(|s| dev.alloc_from(s.as_slice())).transpose()?,
+                sink: mla
+                    .attn_sink
+                    .as_ref()
+                    .map(|s| dev.alloc_from(s.as_slice()))
+                    .transpose()?,
                 wq: upload_gemm(dev, &idx.wq, idx_dim, hidden, prec)?,
                 wk: upload_gemm(dev, &idx.wk, idx_dim, hidden, prec)?,
-                weights_proj: upload_gemm(dev, &idx.weights_proj, cfg.dsa.num_heads, idx_dim, prec)?,
+                weights_proj: upload_gemm(
+                    dev,
+                    &idx.weights_proj,
+                    cfg.dsa.num_heads,
+                    idx_dim,
+                    prec,
+                )?,
                 gate_proj: dev.alloc_from(&idx.gate_proj)?,
                 conv_w: dev.alloc_from(&conv_flat)?,
                 conv_off: dev.alloc_from(&conv_off)?,
@@ -636,11 +655,18 @@ impl DeviceModel {
         .filter(|&v| v % 128 == 0)
         .max()
         .unwrap_or(0);
-        let max_k_bf16 = [hidden, cfg.q_lora_rank, cfg.n_heads * hd, cfg.o_lora_rank, inter, idx_dim]
-            .into_iter()
-            .filter(|&v| v % 128 != 0)
-            .max()
-            .unwrap_or(0);
+        let max_k_bf16 = [
+            hidden,
+            cfg.q_lora_rank,
+            cfg.n_heads * hd,
+            cfg.o_lora_rank,
+            inter,
+            idx_dim,
+        ]
+        .into_iter()
+        .filter(|&v| v % 128 != 0)
+        .max()
+        .unwrap_or(0);
         let ws = Workspace {
             h: dev.alloc(chunk * hidden * 4)?,
             x: dev.alloc(chunk * hidden * 4)?,
@@ -694,12 +720,20 @@ impl DeviceModel {
             moe_drops: dev.alloc(4)?,
             moe_perm: dev.alloc(e * cap * hidden * 4)?,
             moe_map: dev.alloc(ki * 4)?,
-            moe_aq: (hidden % 128 == 0).then(|| dev.alloc(e * cap * hidden)).transpose()?,
-            moe_asf: (hidden % 128 == 0).then(|| dev.alloc(e * cap * (hidden / 128))).transpose()?,
+            moe_aq: (hidden % 128 == 0)
+                .then(|| dev.alloc(e * cap * hidden))
+                .transpose()?,
+            moe_asf: (hidden % 128 == 0)
+                .then(|| dev.alloc(e * cap * (hidden / 128)))
+                .transpose()?,
             moe_act: dev.alloc(e * cap * 2 * inter * 4)?,
             moe_silu: dev.alloc(e * cap * inter * 4)?,
-            moe_aq2: (inter % 128 == 0).then(|| dev.alloc(e * cap * inter)).transpose()?,
-            moe_asf2: (inter % 128 == 0).then(|| dev.alloc(e * cap * (inter / 128))).transpose()?,
+            moe_aq2: (inter % 128 == 0)
+                .then(|| dev.alloc(e * cap * inter))
+                .transpose()?,
+            moe_asf2: (inter % 128 == 0)
+                .then(|| dev.alloc(e * cap * (inter / 128)))
+                .transpose()?,
             moe_a16: (hidden % 128 != 0 && inter % 128 != 0)
                 .then(|| dev.alloc(e * cap * hidden.max(inter) * 2))
                 .transpose()?,
@@ -843,6 +877,57 @@ impl DeviceModel {
         self.mtp.is_some()
     }
 
+    /// One host-side MTP draft step for the device model: reads the
+    /// shared embedding row of `last_token` back from the device (one
+    /// `[hidden]` row — the only D2H traffic drafting needs) and runs the
+    /// checkpoint's MTP module on the host, exactly matching
+    /// [`crate::model::DeepSeekModel::draft_step`] semantics (greedy
+    /// argmax, ties to the lowest id, softmax confidence).
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] when the model has no MTP weights;
+    /// [`Error::OutOfRange`] on an out-of-vocabulary anchor token;
+    /// shape/numerical errors from the MTP forward.
+    pub fn draft_step(
+        &mut self,
+        last_token: u32,
+        hidden: &[f32],
+    ) -> Result<deepinfer_mtp::DraftToken> {
+        let vocab = self.cfg.vocab_size;
+        let hidden_len = self.cfg.hidden_size;
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| Error::invalid("draft_step: the model has no MTP weights"))?;
+        ensure!(
+            (last_token as usize) < vocab,
+            OutOfRange,
+            "draft anchor token {last_token} outside the vocabulary ({vocab})"
+        );
+        ensure!(
+            hidden.len() == hidden_len,
+            DimensionMismatch,
+            "draft_step: hidden length {} does not match the model ({hidden_len})",
+            hidden.len()
+        );
+        let mut emb = vec![0.0f32; hidden_len];
+        let row = self
+            .root
+            .embed
+            .slice(last_token as usize * hidden_len * 4, hidden_len * 4)?;
+        self.dev.read(&row, &mut emb)?;
+        let logits = mtp.forward_logits(hidden, &emb)?;
+        let idx = deepinfer_core::math::argmax(&logits)
+            .ok_or_else(|| Error::internal("draft_step: MTP head produced empty logits"))?;
+        let mut probs = logits.clone();
+        deepinfer_core::math::softmax_inplace(&mut probs);
+        Ok(deepinfer_mtp::DraftToken {
+            token: idx as u32,
+            confidence: probs[idx],
+            logits,
+        })
+    }
+
     /// Tokens cached for `seq` (0 for unknown sequences).
     pub fn seq_len(&self, seq: u32) -> usize {
         self.seqs.get(&seq).map(|s| s.len).unwrap_or(0)
@@ -888,7 +973,13 @@ impl DeviceModel {
     /// `d = a @ w^T` with `a` f32 `[m, w.k]` and the weight's uploaded
     /// precision. FP8 mode stages the activation through the 1x128
     /// quantizer; BF16 mode rounds to bf16 first.
-    pub(crate) fn gemm(&self, w: &crate::device_model::GemmW, a_f32: &Buffer, d: &Buffer, m: usize) -> Result<()> {
+    pub(crate) fn gemm(
+        &self,
+        w: &crate::device_model::GemmW,
+        a_f32: &Buffer,
+        d: &Buffer,
+        m: usize,
+    ) -> Result<()> {
         ensure!(m >= 1, InvalidArgument, "gemm needs m >= 1");
         let (n, kk) = (w.n(), w.k);
         match w.dtype {
@@ -913,9 +1004,16 @@ impl DeviceModel {
                 if self.k.tcgen05_available()
                     && !self.tcgen05_off.load(std::sync::atomic::Ordering::Relaxed)
                 {
-                    let qp = w.q.as_ref().ok_or_else(|| Error::internal("fp8 payload missing"))?;
-                    let sp = w.sf.as_ref().ok_or_else(|| Error::internal("fp8 scales missing"))?;
-                    match self.k.gemm_fp8_nt_sm100(aq, asf, qp, sp, d, m, n, kk, &self.stream) {
+                    let qp =
+                        w.q.as_ref()
+                            .ok_or_else(|| Error::internal("fp8 payload missing"))?;
+                    let sp =
+                        w.sf.as_ref()
+                            .ok_or_else(|| Error::internal("fp8 scales missing"))?;
+                    match self
+                        .k
+                        .gemm_fp8_nt_sm100(aq, asf, qp, sp, d, m, n, kk, &self.stream)
+                    {
                         Ok(()) => return Ok(()),
                         Err(e) => {
                             if std::env::var("DEEPINFER_JIT_DEBUG").ok().as_deref() == Some("1") {
@@ -923,15 +1021,18 @@ impl DeviceModel {
                                     "[deepinfer] tcgen05 GEMM rejected ({e});                                      falling back to the portable kernel (sticky)"
                                 );
                             }
-                            self.tcgen05_off.store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.tcgen05_off
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
                 self.k.gemm_fp8_nt(
                     aq,
                     asf,
-                    w.q.as_ref().ok_or_else(|| Error::internal("fp8 payload missing"))?,
-                    w.sf.as_ref().ok_or_else(|| Error::internal("fp8 scales missing"))?,
+                    w.q.as_ref()
+                        .ok_or_else(|| Error::internal("fp8 payload missing"))?,
+                    w.sf.as_ref()
+                        .ok_or_else(|| Error::internal("fp8 scales missing"))?,
                     d,
                     m,
                     n,
@@ -948,7 +1049,9 @@ impl DeviceModel {
                 self.k.f32_to_bf16(a_f32, a16, m * kk, &self.stream)?;
                 self.k.gemm_bf16_nt(
                     a16,
-                    w.raw.as_ref().ok_or_else(|| Error::internal("weight payload missing"))?,
+                    w.raw
+                        .as_ref()
+                        .ok_or_else(|| Error::internal("weight payload missing"))?,
                     None,
                     d,
                     m,
@@ -959,7 +1062,9 @@ impl DeviceModel {
             }
             GemmDType::F32 => self.k.gemm_f32_nt(
                 a_f32,
-                w.raw.as_ref().ok_or_else(|| Error::internal("weight payload missing"))?,
+                w.raw
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("weight payload missing"))?,
                 None,
                 d,
                 m,
@@ -1084,7 +1189,8 @@ impl DeviceModel {
         let pos_q: Vec<u32> = (0..s * cfg.n_heads)
             .map(|r| (pos0 + r / cfg.n_heads) as u32)
             .collect();
-        self.stream.write_async(&self.dev, &self.ws.pos_kv, &pos_kv)?;
+        self.stream
+            .write_async(&self.dev, &self.ws.pos_kv, &pos_kv)?;
         self.stream.write_async(&self.dev, &self.ws.pos_q, &pos_q)?;
 
         let sm_eff = cfg.sm_scale() * deepinfer_dsa::mscale(cfg.dsa.topk_tokens);
@@ -1092,8 +1198,15 @@ impl DeviceModel {
         // Self-decoder layers.
         for l in 0..cfg.n_self_layers {
             let (w, state) = &self.self_layers[l];
-            self.k
-                .rmsnorm(&self.ws.h, &w.attn_norm, &self.ws.x, s, hidden, cfg.rms_eps, &self.stream)?;
+            self.k.rmsnorm(
+                &self.ws.h,
+                &w.attn_norm,
+                &self.ws.x,
+                s,
+                hidden,
+                cfg.rms_eps,
+                &self.stream,
+            )?;
             // Fused q_a|kv_a projection, then split the strided columns
             // (the kv latent norm needs contiguous rows; with one decode
             // row the slices are contiguous and no split is needed).
@@ -1163,19 +1276,31 @@ impl DeviceModel {
                     &self.stream,
                 )?,
                 DevCacheFormat::Fp8Group32 => {
-                    let dst = state.kv.slice((start + pos0) * self.kv_row_bytes, s * self.kv_row_bytes)?;
-                    self.k.kv_encode_fp8(&self.ws.kv_rows, &dst, s, hd, &self.stream)?;
+                    let dst = state
+                        .kv
+                        .slice((start + pos0) * self.kv_row_bytes, s * self.kv_row_bytes)?;
+                    self.k
+                        .kv_encode_fp8(&self.ws.kv_rows, &dst, s, hd, &self.stream)?;
                 }
                 DevCacheFormat::Fp4Group16 => {
-                    let dst = state.kv.slice((start + pos0) * self.kv_row_bytes, s * self.kv_row_bytes)?;
-                    self.k.kv_encode_fp4(&self.ws.kv_rows, &dst, s, hd, &self.stream)?;
+                    let dst = state
+                        .kv
+                        .slice((start + pos0) * self.kv_row_bytes, s * self.kv_row_bytes)?;
+                    self.k
+                        .kv_encode_fp4(&self.ws.kv_rows, &dst, s, hd, &self.stream)?;
                 }
             }
             // DSA indexer: projections from the RAW residual rows.
             self.gemm(&w.wq, &self.ws.h, &self.ws.q_idx, s)?;
             self.gemm(&w.wk, &self.ws.h, &self.ws.k_new, s)?;
-            self.k
-                .append_rows(&self.ws.k_new, &state.k_raw, start + pos0, s, idx_dim, &self.stream)?;
+            self.k.append_rows(
+                &self.ws.k_new,
+                &state.k_raw,
+                start + pos0,
+                s,
+                idx_dim,
+                &self.stream,
+            )?;
             self.k.append_norm_rows(
                 &self.ws.k_new,
                 &state.k_norm,
@@ -1201,7 +1326,8 @@ impl DeviceModel {
                 let feat_slice = state
                     .feat
                     .slice((start + pos0) * idx_dim * 4, s * idx_dim * 4)?;
-                self.k.conv_gated_norm(&feat_slice, &w.conv_gain, s, idx_dim, &self.stream)?;
+                self.k
+                    .conv_gated_norm(&feat_slice, &w.conv_gain, s, idx_dim, &self.stream)?;
             }
             // Per-head normed q copy + lightning quant (whole history, the
             // CPU's per-call semantics).
@@ -1214,7 +1340,9 @@ impl DeviceModel {
             self.k
                 .indexer_rmsnorm_per_head(&self.ws.q_idx_n, s, nh, ihd, &self.stream)?;
             {
-                let k_norm_slice = state.k_norm.slice(start * idx_dim * 4, total * idx_dim * 4)?;
+                let k_norm_slice = state
+                    .k_norm
+                    .slice(start * idx_dim * 4, total * idx_dim * 4)?;
                 let k_u8_slice = state.k_u8.slice(start * idx_dim, total * idx_dim)?;
                 let k_sf_view = self.seqs[&seq].k_sf.slice(0, (total / qb).max(1))?;
                 self.k.lightning_quant(
@@ -1286,13 +1414,19 @@ impl DeviceModel {
                     hidden,
                     &self.stream,
                 )?;
-                self.k
-                    .gate_blend(&self.ws.gt, &self.ws.gc, &conv, &scores, s, total, &self.stream)?;
+                self.k.gate_blend(
+                    &self.ws.gt,
+                    &self.ws.gc,
+                    &conv,
+                    &scores,
+                    s,
+                    total,
+                    &self.stream,
+                )?;
                 self.k
                     .causal_window_clip(&scores, s, total, window, &self.stream)?;
                 let k_eff = cfg.dsa.topk_tokens.min(total);
-                let cands_cap =
-                    total.div_ceil(cfg.dsa.block_size) * cfg.dsa.preselect_per_block;
+                let cands_cap = total.div_ceil(cfg.dsa.block_size) * cfg.dsa.preselect_per_block;
                 let cands_a = self.dev.alloc(s * cands_cap * 8)?;
                 let cands_b = self.dev.alloc(s * cands_cap * 8)?;
                 let sel = self.ws.sel.slice(0, s * k_eff * 4)?;
@@ -1310,7 +1444,9 @@ impl DeviceModel {
                     &self.stream,
                 )?;
                 // Sparse attention over the sequence's cache rows.
-                let kv_seq = state.kv.slice(start * self.kv_row_bytes, total * self.kv_row_bytes)?;
+                let kv_seq = state
+                    .kv
+                    .slice(start * self.kv_row_bytes, total * self.kv_row_bytes)?;
                 self.k.mla_prefill(
                     &self.ws.q,
                     &kv_seq,
@@ -1346,7 +1482,10 @@ impl DeviceModel {
             for g in 0..cfg.o_groups {
                 if s == 1 {
                     let a = self.ws.attn.slice(g * r * 4, r * 4)?;
-                    let d = self.ws.wv_lora.slice(g * cfg.o_lora_rank * 4, cfg.o_lora_rank * 4)?;
+                    let d = self
+                        .ws
+                        .wv_lora
+                        .slice(g * cfg.o_lora_rank * 4, cfg.o_lora_rank * 4)?;
                     self.gemm(&w.wv[g], &a, &d, 1)?;
                 } else {
                     let tmp = self.ws.swa_out.slice(0, s * r * 4)?; // reuse as [s, r]
@@ -1377,10 +1516,18 @@ impl DeviceModel {
                 }
             }
             self.gemm(&w.wo, &self.ws.wv_lora, &self.ws.proj, s)?;
-            self.k.add(&self.ws.proj, &self.ws.h, s * hidden, &self.stream)?;
-            // FFN.
             self.k
-                .rmsnorm(&self.ws.h, &w.ffn_norm, &self.ws.x, s, hidden, cfg.rms_eps, &self.stream)?;
+                .add(&self.ws.proj, &self.ws.h, s * hidden, &self.stream)?;
+            // FFN.
+            self.k.rmsnorm(
+                &self.ws.h,
+                &w.ffn_norm,
+                &self.ws.x,
+                s,
+                hidden,
+                cfg.rms_eps,
+                &self.stream,
+            )?;
             self.moe_prefill(&w.moe, s)?;
         }
 
@@ -1413,17 +1560,22 @@ impl DeviceModel {
                 // Ring append (wrapped host-split writes) + gather + SWA.
                 let slot0 = pos0 % cfg.swa_window;
                 if slot0 + s <= cfg.swa_window {
-                    let dst = self.seqs[&seq].rings[l]
-                        .slice(slot0 * hidden * 4, s * hidden * 4)?;
+                    let dst = self.seqs[&seq].rings[l].slice(slot0 * hidden * 4, s * hidden * 4)?;
                     self.k
                         .append_rows(&self.ws.x, &dst, 0, s, hidden, &self.stream)?;
                 } else {
                     let head = cfg.swa_window - slot0;
-                    let d1 = self.seqs[&seq].rings[l].slice(slot0 * hidden * 4, head * hidden * 4)?;
-                    self.k.append_rows(&self.ws.x, &d1, 0, head, hidden, &self.stream)?;
+                    let d1 =
+                        self.seqs[&seq].rings[l].slice(slot0 * hidden * 4, head * hidden * 4)?;
+                    self.k
+                        .append_rows(&self.ws.x, &d1, 0, head, hidden, &self.stream)?;
                     let d2 = self.seqs[&seq].rings[l].slice(0, (s - head) * hidden * 4)?;
-                    let src2 = self.ws.x.slice(head * hidden * 4, (s - head) * hidden * 4)?;
-                    self.k.append_rows(&src2, &d2, 0, s - head, hidden, &self.stream)?;
+                    let src2 = self
+                        .ws
+                        .x
+                        .slice(head * hidden * 4, (s - head) * hidden * 4)?;
+                    self.k
+                        .append_rows(&src2, &d2, 0, s - head, hidden, &self.stream)?;
                 }
                 self.k.gather_rows(
                     &self.seqs[&seq].rings[l],
@@ -1493,8 +1645,10 @@ impl DeviceModel {
                     &self.stream,
                 )?;
                 self.gemm(&w.o_proj, &self.ws.attn, &self.ws.proj, s)?;
-                self.k.add(&self.ws.proj, &self.ws.h, s * hidden, &self.stream)?;
-                self.k.add(&self.ws.swa_out, &self.ws.h, s * hidden, &self.stream)?;
+                self.k
+                    .add(&self.ws.proj, &self.ws.h, s * hidden, &self.stream)?;
+                self.k
+                    .add(&self.ws.swa_out, &self.ws.h, s * hidden, &self.stream)?;
                 self.k.rmsnorm(
                     &self.ws.h,
                     &w.ffn_norm,
@@ -1532,7 +1686,6 @@ impl DeviceModel {
         self.seqs.get_mut(&seq).expect("seq exists").len = total;
         Ok((logits, residual))
     }
-
 }
 
 impl DeviceModel {
@@ -1741,16 +1894,8 @@ impl DeviceModel {
             let y = self.ws.h.slice(c0 * hidden * 4, cs * hidden * 4)?;
             // combine writes y; then the residual add happens per chunk.
             let y_buf = self.ws.swa_out.slice(0, cs * hidden * 4)?;
-            self.k.moe_combine(
-                &down,
-                &map,
-                &topk_w,
-                &y_buf,
-                cs,
-                hidden,
-                ki,
-                &self.stream,
-            )?;
+            self.k
+                .moe_combine(&down, &map, &topk_w, &y_buf, cs, hidden, ki, &self.stream)?;
             self.k.add(&y_buf, &y, cs * hidden, &self.stream)?;
             // Shared experts (unweighted sum, dense; transient staging —
             // the masked decode buffers are capacity-sized, not chunk-sized).
@@ -1809,8 +1954,15 @@ impl DeviceModel {
             GemmDType::Fp8 => {
                 let aq = self.ws.moe_aq.as_ref().unwrap();
                 let asf = self.ws.moe_asf.as_ref().unwrap();
-                self.k
-                    .quant_per_token_group(&self.ws.moe_perm, aq, asf, rows, hidden, 128, &self.stream)?;
+                self.k.quant_per_token_group(
+                    &self.ws.moe_perm,
+                    aq,
+                    asf,
+                    rows,
+                    hidden,
+                    128,
+                    &self.stream,
+                )?;
                 self.k.gemm_grouped_masked_nt(
                     aq,
                     Some(asf),
@@ -1987,10 +2139,11 @@ impl DeviceModel {
         let window = cfg.dsa.extrapolation_window.unwrap_or(0);
         let topk = self.geo.topk;
         let sm_eff = cfg.sm_scale() * deepinfer_dsa::mscale(cfg.dsa.topk_tokens);
-        let splits = topk
-            .div_ceil(deepinfer_kernels::DECODE_CHUNK)
-            .max(1);
-        let st_seq = self.seqs.get(&seq).ok_or_else(|| Error::internal("seq missing"))?;
+        let splits = topk.div_ceil(deepinfer_kernels::DECODE_CHUNK).max(1);
+        let st_seq = self
+            .seqs
+            .get(&seq)
+            .ok_or_else(|| Error::internal("seq missing"))?;
         let start = st_seq.start;
 
         self.k.step_params(
@@ -2002,38 +2155,79 @@ impl DeviceModel {
             topk,
             s,
         )?;
-        self.k
-            .pos_fill(&self.ws.pos_q, &self.ws.pos_kv, &self.ws.p_pos, cfg.n_heads, s)?;
+        self.k.pos_fill(
+            &self.ws.pos_q,
+            &self.ws.pos_kv,
+            &self.ws.p_pos,
+            cfg.n_heads,
+            s,
+        )?;
 
         for l in 0..cfg.n_self_layers {
             let (w, state) = &self.self_layers[l];
-            self.k
-                .rmsnorm(&self.ws.h, &w.attn_norm, &self.ws.x, 1, hidden, cfg.rms_eps, s)?;
+            self.k.rmsnorm(
+                &self.ws.h,
+                &w.attn_norm,
+                &self.ws.x,
+                1,
+                hidden,
+                cfg.rms_eps,
+                s,
+            )?;
             self.gemm(&w.fused_qkv, &self.ws.x, &self.ws.fused, 1)?;
             let kv_slice = self.ws.fused.slice(cfg.q_lora_rank * 4, hd * 4)?;
-            self.k
-                .rmsnorm_latent(&kv_slice, &w.kv_norm, 1, hd, latent, crate::weights::V41_RMS_EPS, s)?;
+            self.k.rmsnorm_latent(
+                &kv_slice,
+                &w.kv_norm,
+                1,
+                hd,
+                latent,
+                crate::weights::V41_RMS_EPS,
+                s,
+            )?;
             let qa_slice = self.ws.fused.slice(0, cfg.q_lora_rank * 4)?;
             self.gemm(&w.q_b, &qa_slice, &self.ws.q, 1)?;
-            self.k
-                .rope(&self.root.rope_cs, &self.ws.pos_q, &self.ws.q, cfg.n_heads, hd, latent, half, false, s)?;
-            self.k
-                .rope(&self.root.rope_cs, &self.ws.pos_kv, &kv_slice, 1, hd, latent, half, false, s)?;
+            self.k.rope(
+                &self.root.rope_cs,
+                &self.ws.pos_q,
+                &self.ws.q,
+                cfg.n_heads,
+                hd,
+                latent,
+                half,
+                false,
+                s,
+            )?;
+            self.k.rope(
+                &self.root.rope_cs,
+                &self.ws.pos_kv,
+                &kv_slice,
+                1,
+                hd,
+                latent,
+                half,
+                false,
+                s,
+            )?;
             match self.fmt {
                 DevCacheFormat::Fp8Group32 => {
-                    self.k.kv_encode_fp8_dev(&kv_slice, &state.kv, &self.ws.params, hd, s)?
+                    self.k
+                        .kv_encode_fp8_dev(&kv_slice, &state.kv, &self.ws.params, hd, s)?
                 }
                 DevCacheFormat::Fp4Group16 => {
-                    self.k.kv_encode_fp4_dev(&kv_slice, &state.kv, &self.ws.params, hd, s)?
+                    self.k
+                        .kv_encode_fp4_dev(&kv_slice, &state.kv, &self.ws.params, hd, s)?
                 }
                 DevCacheFormat::F32 => {
-                    self.k.append_row(&kv_slice, &state.kv, &self.ws.params, hd, s)?
+                    self.k
+                        .append_row(&kv_slice, &state.kv, &self.ws.params, hd, s)?
                 }
             }
             // DSA indexer (projections consume the RAW residual row).
             self.gemm(&w.wq, &self.ws.h, &self.ws.q_idx, 1)?;
             self.gemm(&w.wk, &self.ws.h, &self.ws.k_new, 1)?;
-            self.k.append_row(&self.ws.k_new, &state.k_raw, &self.ws.params, idx_dim, s)?;
+            self.k
+                .append_row(&self.ws.k_new, &state.k_raw, &self.ws.params, idx_dim, s)?;
             self.k
                 .append_norm_row(&self.ws.k_new, &state.k_norm, &self.ws.params, nh, ihd, s)?;
             self.k.conv_feat_dev(
@@ -2049,8 +2243,12 @@ impl DeviceModel {
             self.k
                 .conv_gated_norm_dev(&state.feat, &w.conv_gain, &self.ws.params, idx_dim, s)?;
             {
-                let k_norm_seq = state.k_norm.slice(start * idx_dim * 4, (self.max_rows - start) * idx_dim * 4)?;
-                let k_u8_seq = state.k_u8.slice(start * idx_dim, (self.max_rows - start) * idx_dim)?;
+                let k_norm_seq = state
+                    .k_norm
+                    .slice(start * idx_dim * 4, (self.max_rows - start) * idx_dim * 4)?;
+                let k_u8_seq = state
+                    .k_u8
+                    .slice(start * idx_dim, (self.max_rows - start) * idx_dim)?;
                 self.k.lightning_block_quant_dev(
                     &k_norm_seq,
                     &k_u8_seq,
@@ -2081,8 +2279,12 @@ impl DeviceModel {
                 s,
             )?;
             {
-                let k_norm_seq = state.k_norm.slice(start * idx_dim * 4, (self.max_rows - start) * idx_dim * 4)?;
-                let k_u8_seq = state.k_u8.slice(start * idx_dim, (self.max_rows - start) * idx_dim)?;
+                let k_norm_seq = state
+                    .k_norm
+                    .slice(start * idx_dim * 4, (self.max_rows - start) * idx_dim * 4)?;
+                let k_u8_seq = state
+                    .k_u8
+                    .slice(start * idx_dim, (self.max_rows - start) * idx_dim)?;
                 self.k.thunder_logits_dev(
                     &self.ws.q_idx_n,
                     &self.ws.q_idx_u8,
@@ -2101,7 +2303,9 @@ impl DeviceModel {
                     self.max_rows,
                     s,
                 )?;
-                let feat_seq = state.feat.slice(start * idx_dim * 4, (self.max_rows - start) * idx_dim * 4)?;
+                let feat_seq = state
+                    .feat
+                    .slice(start * idx_dim * 4, (self.max_rows - start) * idx_dim * 4)?;
                 self.k.dot_scores_dev(
                     &self.ws.q_idx,
                     &feat_seq,
@@ -2154,7 +2358,10 @@ impl DeviceModel {
                 s,
             )?;
             {
-                let kv_seq = state.kv.slice(start * self.kv_row_bytes, (self.max_rows - start) * self.kv_row_bytes)?;
+                let kv_seq = state.kv.slice(
+                    start * self.kv_row_bytes,
+                    (self.max_rows - start) * self.kv_row_bytes,
+                )?;
                 if self.fmt == DevCacheFormat::Fp4Group16 {
                     self.k.mla_decode_fp4_partial(
                         &self.ws.q,
@@ -2228,8 +2435,15 @@ impl DeviceModel {
             }
             self.gemm(&w.wo, &self.ws.wv_lora, &self.ws.proj, 1)?;
             self.k.add(&self.ws.proj, &self.ws.h, hidden, s)?;
-            self.k
-                .rmsnorm(&self.ws.h, &w.ffn_norm, &self.ws.x, 1, hidden, cfg.rms_eps, s)?;
+            self.k.rmsnorm(
+                &self.ws.h,
+                &w.ffn_norm,
+                &self.ws.x,
+                1,
+                hidden,
+                cfg.rms_eps,
+                s,
+            )?;
             self.moe_decode(&w.moe)?;
             self.k.add(&self.ws.moe_y, &self.ws.h, hidden, s)?;
         }
@@ -2245,11 +2459,19 @@ impl DeviceModel {
             let p_cross_qoff = self.pcell(DecodeParams::CROSS_QOFF)?;
             for l in 0..cfg.n_cross_layers {
                 let w = &self.cross_layers[l];
-                self.k
-                    .rmsnorm(&self.ws.h, &w.attn_norm, &self.ws.x, 1, hidden, cfg.rms_eps, s)?;
+                self.k.rmsnorm(
+                    &self.ws.h,
+                    &w.attn_norm,
+                    &self.ws.x,
+                    1,
+                    hidden,
+                    cfg.rms_eps,
+                    s,
+                )?;
                 // Ring append at the device-read slot, then gather + SWA.
                 let ring = &self.seqs[&seq].rings[l];
-                self.k.append_row(&self.ws.x, ring, &p_swa_slot, hidden, s)?;
+                self.k
+                    .append_row(&self.ws.x, ring, &p_swa_slot, hidden, s)?;
                 self.k.gather_rows(
                     ring,
                     &self.ws.swa_stage,
@@ -2322,8 +2544,15 @@ impl DeviceModel {
                 self.gemm(&w.o_proj, &self.ws.attn, &self.ws.proj, 1)?;
                 self.k.add(&self.ws.proj, &self.ws.h, hidden, s)?;
                 self.k.add(&self.ws.swa_out, &self.ws.h, hidden, s)?;
-                self.k
-                    .rmsnorm(&self.ws.h, &w.ffn_norm, &self.ws.x, 1, hidden, cfg.rms_eps, s)?;
+                self.k.rmsnorm(
+                    &self.ws.h,
+                    &w.ffn_norm,
+                    &self.ws.x,
+                    1,
+                    hidden,
+                    cfg.rms_eps,
+                    s,
+                )?;
                 self.moe_decode(&w.moe)?;
                 self.k.add(&self.ws.moe_y, &self.ws.h, hidden, s)?;
             }
@@ -2348,7 +2577,11 @@ impl DeviceModel {
     /// parameter pair. Everything else is computed on the device.
     fn upload_decode_inputs(&self, token: u32, pos: usize, start: usize) -> Result<()> {
         let cfg = &self.cfg;
-        ensure!((token as usize) < cfg.vocab_size, OutOfRange, "token {token} outside the vocabulary");
+        ensure!(
+            (token as usize) < cfg.vocab_size,
+            OutOfRange,
+            "token {token} outside the vocabulary"
+        );
         self.stream
             .write_async(&self.dev, &self.ws.tokens, &[token])?;
         self.k.gather_indexed(
@@ -2510,10 +2743,7 @@ impl DeviceModel {
     ///
     /// # Errors
     /// [`Error::OutOfRange`] on a bad `eos_id`.
-    pub fn vocab_bytes_from_tokenizer(
-        tok: &dyn Tokenizer,
-        eos_id: u32,
-    ) -> Result<Vec<Vec<u8>>> {
+    pub fn vocab_bytes_from_tokenizer(tok: &dyn Tokenizer, eos_id: u32) -> Result<Vec<Vec<u8>>> {
         let vocab = tok.vocab_size();
         ensure!(
             vocab >= 1 && (eos_id as usize) < vocab,
@@ -2568,7 +2798,9 @@ impl DeviceModel {
         for _ in 0..max_tokens {
             let tok = sampler.sample(&logits, None, &mut rng)?;
             if tok as usize >= self.cfg.vocab_size {
-                return Err(Error::internal("sampler produced an out-of-vocabulary token"));
+                return Err(Error::internal(
+                    "sampler produced an out-of-vocabulary token",
+                ));
             }
             out.push(tok);
             if Some(tok) == eos {
@@ -2719,8 +2951,7 @@ mod tests {
         let Some(dev) = gpu_device() else { return };
         let cfg = ModelConfig::v41_tiny();
         let mut cpu = crate::model::DeepSeekModel::random_init(&cfg, 42).unwrap();
-        let mut gpu =
-            DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+        let mut gpu = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
         let prompt: Vec<u32> = (0..6u32).map(|t| (t * 61) % 250).collect();
         let la = cpu.prefill(7, &prompt).unwrap();
         let lb = gpu.prefill(7, &prompt).unwrap();
@@ -2929,6 +3160,190 @@ mod tests {
         assert!(e < 5e-2, "re-attached prefill rel err {e}");
     }
 
+    /// The spec-decode surface of the serve engine: `serve_verify`
+    /// returns one row per draft position and matches the sequential
+    /// `serve_decode` rows within tolerance; `serve_decode_out` also
+    /// reads the residual hidden anchor; `draft_step` proposes valid
+    /// tokens; rollback undoes the chain.
+    #[test]
+    fn serve_spec_decode_surface() {
+        let Some(dev) = gpu_device() else { return };
+        let cfg = ModelConfig::v41_tiny();
+        let mut gpu = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+        let prompt: Vec<u32> = (0..6u32).map(|t| (t * 61) % 250).collect();
+        gpu.serve_configure(2, 64, 4).unwrap();
+        gpu.serve_attach(1).unwrap();
+        let anchor = gpu.serve_prefill(1, &prompt).unwrap();
+        assert!(gpu.has_mtp(), "tiny config must carry MTP weights");
+        // Anchor hidden from a batched decode_out.
+        let out = gpu.serve_decode_out(&[(1, 5)]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].logits.len(), cfg.vocab_size);
+        assert_eq!(out[0].hidden.len(), cfg.hidden_size);
+        assert!(out[0].hidden.iter().all(|v| v.is_finite()));
+        // Host drafting from the anchor hidden.
+        let d = gpu.draft_step(5, &out[0].hidden).unwrap();
+        assert!((d.token as usize) < cfg.vocab_size);
+        assert!(d.confidence > 0.0 && d.confidence <= 1.0 + 1e-5);
+        // Verification chain: serve_verify rows vs sequential decodes.
+        let mut chain = vec![d.token];
+        let h = out[0].hidden.clone();
+        for _ in 0..2 {
+            let nd = gpu
+                .draft_step(chain.last().copied().unwrap_or(0), &h)
+                .unwrap();
+            chain.push(nd.token);
+        }
+        let rows = gpu.serve_verify(1, &chain).unwrap();
+        assert_eq!(rows.len(), chain.len());
+        for r in &rows {
+            assert_eq!(r.len(), cfg.vocab_size);
+            assert!(r.iter().all(|v| v.is_finite()));
+        }
+        // Sequential reference on a second sequence with the same prompt.
+        gpu.serve_attach(2).unwrap();
+        let _ = gpu.serve_prefill(2, &prompt).unwrap();
+        let _ = gpu.serve_decode(&[(2, 5)]).unwrap();
+        let mut seq_rows = Vec::new();
+        for &t in &chain {
+            let r = gpu.serve_decode(&[(2, t)]).unwrap();
+            seq_rows.push(r.into_iter().next().unwrap());
+        }
+        for (j, (a, b)) in rows.iter().zip(seq_rows.iter()).enumerate() {
+            let e = rel_err(a, b);
+            assert!(e < 5e-2, "verify row {j} rel err {e}");
+        }
+        assert_eq!(gpu.serve_len(1), prompt.len() + 1 + chain.len());
+        // Rollback the whole chain.
+        gpu.serve_rollback(1, chain.len()).unwrap();
+        assert_eq!(gpu.serve_len(1), prompt.len() + 1);
+        let after = gpu.serve_decode(&[(1, chain[0])]).unwrap();
+        let e = rel_err(&after[0], &seq_rows[0]);
+        assert!(e < 5e-2, "post-rollback row rel err {e}");
+        let _ = anchor;
+    }
+
+    /// The GPU prefix cache: block-granular page sharing over the paged
+    /// pools. Sequence 1 prefills a 130-token prompt (two full blocks);
+    /// sequence 2 re-prefills the same prompt and must (a) register a
+    /// hit, (b) match the cold logits, (c) decode identically. A
+    /// rollback below the frozen prefix (copy-on-write) stays exact
+    /// against a cold replay, detaching a donor keeps shared pages
+    /// alive for the next sequence, and the pressure valve frees tree
+    /// pages before allocations fail.
+    #[test]
+    fn serve_prefix_cache_reuse() {
+        let Some(dev) = gpu_device() else { return };
+        let cfg = ModelConfig::v41_tiny();
+        let mut gpu = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+        let prompt: Vec<u32> = (0..130u32).map(|t| (t * 37 + 5) % 250).collect();
+        gpu.serve_configure(4, 256, 16).unwrap();
+        gpu.serve_prefix_configure(1 << 18).unwrap();
+        // Cold run: two full blocks enter the radix tree.
+        gpu.serve_attach(1).unwrap();
+        let cold = gpu.serve_prefill(1, &prompt).unwrap();
+        let st = gpu.serve_prefix_stats();
+        assert_eq!(st.nodes, 2, "two full 64-token blocks cached");
+        assert_eq!(st.inserts, 2);
+        assert_eq!(st.cached_tokens, 128);
+        assert_eq!(st.hits, 0);
+        // Warm run: page-shared restore + the 2-token suffix prefill.
+        gpu.serve_attach(2).unwrap();
+        let warm = gpu.serve_prefill(2, &prompt).unwrap();
+        let st = gpu.serve_prefix_stats();
+        assert_eq!(st.hits, 1, "the second prefill matched the prefix");
+        assert_eq!(st.reused_tokens as usize, 128);
+        let e = rel_err(&cold, &warm);
+        assert!(e < 5e-2, "warm prefill rel err {e}");
+        assert_eq!(gpu.serve_len(2), 130);
+        // Interleaved decodes agree with the cold path.
+        let d = gpu.serve_decode(&[(1, 9), (2, 9)]).unwrap();
+        let e = rel_err(&d[0], &d[1]);
+        assert!(e < 5e-2, "warm decode rel err {e}");
+        // Copy-on-write: sequence 2 rolls back below the frozen prefix
+        // (len 120 < 128) and appends divergent tokens. The tree's
+        // snapshots must stay exact — sequence 3 replays the original
+        // prompt afterwards and must still match the cold run.
+        gpu.serve_rollback(2, 11).unwrap();
+        assert_eq!(gpu.serve_len(2), 120);
+        let alt: Vec<u32> = vec![200, 150, 99, 3];
+        let vrows = gpu.serve_verify(2, &alt).unwrap();
+        assert_eq!(vrows.len(), alt.len());
+        gpu.serve_rollback(2, alt.len()).unwrap();
+        assert_eq!(gpu.serve_len(2), 120);
+        let d2 = gpu.serve_decode(&[(2, alt[0])]).unwrap();
+        // The original prompt still restores bit-exactly.
+        gpu.serve_attach(3).unwrap();
+        let again = gpu.serve_prefill(3, &prompt).unwrap();
+        let e = rel_err(&cold, &again);
+        assert!(e < 5e-2, "post-CoW restore rel err {e}");
+        let st = gpu.serve_prefix_stats();
+        assert_eq!(st.hits, 2);
+        // The CoW'd continuation matches a cold replay of the same
+        // history (cache dropped so the replay is fully cold).
+        gpu.serve_prefix_reset();
+        gpu.serve_attach(4).unwrap();
+        let mut hist = prompt[..120].to_vec();
+        hist.push(alt[0]);
+        let cold2 = gpu.serve_prefill(4, &hist).unwrap();
+        let e = rel_err(&d2[0], &cold2);
+        assert!(e < 5e-2, "CoW divergence rel err {e}");
+        // Detach returns shared pages only when the last lease ends:
+        // after every sequence is gone the tree keeps them alive, and
+        // `serve_prefix_reset` finally frees them for reuse.
+        gpu.serve_detach(1).unwrap();
+        gpu.serve_detach(2).unwrap();
+        gpu.serve_detach(3).unwrap();
+        gpu.serve_detach(4).unwrap();
+        gpu.serve_prefix_reset();
+        let st = gpu.serve_prefix_stats();
+        assert_eq!(st.nodes, 0, "the tree is empty after the reset");
+        // A fresh cycle works end to end.
+        gpu.serve_attach(1).unwrap();
+        let fresh = gpu.serve_prefill(1, &prompt).unwrap();
+        let e = rel_err(&cold, &fresh);
+        assert!(e < 5e-2, "post-reset cold prefill rel err {e}");
+        assert_eq!(gpu.serve_prefix_stats().nodes, 2);
+    }
+
+    /// The prefix-cache pressure valve: a page-starved pool evicts
+    /// radix-tree leaves instead of failing the allocation.
+    #[test]
+    fn serve_prefix_cache_pressure_valve() {
+        let Some(dev) = gpu_device() else { return };
+        let cfg = ModelConfig::v41_tiny();
+        let mut gpu = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+        let a: Vec<u32> = (0..130u32).map(|t| (t * 37 + 5) % 250).collect();
+        let b: Vec<u32> = (0..130u32).map(|t| (t * 53 + 11) % 250).collect();
+        let c: Vec<u32> = (0..130u32).map(|t| (t * 71 + 17) % 250).collect();
+        // 6 pages total: sequences A and B each lease 3 pages and leave
+        // their two full blocks with the tree after detaching (4 leased
+        // pages, 2 free). Sequence C — a distinct prompt, so no restore
+        // — needs 3 pages: the valve must evict a tree leaf to grant
+        // the third instead of failing.
+        gpu.serve_configure(3, 256, 6).unwrap();
+        gpu.serve_prefix_configure(1 << 18).unwrap();
+        gpu.serve_attach(1).unwrap();
+        let _ = gpu.serve_prefill(1, &a).unwrap();
+        gpu.serve_detach(1).unwrap(); // the tree now holds the only leases
+        assert_eq!(gpu.serve_prefix_stats().nodes, 2);
+        assert_eq!(gpu.serve_prefix_stats().hits, 0);
+        gpu.serve_attach(2).unwrap();
+        let _ = gpu.serve_prefill(2, &b).unwrap();
+        gpu.serve_detach(2).unwrap();
+        let st = gpu.serve_prefix_stats();
+        assert_eq!(st.nodes, 4, "both prompts cached");
+        assert_eq!(st.hits, 0, "distinct prompts never match");
+        gpu.serve_attach(3).unwrap();
+        let _ = gpu.serve_prefill(3, &c).unwrap(); // forces the eviction
+        let st = gpu.serve_prefix_stats();
+        assert!(st.evictions > 0, "the pressure valve evicted tree leaves");
+        assert!(st.evictions < 4, "only as many leaves as needed");
+        // The forward still produces sane logits after the churn.
+        let out = gpu.serve_decode(&[(3, 7)]).unwrap();
+        assert!(out[0].iter().all(|v| v.is_finite()));
+    }
+
     /// The NVSHMEM-style symmetric-buffer EP against a host-computed
     /// reference (world = 1: the full dispatch -> group -> combine ->
     /// reduce protocol over one rank; multi-rank needs the multi-GPU
@@ -2946,7 +3361,9 @@ mod tests {
         let ep = deepinfer_kernels::SymmetricEp::new(mesh, k, cap, tokens, hidden).unwrap();
         // Random FP8 payloads + routing.
         let mut rng = deepinfer_core::rng::Philox::new(7, 9);
-        let xq: Vec<u8> = (0..tokens * hidden).map(|_| (rng.next_u64_from_two() & 0xff) as u8).collect();
+        let xq: Vec<u8> = (0..tokens * hidden)
+            .map(|_| (rng.next_u64_from_two() & 0xff) as u8)
+            .collect();
         let xsf: Vec<u8> = (0..tokens * (hidden / 128)).map(|_| 0x80).collect();
         let mut topk_idx: Vec<i32> = Vec::new();
         for t in 0..tokens {
@@ -2955,7 +3372,9 @@ mod tests {
                 topk_idx.push((base + kk as i32) % e as i32);
             }
         }
-        let topk_w: Vec<f32> = (0..tokens * k).map(|i| 0.25 + (i % 7) as f32 / 28.0).collect();
+        let topk_w: Vec<f32> = (0..tokens * k)
+            .map(|i| 0.25 + (i % 7) as f32 / 28.0)
+            .collect();
         let xq_b = dev.alloc_from(&xq).unwrap();
         let xsf_b = dev.alloc_from(&xsf).unwrap();
         let idx_b = dev.alloc_from(&topk_idx).unwrap();
@@ -2970,8 +3389,10 @@ mod tests {
         // Step: reset -> dispatch -> group -> (stub expert GEMM: y row =
         // f(expert)) -> combine -> reduce.
         ep.reset_all(&kern).unwrap();
-        ep.dispatch(&kern, 0, &xq_b, &xsf_b, &idx_b, tokens, e).unwrap();
-        ep.group(&kern, 0, &counters, &aq, &asf, &meta2, &drops).unwrap();
+        ep.dispatch(&kern, 0, &xq_b, &xsf_b, &idx_b, tokens, e)
+            .unwrap();
+        ep.group(&kern, 0, &counters, &aq, &asf, &meta2, &drops)
+            .unwrap();
         // Stub: y[e*cap + r] = f(e) = (e+1) * 0.5 on every dim.
         let y_host: Vec<f32> = (0..e * cap * hidden)
             .map(|i| ((i / (cap * hidden)) as f32 + 1.0) * 0.5)
@@ -2996,10 +3417,7 @@ mod tests {
                     acc += topk_w[t * k + kk] * ((ei as f32 + 1.0) * 0.5);
                 }
                 let g = got[t * hidden + d];
-                assert!(
-                    (g - acc).abs() < 1e-4,
-                    "t={t} d={d} got {g} want {acc}"
-                );
+                assert!((g - acc).abs() < 1e-4, "t={t} d={d} got {g} want {acc}");
             }
         }
     }
@@ -3035,8 +3453,10 @@ mod tests {
         let cap = 16usize; // per-rank channel capacity
         let world = 2usize;
         let mesh = deepinfer_kernels::PeerMesh::new(&devs).unwrap();
-        let kern: Vec<deepinfer_kernels::Kernels> =
-            devs.iter().map(|d| deepinfer_kernels::Kernels::new(d).unwrap()).collect();
+        let kern: Vec<deepinfer_kernels::Kernels> = devs
+            .iter()
+            .map(|d| deepinfer_kernels::Kernels::new(d).unwrap())
+            .collect();
         let ep = deepinfer_kernels::SymmetricEp::new(mesh, k, cap, tokens, hidden).unwrap();
         // Routing: token t on rank r routes experts so both ranks send.
         let mut topk_idx: Vec<i32> = Vec::new();
@@ -3046,12 +3466,16 @@ mod tests {
                 topk_idx.push(ex);
             }
         }
-        let topk_w: Vec<f32> = (0..tokens * k).map(|i| 0.125 + (i % 5) as f32 / 40.0).collect();
+        let topk_w: Vec<f32> = (0..tokens * k)
+            .map(|i| 0.125 + (i % 5) as f32 / 40.0)
+            .collect();
         // Block-contiguous ownership is exercised implicitly through
         // the kernels' `owner(e) = e * world / E` routing.
         let mut bufs = Vec::new();
         for r in 0..world {
-            let xq: Vec<u8> = (0..tokens * hidden).map(|i| ((i + r * 17) % 251) as u8).collect();
+            let xq: Vec<u8> = (0..tokens * hidden)
+                .map(|i| ((i + r * 17) % 251) as u8)
+                .collect();
             let xsf: Vec<u8> = vec![0x80; tokens * (hidden / 128)];
             let xq_b = devs[r].alloc_from(&xq).unwrap();
             let xsf_b = devs[r].alloc_from(&xsf).unwrap();
@@ -3064,17 +3488,21 @@ mod tests {
             let asf = devs[r].alloc(e * cap * (hidden / 128)).unwrap();
             let y = devs[r].alloc(e * cap * hidden * 4).unwrap();
             let out = devs[r].alloc(tokens * hidden * 4).unwrap();
-            bufs.push((xq_b, xsf_b, idx_b, w_b, counters, meta2, drops, aq, asf, y, out));
+            bufs.push((
+                xq_b, xsf_b, idx_b, w_b, counters, meta2, drops, aq, asf, y, out,
+            ));
         }
         ep.reset_all(&kern[0]).unwrap();
         for r in 0..world {
             let (xq_b, xsf_b, idx_b, _, _, _, drops, _, _, _, _) = &bufs[r];
-            ep.dispatch(&kern[r], r, xq_b, xsf_b, idx_b, tokens, e).unwrap();
+            ep.dispatch(&kern[r], r, xq_b, xsf_b, idx_b, tokens, e)
+                .unwrap();
             let _ = drops;
         }
         for r in 0..world {
             let (_, _, _, _, counters, meta2, drops, aq, asf, _, _) = &bufs[r];
-            ep.group(&kern[r], r, counters, aq, asf, meta2, drops).unwrap();
+            ep.group(&kern[r], r, counters, aq, asf, meta2, drops)
+                .unwrap();
         }
         // Stub expert outputs on each rank: y[e*cap + rank] = f(e).
         for r in 0..world {
@@ -3154,8 +3582,10 @@ mod tests {
         let d1 = dev.alloc(m * n * 4).unwrap();
         let d2 = dev.alloc(m * n * 4).unwrap();
         let s = dev.stream().unwrap();
-        k.gemm_fp8_nt(&aq_b, &asf_b, &bq_b, &bsf_b, &d1, m, n, kk, &s).unwrap();
-        k.gemm_fp8_nt_sm100(&aq_b, &asf_b, &bq_b, &bsf_b, &d2, m, n, kk, &s).unwrap();
+        k.gemm_fp8_nt(&aq_b, &asf_b, &bq_b, &bsf_b, &d1, m, n, kk, &s)
+            .unwrap();
+        k.gemm_fp8_nt_sm100(&aq_b, &asf_b, &bq_b, &bsf_b, &d2, m, n, kk, &s)
+            .unwrap();
         s.synchronize().unwrap();
         let mut g1 = vec![0.0f32; m * n];
         let mut g2 = vec![0.0f32; m * n];
@@ -3165,7 +3595,6 @@ mod tests {
         assert!(e < 1e-3, "tcgen05 vs portable rel err {e}");
         assert!(g2.iter().all(|v| v.is_finite()));
     }
-
 
     /// The AMD MFMA FP8 GEMM vs the scalar path (Instinct + the
     /// `DEEPINFER_AMD_MFMA=1` opt-in; skipped otherwise — the golden
@@ -3193,8 +3622,10 @@ mod tests {
         let d1 = dev.alloc(m * n * 4).unwrap();
         let d2 = dev.alloc(m * n * 4).unwrap();
         let s = dev.stream().unwrap();
-        k.gemm_fp8_nt(&aq_b, &asf_b, &bq_b, &bsf_b, &d1, m, n, kk, &s).unwrap();
-        k.gemm_fp8_nt_mfma(&aq_b, &asf_b, &bq_b, &bsf_b, &d2, m, n, kk, &s).unwrap();
+        k.gemm_fp8_nt(&aq_b, &asf_b, &bq_b, &bsf_b, &d1, m, n, kk, &s)
+            .unwrap();
+        k.gemm_fp8_nt_mfma(&aq_b, &asf_b, &bq_b, &bsf_b, &d2, m, n, kk, &s)
+            .unwrap();
         s.synchronize().unwrap();
         let mut g1 = vec![0.0f32; m * n];
         let mut g2 = vec![0.0f32; m * n];

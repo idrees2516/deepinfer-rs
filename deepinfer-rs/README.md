@@ -45,7 +45,14 @@ crates/
 ├── sampler    deterministic batch-invariant sampling
 ├── grammar    EBNF/JSON-Schema/Regex → DFA → adaptive token masks
 ├── scheduler  continuous batching + zero-overlap async engine
-└── runtime    the DeepSeek-V4.1-Flash model + generate + checkpoint + example
+├── runtime    the DeepSeek-V4.1-Flash model + generate + checkpoint + example
+│              (+ DeviceModel: the GPU forward path, decode graphs, paged serve)
+├── gpu        dlopen CUDA/HIP driver + NVRTC/hipRTC JIT layer
+├── kernels    embedded CUDA/HIP kernels + typed launchers (the operator layer)
+└── server     OpenAI-compatible HTTP serving: SSE streaming, continuous
+               batching, DSpark speculative decoding with per-request
+               rollback, prefix caching, adaptive draft depth, grammar-
+               constrained decoding, Prometheus metrics
 ```
 
 ## Design principles
@@ -68,9 +75,141 @@ DEEPINFER_HF_MODEL_DIR=/path/to/DeepSeek-V4.1-Flash-1017 \
 
 Environment contract (mirrors upstream): `DEEPINFER_ACCELERATOR`, `DEEPINFER_HF_MODEL_DIR`, `DEEPINFER_ENABLE_MTP_VARLEN`, `DEEPINFER_USE_NEXTN_DECODE`, `DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE`, `DEEPINFER_YOCO_PREFILL_KEEP_TOKENS`, `DEEPINFER_BATCH_INVARIANT`.
 
+## Serving (OpenAI-compatible HTTP API)
+
+The `deepinfer-server` binary serves the model over the wire — still
+with **zero external dependencies** (hand-rolled HTTP/1.1 + SSE on
+`std::net`, the workspace JSON, the workspace scheduler):
+
+```bash
+# Tiny self-check (deterministic random weights; proves the whole wire path):
+cargo run -p deepinfer-server --bin deepinfer-server -- --tiny --port 8080
+
+# Serve a checkpoint on the CPU golden engine:
+cargo run --release -p deepinfer-server --bin deepinfer-server -- \
+    --model /path/to/DeepSeek-V4.1-Flash-1017
+
+# Serve on the GPU (paged serve engine, FP8 auto):
+cargo run --release -p deepinfer-server --bin deepinfer-server -- \
+    --model /path/to/DeepSeek-V4.1-Flash-1017 --gpu
+```
+
+Then any OpenAI client works:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepinfer-rs","messages":[{"role":"user","content":"Hi"}],"max_tokens":64}'
+
+# Streaming:
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hi"}],"stream":true}'
+
+# Grammar-constrained output (JSON):
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Give me JSON"}],"response_format":{"type":"json_object"}}'
+```
+
+Endpoints: `GET /health` (engine status, degraded 503 after a failure),
+`GET /v1/models`, `POST /v1/chat/completions` (stream + non-stream,
+stop strings, `response_format` JSON Schema, native
+`structured_output` for EBNF/regex), `POST /v1/completions` (text or
+token-id prompts), `GET /metrics` (Prometheus: TTFT/latency
+histograms, token throughput, queue depth), `POST /admin/shutdown`
+(graceful drain).
+
+Operational knobs: config file (`--config`),
+`DEEPINFER_SERVER_{HOST,PORT,API_KEY,MODEL_NAME,MAX_TOKENS_CAP,MAX_PROMPT_TOKENS,REQUEST_TIMEOUT_SECS,MAX_CONNECTIONS,MAX_BODY_BYTES,SCHED_*,SPEC_DRAFT_LEN,SPEC_ADAPTIVE,PREFIX_CACHE_TOKENS}`.
+Bearer auth gates `/v1/*` when `DEEPINFER_SERVER_API_KEY` is set. A
+Dockerfile is provided (`docker run --init` for clean SIGTERM drain).
+
+**Single-process serving.** The server is one OS process, end to end:
+weights load, tokenizer, engine threads (coordinator + engine over
+`std::thread`), the accept loop and every connection worker live in the
+same address space — no forks, no subprocesses, no IPC rendezvous, no
+external runtime. (The multi-rank symmetric-EP paths exist at the
+operator layer for offline multi-GPU runs; the HTTP server never uses
+them.) This is the deployment shape the `--tiny` self-check exercises:
+`deepinfer-server --tiny` proves the whole wire path in one process,
+and the same binary serves a full checkpoint.
+
+**The byte tokenizer.** `--tokenizer auto` (default) loads the
+checkpoint's `tokenizer.json`; `--tokenizer byte` forces byte-mode
+serving: a 256-token byte-level alphabet plus the DeepSeek
+conversation pieces (`<｜begin▁of▁sentence｜>`, `<｜end▁of▁sentence｜>`,
+`<｜User｜>`, `<｜Assistant｜>`) as single tokens (ids 256-259), so the
+chat template costs 4 tokens instead of ~64 bytes of context. Any
+checkpoint serves without a `tokenizer.json` — the sampling surface is
+capped to the tokenizer's alphabet (the engine masks unreachable ids
+out of plain sampling, spec drafting and verification), and
+structured-output grammar masking uses exact per-token bytes (`0xFF`
+masks as the byte `0xFF`, never U+FFFD). Quality follows the model's
+training tokenizer — byte mode is the universal, always-works path
+(the direction Meta's Byte Latent Transformer research validates for
+byte-level models).
+
+**Prefix caching** (SGLang RadixAttention / vLLM automatic prefix
+caching, adapted to this architecture): prompts completing prefill are
+snapshotted (exact f32 KV shadow rows, DSA indexer rows, SWA rings)
+into an LRU-bounded radix tree over token ids; a later request sharing
+a prefix is admitted past it (`Scheduler::skip_prefill`) and the engine
+restores the cached state before prefilling only the suffix — a
+memory-bound copy instead of a compute-bound forward, bit-identical at
+the same chunk boundary (pinned by the runtime
+`prefix_snapshot_restore_is_bit_identical` test). Multi-turn chats,
+few-shot prompts with shared system preambles and agentic loops are
+the workloads that win. Budget: `DEEPINFER_SERVER_PREFIX_CACHE_TOKENS`
+(default 4096 tokens, 0 = off); observability:
+`deepinfer_prefix_cache_{hits,reused_tokens,inserts,entries,tokens}`.
+A scheduler eviction mid-prefill is handled exactly (the engine rolls
+the surplus rows back before re-prefilling — the rewind guard also
+closes a latent double-append on prefill restarts). On the GPU
+(`--gpu`), the same budget drives an engine-internal prefix cache
+instead: a block-granular radix tree over the paged serve pools with
+reference-counted page sharing, copy-on-write on deep rollbacks, and
+an allocation pressure valve (see `docs/GPU.md`) — metrics land on the
+same `deepinfer_prefix_cache_*` family plus
+`deepinfer_prefix_cache_evictions_total`.
+
+**Adaptive speculative depth** (vLLM dynamic-speculative-decoding-style):
+each request tracks an acceptance EMA and retargets its draft depth
+toward `round(ema·(depth+1)) − 1` — a rejecting workload decays to
+single-token rounds (speculation stops costing throughput as
+concurrency rises), an accepting one keeps the full chain. Greedy
+parity is unaffected (verification is prefix-exact for any depth);
+`DEEPINFER_SERVER_SPEC_ADAPTIVE=false` pins the fixed depth. The
+scheduler still bills the configured `depth + 1` rows per step
+(conservative budget accounting).
+
+The serving engine is the same continuous-batching scheduler as the
+offline path, with per-request sampling state, grammar masking,
+cancellation on client disconnect, per-request error isolation, and
+slot recycling with exact cache teardown — CI asserts the served
+greedy stream is **bit-identical to `generate()`**.
+See `docs/UZU-COMPARISON.md` for how this stacks up against uzu, and
+the `deepinfer-server` crate docs for the architecture.
+
+**DSpark speculative serving.** When the model carries MTP (NEXTN)
+weights, every decode step runs a speculative round per request:
+draft up to `DEEPINFER_SERVER_SPEC_DRAFT_LEN` (default 5, 0 = off)
+tokens with the MTP head under the DSpark confidence scheduler,
+verify the chain against the target in one call, roll the rejected
+tail back out of the paged caches (per-sequence, page-recycling), and
+emit the accepted prefix plus the bonus token; the bonus decodes of
+the whole batch share one `serve_decode` launch on the GPU engine.
+Structured-output requests get grammar-aware speculation (draft-time
+masking + masked verification rows + DFA state snapshots) — beyond
+the offline path, which disables speculation under a grammar. Greedy
+parity is pinned in CI: **spec serve == plain serve == `generate()`**,
+with and without grammars, under batching. `deepinfer_spec_*`
+Prometheus series track rounds, drafts, accepted/bonus tokens and
+rollbacks.
+
 ## Tests
 
-415 tests across 14 crates: unit + property-based (deterministic seeded harness), including golden-numerics checks against paper formulas, exact-semantics checks against the FlashMLA README pseudocode, brute-force grammar/mask validation, regex-vs-naive-backtracker properties, dispatch/combine round-trips, MTP greedy-consistency (speculative ON == speculative OFF under temperature 0), and end-to-end generation determinism.
+534 tests across 17 crates: unit + property-based (deterministic seeded harness), including golden-numerics checks against paper formulas, exact-semantics checks against the FlashMLA README pseudocode, brute-force grammar/mask validation, regex-vs-naive-backtracker properties, dispatch/combine round-trips, MTP greedy-consistency (speculative ON == speculative OFF under temperature 0, offline **and** on the batched serve path), and end-to-end generation determinism.
 
 ## Scope notes
 

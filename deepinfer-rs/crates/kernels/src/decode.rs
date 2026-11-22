@@ -139,7 +139,11 @@ impl StepGeometry {
     pub fn new(max_s_kv: usize, topk: usize, block: usize, per: usize) -> Result<StepGeometry> {
         ensure!(max_s_kv >= 1, InvalidArgument, "max_s_kv must be >= 1");
         ensure!(topk >= 1, InvalidArgument, "topk must be >= 1");
-        ensure!((1..=1024).contains(&block), InvalidArgument, "preselect block in [1, 1024]");
+        ensure!(
+            (1..=1024).contains(&block),
+            InvalidArgument,
+            "preselect block in [1, 1024]"
+        );
         ensure!(per >= 1, InvalidArgument, "per must be >= 1");
         let num_blocks = ceil_div(max_s_kv, block);
         let cands_cap = num_blocks
@@ -176,7 +180,11 @@ impl Kernels {
         topk: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(params.len() >= DecodeParams::COUNT * 4, InvalidArgument, "params cell too small");
+        ensure!(
+            params.len() >= DecodeParams::COUNT * 4,
+            InvalidArgument,
+            "params cell too small"
+        );
         self.launch1d(
             "di_step_params_kernel",
             1,
@@ -209,7 +217,11 @@ impl Kernels {
             h.max(1),
             128,
             0,
-            KernelArgs::new().ptr(pos_q).ptr(pos_kv).ptr(p_pos).i32(h as i32),
+            KernelArgs::new()
+                .ptr(pos_q)
+                .ptr(pos_kv)
+                .ptr(p_pos)
+                .i32(h as i32),
             stream,
         )
     }
@@ -251,7 +263,11 @@ impl Kernels {
     ) -> Result<()> {
         ensure!(d >= 32, InvalidArgument, "kv encode needs D >= 32");
         let group = if kernel.contains("fp8") { 32 } else { 16 };
-        ensure!(d % group == 0, InvalidArgument, "D must be a multiple of the group size");
+        ensure!(
+            d % group == 0,
+            InvalidArgument,
+            "D must be a multiple of the group size"
+        );
         let warps_per_block = 64 / self.warp_size() as usize;
         let grid = (d / group).div_ceil(warps_per_block).max(1);
         let f = self.f(kernel)?;
@@ -307,7 +323,11 @@ impl Kernels {
         hd: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(nh >= 1 && hd >= 1, InvalidArgument, "append_norm_row needs nh/hd >= 1");
+        ensure!(
+            nh >= 1 && hd >= 1,
+            InvalidArgument,
+            "append_norm_row needs nh/hd >= 1"
+        );
         self.launch1d(
             "di_append_norm_row_kernel",
             nh,
@@ -339,10 +359,14 @@ impl Kernels {
         quant_block: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(dim >= 1 && quant_block >= 1, InvalidArgument, "lightning needs dim/quant_block >= 1");
-        let per_block = quant_block
-            .checked_mul(dim)
-            .ok_or_else(|| deepinfer_core::Error::CapacityExceeded("block elems overflow".into()))?;
+        ensure!(
+            dim >= 1 && quant_block >= 1,
+            InvalidArgument,
+            "lightning needs dim/quant_block >= 1"
+        );
+        let per_block = quant_block.checked_mul(dim).ok_or_else(|| {
+            deepinfer_core::Error::CapacityExceeded("block elems overflow".into())
+        })?;
         // 1) zero the block's atomic amax cell
         self.launch1d(
             "di_lightning_block_zero_dev_kernel",
@@ -563,7 +587,11 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         ensure!(s_q > 0, InvalidArgument, "select needs s_q > 0");
-        ensure!(geo.block <= 1024, InvalidArgument, "preselect block must be <= 1024");
+        ensure!(
+            geo.block <= 1024,
+            InvalidArgument,
+            "preselect block must be <= 1024"
+        );
         // 1) zero the candidate buffer (padding keys must be 0)
         self.fill_zero(cands_a, s_q * geo.cands_cap * 8, stream)?;
         // 2) per-block preselect over the device-read s_kv, fixed grid
@@ -726,7 +754,7 @@ mod tests {
         assert_eq!(p[DecodeParams::SWA_QOFF], 2);
         assert_eq!(p[DecodeParams::TOPK], 7);
         assert_eq!(p[DecodeParams::SWA_START], 0); // (6 - 3) % 3
-        // Window larger than len clamps.
+                                                   // Window larger than len clamps.
         let q = fanout_params(0, 0, 512, 128, 2048, 2048);
         assert_eq!(q[DecodeParams::LEN], 1);
         assert_eq!(q[DecodeParams::ROW], 0);

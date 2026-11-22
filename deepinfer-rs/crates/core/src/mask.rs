@@ -43,7 +43,11 @@ impl TokenMask {
     /// Allows token `id`.
     pub fn set(&mut self, id: u32) {
         let id = id as usize;
-        assert!(id < self.vocab, "token id {id} out of vocab {vocab}", vocab = self.vocab);
+        assert!(
+            id < self.vocab,
+            "token id {id} out of vocab {vocab}",
+            vocab = self.vocab
+        );
         self.bits[id / 64] |= 1u64 << (id % 64);
         self.any_set = true;
     }

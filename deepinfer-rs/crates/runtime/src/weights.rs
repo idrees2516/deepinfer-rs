@@ -82,9 +82,8 @@ pub(crate) struct ModelWeights {
 /// failure.
 pub(crate) fn zeros(len: usize) -> Result<Vec<f32>> {
     let mut v = Vec::new();
-    v.try_reserve_exact(len).map_err(|_| {
-        Error::CapacityExceeded(format!("cannot allocate {len} f32 values"))
-    })?;
+    v.try_reserve_exact(len)
+        .map_err(|_| Error::CapacityExceeded(format!("cannot allocate {len} f32 values")))?;
     v.resize(len, 0.0);
     Ok(v)
 }
@@ -183,7 +182,11 @@ fn total_floats(cfg: &ModelConfig) -> Result<u64> {
             .ok_or_else(|| Error::CapacityExceeded("parameter count overflows u64".into()))?;
         Ok(())
     };
-    let (h, hd, vocab) = (cfg.hidden_size as u64, cfg.head_dim as u64, cfg.vocab_size as u64);
+    let (h, hd, vocab) = (
+        cfg.hidden_size as u64,
+        cfg.head_dim as u64,
+        cfg.vocab_size as u64,
+    );
     add(vocab * h)?; // embed
     if !cfg.tie_word_embeddings {
         add(vocab * h)?; // lm_head
@@ -191,15 +194,17 @@ fn total_floats(cfg: &ModelConfig) -> Result<u64> {
     add(h)?; // final_norm
     let per_mlp = |mo: &deepinfer_moe::MoeConfig| -> Result<u64> {
         let experts = (mo.num_shared + mo.num_routed) as u64;
-        Ok(mo.num_routed as u64 * h + mo.num_routed as u64
+        Ok(mo.num_routed as u64 * h
+            + mo.num_routed as u64
             + experts * (2 * mo.intermediate as u64 * h + h * mo.intermediate as u64))
     };
     for _ in 0..cfg.n_self_layers {
         add(cfg.q_lora_rank as u64 * h)?; // q_a
         add(cfg.n_heads as u64 * hd * cfg.q_lora_rank as u64)?; // q_b
         add(hd * h)?; // kv_a
-        add(cfg.o_groups as u64 * cfg.o_lora_rank as u64 * (cfg.n_heads as u64
-            / cfg.o_groups as u64)
+        add(cfg.o_groups as u64
+            * cfg.o_lora_rank as u64
+            * (cfg.n_heads as u64 / cfg.o_groups as u64)
             * hd)?; // wv
         add(h * cfg.o_groups as u64 * cfg.o_lora_rank as u64)?; // wo
         add(hd - cfg.rope_dim as u64)?; // kv_norm
@@ -251,14 +256,22 @@ pub(crate) fn random_init(cfg: &ModelConfig, seed: u64) -> Result<ModelWeights> 
         let indexer = random_indexer(&mut rng, cfg)?;
         let mla = MlaWeights {
             q_a_proj: fill_fan(&mut rng, cfg.q_lora_rank * h, h)?,
-            q_b_proj: fill_fan(&mut rng, cfg.n_heads * hd * cfg.q_lora_rank, cfg.q_lora_rank)?,
+            q_b_proj: fill_fan(
+                &mut rng,
+                cfg.n_heads * hd * cfg.q_lora_rank,
+                cfg.q_lora_rank,
+            )?,
             kv_a_proj: fill_fan(&mut rng, hd * h, h)?,
             wv_proj: fill_fan(
                 &mut rng,
                 cfg.o_groups * cfg.o_lora_rank * (cfg.n_heads / cfg.o_groups) * hd,
                 (cfg.n_heads / cfg.o_groups) * hd,
             )?,
-            wo_proj: fill_fan(&mut rng, h * cfg.o_groups * cfg.o_lora_rank, cfg.o_groups * cfg.o_lora_rank)?,
+            wo_proj: fill_fan(
+                &mut rng,
+                h * cfg.o_groups * cfg.o_lora_rank,
+                cfg.o_groups * cfg.o_lora_rank,
+            )?,
             q_norm: None,
             kv_norm: unit_gain(latent)?,
             attn_sink: None,
@@ -375,14 +388,8 @@ mod tests {
             a.self_layers[1].mla.kv_a_proj,
             b.self_layers[1].mla.kv_a_proj
         );
-        assert_eq!(
-            a.cross_layers[0].q_proj,
-            b.cross_layers[0].q_proj
-        );
-        assert_eq!(
-            a.self_layers[0].moe.gate,
-            b.self_layers[0].moe.gate
-        );
+        assert_eq!(a.cross_layers[0].q_proj, b.cross_layers[0].q_proj);
+        assert_eq!(a.self_layers[0].moe.gate, b.self_layers[0].moe.gate);
         assert!(a.mtp.is_some());
 
         let h = cfg.hidden_size;
@@ -396,7 +403,10 @@ mod tests {
         assert_eq!(sl.mla.q_b_proj.len(), cfg.n_heads * hd * cfg.q_lora_rank);
         assert_eq!(sl.mla.kv_a_proj.len(), hd * h);
         assert_eq!(sl.mla.kv_norm.len(), hd - cfg.rope_dim);
-        assert_eq!(sl.indexer.wq.len(), cfg.dsa.num_heads * cfg.dsa.head_dim * h);
+        assert_eq!(
+            sl.indexer.wq.len(),
+            cfg.dsa.num_heads * cfg.dsa.head_dim * h
+        );
         assert_eq!(sl.moe.gate.len(), cfg.moe.num_routed * h);
         assert_eq!(sl.moe.routed.len(), cfg.moe.num_routed);
         assert_eq!(sl.moe.shared.len(), cfg.moe.num_shared);

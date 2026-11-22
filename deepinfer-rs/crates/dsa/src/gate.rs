@@ -165,8 +165,16 @@ mod tests {
         assert!((thunder[1] - 10.0).abs() < 1e-6, "{}", thunder[1]);
         // i = 1: g_t = sigma(0) = 0.5, g_c = sigma(1) -> weighted average.
         let denom = 0.5f32 + 0.731_058_6;
-        assert!((thunder[2] - 30.0 * 0.5 / denom).abs() < 1e-4, "{}", thunder[2]);
-        assert!((thunder[3] - 40.0 * 0.5 / denom).abs() < 1e-4, "{}", thunder[3]);
+        assert!(
+            (thunder[2] - 30.0 * 0.5 / denom).abs() < 1e-4,
+            "{}",
+            thunder[2]
+        );
+        assert!(
+            (thunder[3] - 40.0 * 0.5 / denom).abs() < 1e-4,
+            "{}",
+            thunder[3]
+        );
     }
 
     #[test]
@@ -204,7 +212,9 @@ mod tests {
         let mut pos_inf = [f32::INFINITY; 2];
         assert!(gate_and_combine(&[1.0, 1.0], 1, 2, &[0.0; 8], &mut pos_inf, &cv).is_err()); // +inf
         let mut odd = [0.0f32; 3];
-        assert!(gate_and_combine(&[1.0, 1.0, 1.0, 1.0], 2, 2, &[0.0; 8], &mut odd, &[0.0; 3]).is_err()); // not divisible
+        assert!(
+            gate_and_combine(&[1.0, 1.0, 1.0, 1.0], 2, 2, &[0.0; 8], &mut odd, &[0.0; 3]).is_err()
+        ); // not divisible
     }
 
     #[test]

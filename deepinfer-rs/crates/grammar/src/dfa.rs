@@ -166,9 +166,9 @@ pub fn determinize(nfa: &Nfa, max_states: usize) -> Result<Dfa> {
                         "grammar DFA exceeds the state cap of {} states (exponential subset blowup); increase GrammarLimits::max_dfa_states if you trust the grammar",
                         max_states
                     );
-                    total_elems = total_elems
-                        .checked_add(closed.len())
-                        .ok_or_else(|| Error::CapacityExceeded("grammar DFA size overflow".into()))?;
+                    total_elems = total_elems.checked_add(closed.len()).ok_or_else(|| {
+                        Error::CapacityExceeded("grammar DFA size overflow".into())
+                    })?;
                     ensure!(
                         total_elems <= max_total_elems,
                         CapacityExceeded,
@@ -189,7 +189,10 @@ pub fn determinize(nfa: &Nfa, max_states: usize) -> Result<Dfa> {
         i += 1;
     }
 
-    Ok(prune_live(Dfa { trans, accepting: acc }))
+    Ok(prune_live(Dfa {
+        trans,
+        accepting: acc,
+    }))
 }
 
 fn max_steps_guard(max_states: usize) -> usize {
@@ -409,11 +412,9 @@ mod tests {
     fn state_cap_enforced() {
         // "an 'a' 20-from-last" requires 2^20 DFA states (classic subset
         // blowup); the small NFA determinizes past any modest cap.
-        let nfa = crate::regex::compile_regex_nfa(
-            "[ab]*a[ab]{20}",
-            &crate::GrammarLimits::default(),
-        )
-        .unwrap();
+        let nfa =
+            crate::regex::compile_regex_nfa("[ab]*a[ab]{20}", &crate::GrammarLimits::default())
+                .unwrap();
         assert!(matches!(
             determinize(&nfa, 1000),
             Err(Error::CapacityExceeded(_))
@@ -441,7 +442,10 @@ mod tests {
         let c1 = builder2.frag_class(&cls).unwrap().unwrap();
         let c2 = builder2.frag_class(&cls).unwrap().unwrap();
         let c3 = builder2.frag_class(&cls).unwrap().unwrap();
-        let f2 = builder2.seq(vec![Some(c1), Some(c2), Some(c3)]).unwrap().unwrap();
+        let f2 = builder2
+            .seq(vec![Some(c1), Some(c2), Some(c3)])
+            .unwrap()
+            .unwrap();
         let nfa2 = builder2.finish(Some(f2)).unwrap();
         let d2 = determinize(&nfa2, 1000).unwrap();
 

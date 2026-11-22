@@ -227,7 +227,10 @@ mod tests {
         );
         assert!(r.env.enable_mtp_varlen);
         assert_eq!(r.env.use_nextn_decode, 3);
-        assert_eq!(r.env.yoco_prefill_truncation_mode, YocoTruncationMode::Compact);
+        assert_eq!(
+            r.env.yoco_prefill_truncation_mode,
+            YocoTruncationMode::Compact
+        );
         assert_eq!(r.env.yoco_prefill_keep_tokens, 140);
         assert!(r.env.batch_invariant);
         assert!(r.warnings.is_empty());

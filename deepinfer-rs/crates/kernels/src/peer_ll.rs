@@ -40,7 +40,10 @@ impl std::fmt::Debug for SymmetricHeap {
             .field("cap", &self.cap)
             .field("tokens_max", &self.tokens_max)
             .field("hidden", &self.hidden)
-            .field("bytes", &heap_bytes(self.k_channels, self.cap, self.tokens_max, self.hidden))
+            .field(
+                "bytes",
+                &heap_bytes(self.k_channels, self.cap, self.tokens_max, self.hidden),
+            )
             .finish()
     }
 }
@@ -93,7 +96,11 @@ impl SymmetricHeap {
         ensure!(k_channels >= 1, InvalidArgument, "k_channels must be >= 1");
         ensure!(cap >= 1, InvalidArgument, "cap must be >= 1");
         ensure!(tokens_max >= 1, InvalidArgument, "tokens_max must be >= 1");
-        ensure!(hidden % 128 == 0, InvalidArgument, "hidden must be a multiple of 128");
+        ensure!(
+            hidden % 128 == 0,
+            InvalidArgument,
+            "hidden must be a multiple of 128"
+        );
         let bytes = heap_bytes(k_channels, cap, tokens_max, hidden);
         let buf = dev
             .alloc(bytes)
@@ -155,7 +162,15 @@ impl Session {
     ///
     /// # Errors
     /// [`Error::Internal`] on I/O failure.
-    pub fn publish(&self, rank: usize, handle: &[u8; 64], k: usize, cap: usize, tokens: usize, hidden: usize) -> Result<()> {
+    pub fn publish(
+        &self,
+        rank: usize,
+        handle: &[u8; 64],
+        k: usize,
+        cap: usize,
+        tokens: usize,
+        hidden: usize,
+    ) -> Result<()> {
         let mut blob = Vec::with_capacity(64 + 16);
         blob.extend_from_slice(handle);
         blob.extend_from_slice(&(k as u32).to_le_bytes());
@@ -190,14 +205,13 @@ impl Session {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         std::thread::sleep(std::time::Duration::from_millis(25));
                     }
-                    Err(e) => {
-                        return Err(Error::internal(format!("read rank{r}: {e}")))
-                    }
+                    Err(e) => return Err(Error::internal(format!("read rank{r}: {e}"))),
                 }
             };
             let mut handle = [0u8; 64];
             handle.copy_from_slice(&blob[0..64]);
-            let rd = |o: usize| u32::from_le_bytes(blob[o..o + 4].try_into().expect("4 bytes")) as usize;
+            let rd =
+                |o: usize| u32::from_le_bytes(blob[o..o + 4].try_into().expect("4 bytes")) as usize;
             out.push((handle, rd(64), rd(68), rd(72), rd(76)));
         }
         Ok(out)
@@ -281,8 +295,11 @@ impl SymmetricEp {
         tokens_max: usize,
         hidden: usize,
     ) -> Result<SymmetricEp> {
-        ensure!(mesh.world() == 1, InvalidArgument,
-            "a multi-process SymmetricEp uses a single-device mesh (one process per rank)");
+        ensure!(
+            mesh.world() == 1,
+            InvalidArgument,
+            "a multi-process SymmetricEp uses a single-device mesh (one process per rank)"
+        );
         let dev = mesh.device(0);
         let my_heap = SymmetricHeap::alloc(dev, k, cap, tokens_max, hidden)?;
         let handle = dev.ipc_export(&my_heap.buf)?;
@@ -416,8 +433,12 @@ impl SymmetricEp {
         num_experts: usize,
     ) -> Result<()> {
         let world = self.world();
-        ensure!(tokens <= self.tokens_max, CapacityExceeded,
-            "dispatch of {tokens} tokens exceeds tokens_max = {}", self.tokens_max);
+        ensure!(
+            tokens <= self.tokens_max,
+            CapacityExceeded,
+            "dispatch of {tokens} tokens exceeds tokens_max = {}",
+            self.tokens_max
+        );
         let s = self.mesh.stream(r);
         let f = k.f("di_ep_dispatch_ll_kernel")?;
         f.launch(
@@ -612,10 +633,8 @@ mod tests {
 
     #[test]
     fn session_roundtrips_a_record() {
-        let dir = std::env::temp_dir().join(format!(
-            "deepinfer-ep-session-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("deepinfer-ep-session-test-{}", std::process::id()));
         let s = Session::new(&dir).expect("session dir");
         let mut h = [7u8; 64];
         h[0] = 42;

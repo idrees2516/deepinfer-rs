@@ -51,7 +51,12 @@ impl DType {
             DType::F32 | DType::I32 => 4,
             DType::I64 => 8,
             DType::F16 | DType::BF16 | DType::I16 | DType::U16 => 2,
-            DType::E4M3 | DType::E5M2 | DType::E8M0 | DType::E2M1 | DType::I8 | DType::U8
+            DType::E4M3
+            | DType::E5M2
+            | DType::E8M0
+            | DType::E2M1
+            | DType::I8
+            | DType::U8
             | DType::Bool => 1,
         }
     }
@@ -60,7 +65,13 @@ impl DType {
     pub const fn is_float(self) -> bool {
         matches!(
             self,
-            DType::F32 | DType::F16 | DType::BF16 | DType::E4M3 | DType::E5M2 | DType::E8M0 | DType::E2M1
+            DType::F32
+                | DType::F16
+                | DType::BF16
+                | DType::E4M3
+                | DType::E5M2
+                | DType::E8M0
+                | DType::E2M1
         )
     }
 

@@ -7,10 +7,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/deepseek-ai/DeepInfer"
-homepage = "https://github.com/deepseek-ai/DeepInfer"
-keywords = ["deepseek", "inference", "llm", "mla", "moe"]
-categories = ["science"]
+repository = "https://github.com/idrees2516/deepinfer-rs"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -33,8 +30,6 @@ deepinfer-mla = { path = "crates/mla" }
 deepinfer-dsa = { path = "crates/dsa" }
 deepinfer-swa = { path = "crates/swa" }
 deepinfer-moe = { path = "crates/moe" }
-deepinfer-eplb = { path = "crates/eplb" }
-deepinfer-ep = { path = "crates/ep" }
 deepinfer-mtp = { path = "crates/mtp" }
 deepinfer-sampler = { path = "crates/sampler" }
 deepinfer-grammar = { path = "crates/grammar" }

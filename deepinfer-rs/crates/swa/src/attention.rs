@@ -259,16 +259,15 @@ mod tests {
         let out = swa_attention(&[1.0f32; 6], &[], &[], 10, 2, 3, 1, 8, 1.0).unwrap();
         assert_eq!(out, vec![0.0f32; 6]);
         // (b) keys only in the future of every query.
-        let out = swa_attention(&[1.0f32; 2], &[1.0f32, 2.0f32], &[50], 10, 1, 1, 2, 8, 1.0)
-            .unwrap();
+        let out =
+            swa_attention(&[1.0f32; 2], &[1.0f32, 2.0f32], &[50], 10, 1, 1, 2, 8, 1.0).unwrap();
         assert_eq!(out, vec![0.0f32, 0.0f32]);
         // (c) keys too far in the past.
-        let out = swa_attention(&[1.0f32; 2], &[1.0f32, 2.0f32], &[0], 100, 1, 1, 2, 8, 1.0)
-            .unwrap();
+        let out =
+            swa_attention(&[1.0f32; 2], &[1.0f32, 2.0f32], &[0], 100, 1, 1, 2, 8, 1.0).unwrap();
         assert_eq!(out, vec![0.0f32, 0.0f32]);
         // (d) window == 0 masks everything, even the query's own position.
-        let out = swa_attention(&[1.0f32; 2], &[1.0f32, 2.0f32], &[5], 5, 1, 1, 2, 0, 1.0)
-            .unwrap();
+        let out = swa_attention(&[1.0f32; 2], &[1.0f32, 2.0f32], &[5], 5, 1, 1, 2, 0, 1.0).unwrap();
         assert_eq!(out, vec![0.0f32, 0.0f32]);
     }
 
@@ -426,12 +425,33 @@ mod tests {
                 rng.uniform_f32(0.1, 1.0)
             };
             let got = swa_attention(
-                &q, &kv, &kv_positions, q_offset, s_q, h, d, window, sm_scale,
+                &q,
+                &kv,
+                &kv_positions,
+                q_offset,
+                s_q,
+                h,
+                d,
+                window,
+                sm_scale,
             )?;
             let want = dense_reference(
-                &q, &kv, &kv_positions, q_offset, s_q, h, d, window, sm_scale,
+                &q,
+                &kv,
+                &kv_positions,
+                q_offset,
+                s_q,
+                h,
+                d,
+                window,
+                sm_scale,
             );
-            assert_close_slice(&got, &want, 1e-4, "swa_attention vs dense window-mask reference");
+            assert_close_slice(
+                &got,
+                &want,
+                1e-4,
+                "swa_attention vs dense window-mask reference",
+            );
             Ok(())
         });
     }

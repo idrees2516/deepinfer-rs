@@ -69,9 +69,7 @@ fn main() {
         let dir = model_dir
             .or_else(|| env.hf_model_dir.clone())
             .unwrap_or_else(|| {
-                eprintln!(
-                    "no model directory: pass --model <dir> or set DEEPINFER_HF_MODEL_DIR"
-                );
+                eprintln!("no model directory: pass --model <dir> or set DEEPINFER_HF_MODEL_DIR");
                 std::process::exit(2);
             });
         println!("loading checkpoint from {} ...", dir.display());
@@ -80,41 +78,38 @@ fn main() {
             eprintln!("cannot read {}: {e}", cfg_path.display());
             std::process::exit(2);
         });
-        let cfg_json = deepinfer_core::json::Json::parse(&cfg_text)
-            .unwrap_or_else(|e| {
-                eprintln!("invalid config.json: {e}");
-                std::process::exit(2);
-            });
-        let cfg = ModelConfig::from_json(&cfg_json)
-            .unwrap_or_else(|e| {
-                eprintln!("config error: {e}");
-                std::process::exit(2);
-            });
+        let cfg_json = deepinfer_core::json::Json::parse(&cfg_text).unwrap_or_else(|e| {
+            eprintln!("invalid config.json: {e}");
+            std::process::exit(2);
+        });
+        let cfg = ModelConfig::from_json(&cfg_json).unwrap_or_else(|e| {
+            eprintln!("config error: {e}");
+            std::process::exit(2);
+        });
         let model = DeepSeekModel::load_checkpoint(&dir, &cfg).unwrap_or_else(|e| {
             eprintln!("checkpoint error: {e}");
             std::process::exit(2);
         });
         // tokenizer.json (GPT-2-style BPE) when present, else bytes.
-        let tok: Box<dyn Tokenizer> =
-            match std::fs::read_to_string(dir.join("tokenizer.json")) {
-                Ok(text) => match deepinfer_core::json::Json::parse(&text) {
-                    Ok(json) => Box::new(
-                        deepinfer_core::tokenizer::BpeTokenizer::from_tokenizer_json(&json)
-                            .unwrap_or_else(|e| {
-                                eprintln!("tokenizer error: {e}");
-                                std::process::exit(2);
-                            }),
-                    ),
-                    Err(e) => {
-                        eprintln!("invalid tokenizer.json ({e}); falling back to bytes");
-                        Box::new(ByteTokenizer::new(0).expect("byte tokenizer"))
-                    }
-                },
-                Err(_) => {
-                    println!("no tokenizer.json; using byte tokenizer");
+        let tok: Box<dyn Tokenizer> = match std::fs::read_to_string(dir.join("tokenizer.json")) {
+            Ok(text) => match deepinfer_core::json::Json::parse(&text) {
+                Ok(json) => Box::new(
+                    deepinfer_core::tokenizer::BpeTokenizer::from_tokenizer_json(&json)
+                        .unwrap_or_else(|e| {
+                            eprintln!("tokenizer error: {e}");
+                            std::process::exit(2);
+                        }),
+                ),
+                Err(e) => {
+                    eprintln!("invalid tokenizer.json ({e}); falling back to bytes");
                     Box::new(ByteTokenizer::new(0).expect("byte tokenizer"))
                 }
-            };
+            },
+            Err(_) => {
+                println!("no tokenizer.json; using byte tokenizer");
+                Box::new(ByteTokenizer::new(0).expect("byte tokenizer"))
+            }
+        };
         let eos = tok.eos_token_id();
         (model, tok, eos)
     };
@@ -146,8 +141,13 @@ fn main() {
     println!("generation finished in {:?}", start.elapsed());
 
     for (i, out) in outputs.iter().enumerate() {
-        let text = tokenizer.decode(&out.tokens).unwrap_or_else(|_| "<decode error>".into());
-        println!("\n--- prompt #{i}: {:?} ---", prompts.get(i).map(String::as_str).unwrap_or(""));
+        let text = tokenizer
+            .decode(&out.tokens)
+            .unwrap_or_else(|_| "<decode error>".into());
+        println!(
+            "\n--- prompt #{i}: {:?} ---",
+            prompts.get(i).map(String::as_str).unwrap_or("")
+        );
         println!("tokens: {:?}", out.tokens);
         println!("finish: {}", out.finish);
         println!("text:   {text}");
@@ -168,7 +168,10 @@ fn main() {
             .iter()
             .zip(outputs2.iter())
             .all(|(a, b)| a.tokens == b.tokens && a.finish == b.finish);
-        println!("\ndeterminism self-check: {}", if same { "PASS" } else { "FAIL" });
+        println!(
+            "\ndeterminism self-check: {}",
+            if same { "PASS" } else { "FAIL" }
+        );
         assert!(same, "tiny self-test must be deterministic");
     }
 }

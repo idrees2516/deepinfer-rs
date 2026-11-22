@@ -118,12 +118,15 @@ impl EplbConfig {
             "EplbConfig: num_gpus must be >= 1, got {}",
             self.num_gpus
         );
-        let physical = self.num_logical.checked_add(self.num_replicas).ok_or_else(|| {
-            Error::CapacityExceeded(format!(
-                "EplbConfig: num_logical ({}) + num_replicas ({}) overflows usize",
-                self.num_logical, self.num_replicas
-            ))
-        })?;
+        let physical = self
+            .num_logical
+            .checked_add(self.num_replicas)
+            .ok_or_else(|| {
+                Error::CapacityExceeded(format!(
+                    "EplbConfig: num_logical ({}) + num_replicas ({}) overflows usize",
+                    self.num_logical, self.num_replicas
+                ))
+            })?;
         ensure!(
             self.num_logical % self.num_groups == 0,
             InvalidArgument,
@@ -165,7 +168,13 @@ impl EplbConfig {
 mod tests {
     use super::*;
 
-    fn cfg(logical: usize, replicas: usize, groups: usize, nodes: usize, gpus: usize) -> EplbConfig {
+    fn cfg(
+        logical: usize,
+        replicas: usize,
+        groups: usize,
+        nodes: usize,
+        gpus: usize,
+    ) -> EplbConfig {
         EplbConfig {
             num_logical: logical,
             num_replicas: replicas,
@@ -189,9 +198,7 @@ mod tests {
         assert!(cfg(4, 0, 1, 1, 0).validate().is_err()); // num_gpus = 0
         assert!(cfg(5, 0, 2, 1, 2).validate().is_err()); // 5 % 2 != 0
         assert!(cfg(2, 0, 1, 1, 4).validate().is_err()); // 2 physical < 4 gpus
-        assert!(cfg(usize::MAX, usize::MAX, 1, 1, 1)
-            .validate()
-            .is_err()); // logical + replicas overflows
+        assert!(cfg(usize::MAX, usize::MAX, 1, 1, 1).validate().is_err()); // logical + replicas overflows
         assert!(cfg(4, 1, 2, 2, 4).validate().is_ok());
         assert!(cfg(4, 1, 2, 3, 4).validate().is_ok()); // global fallback is valid
     }

@@ -1,11 +1,11 @@
 //! Normal-mode dispatch and receive (DeepEP `intranode_dispatch` /
 //! `internode_dispatch` + `recv` semantics, simulated in-process).
 
+use crate::align_up;
 use crate::config::EpConfig;
 use crate::handle::DispatchHandle;
 use crate::hook::EpHook;
 use crate::payload::{decode_payload, quantize_payload, DispatchPayload};
-use crate::align_up;
 use deepinfer_core::{ensure, Error, Result};
 
 /// Result of [`recv`]: the rows destined for one rank, plus the
@@ -57,7 +57,9 @@ pub(crate) fn validate_routing(
         "k ({k}) must be <= u32::MAX"
     );
     let pairs = tokens.checked_mul(k).ok_or_else(|| {
-        Error::CapacityExceeded(format!("dispatch: tokens ({tokens}) * k ({k}) overflows usize"))
+        Error::CapacityExceeded(format!(
+            "dispatch: tokens ({tokens}) * k ({k}) overflows usize"
+        ))
     })?;
     ensure!(
         topk_idx.len() == pairs,
@@ -211,7 +213,10 @@ fn validate_handle(cfg: &EpConfig, handle: &DispatchHandle) -> Result<()> {
         handle.topk_weights.len()
     );
     ensure!(
-        handle.topk_idx.iter().all(|&e| (e as usize) < cfg.num_experts),
+        handle
+            .topk_idx
+            .iter()
+            .all(|&e| (e as usize) < cfg.num_experts),
         OutOfRange,
         "recv: handle.topk_idx contains an expert >= num_experts ({})",
         cfg.num_experts

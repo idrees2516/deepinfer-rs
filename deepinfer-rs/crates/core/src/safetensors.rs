@@ -6,7 +6,6 @@
 //! panic, and never an out-of-bounds access.
 use crate::ensure;
 
-
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::json::Json;
@@ -102,7 +101,9 @@ impl SafeTensorsFile {
             let offsets = val
                 .get("data_offsets")
                 .and_then(Json::as_arr)
-                .ok_or_else(|| Error::Checkpoint(format!("tensor {key:?}: missing data_offsets")))?;
+                .ok_or_else(|| {
+                    Error::Checkpoint(format!("tensor {key:?}: missing data_offsets"))
+                })?;
             ensure!(
                 offsets.len() == 2,
                 Checkpoint,
@@ -114,8 +115,10 @@ impl SafeTensorsFile {
             let end = offsets[1]
                 .as_u64()
                 .ok_or_else(|| Error::Checkpoint(format!("tensor {key:?}: bad end offset")))?;
-            let begin = usize::try_from(begin).map_err(|_| Error::Checkpoint("offset overflow".into()))?;
-            let end = usize::try_from(end).map_err(|_| Error::Checkpoint("offset overflow".into()))?;
+            let begin =
+                usize::try_from(begin).map_err(|_| Error::Checkpoint("offset overflow".into()))?;
+            let end =
+                usize::try_from(end).map_err(|_| Error::Checkpoint("offset overflow".into()))?;
             ensure!(end >= begin, Checkpoint, "tensor {key:?}: end < begin");
             let numel: usize = shape.iter().product();
             let expected = numel
@@ -181,9 +184,12 @@ impl SafeTensorsFile {
 
     /// Loads one tensor (data region slice is copied out).
     pub fn tensor(&self, name: &str) -> Result<Tensor> {
-        let m = self
-            .meta(name)
-            .ok_or_else(|| Error::Checkpoint(format!("tensor {name:?} not found in {}", self.path.display())))?;
+        let m = self.meta(name).ok_or_else(|| {
+            Error::Checkpoint(format!(
+                "tensor {name:?} not found in {}",
+                self.path.display()
+            ))
+        })?;
         let file = fs::File::open(&self.path)
             .map_err(|e| Error::Io(format!("{}: {e}", self.path.display())))?;
         use std::io::{Read, Seek, SeekFrom};
@@ -236,7 +242,12 @@ impl CheckpointDir {
             }
         }
         names.sort();
-        ensure!(!names.is_empty(), Checkpoint, "no *.safetensors in {}", dir.display());
+        ensure!(
+            !names.is_empty(),
+            Checkpoint,
+            "no *.safetensors in {}",
+            dir.display()
+        );
 
         for p in names {
             let f = SafeTensorsFile::open(&p)?;
@@ -264,10 +275,12 @@ impl CheckpointDir {
 
     /// Loads one tensor by name.
     pub fn tensor(&self, name: &str) -> Result<Tensor> {
-        let fi = *self
-            .index
-            .get(name)
-            .ok_or_else(|| Error::Checkpoint(format!("tensor {name:?} not found in {}", self.dir.display())))?;
+        let fi = *self.index.get(name).ok_or_else(|| {
+            Error::Checkpoint(format!(
+                "tensor {name:?} not found in {}",
+                self.dir.display()
+            ))
+        })?;
         self.files[fi].tensor(name)
     }
 
@@ -283,10 +296,9 @@ mod tests {
 
     fn write_st_file(path: &Path, name: &str) {
         // header: one f32 tensor shape [2,2]
-        let header = format!(
-            r#"{{"{name}":{{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}}}}"#
-        )
-        .into_bytes();
+        let header =
+            format!(r#"{{"{name}":{{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}}}}"#)
+                .into_bytes();
         let mut out = Vec::new();
         out.extend_from_slice(&(header.len() as u64).to_le_bytes());
         out.extend_from_slice(&header);

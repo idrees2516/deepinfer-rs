@@ -76,7 +76,11 @@ impl Kernels {
         eps: f32,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(rows > 0 && cols > 0, InvalidArgument, "rmsnorm needs rows/cols > 0");
+        ensure!(
+            rows > 0 && cols > 0,
+            InvalidArgument,
+            "rmsnorm needs rows/cols > 0"
+        );
         self.launch1d(
             "di_rmsnorm_kernel",
             rows,
@@ -195,7 +199,11 @@ impl Kernels {
         group: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(cols % group == 0, InvalidArgument, "cols must be a multiple of group");
+        ensure!(
+            cols % group == 0,
+            InvalidArgument,
+            "cols must be a multiple of group"
+        );
         let warps_per_block = 256 / self.warp_size() as usize;
         let total_warps = rows * (cols / group);
         let grid = total_warps.div_ceil(warps_per_block);
@@ -253,7 +261,11 @@ impl Kernels {
         kernel: &'static str,
         stream: &Stream,
     ) -> Result<()> {
-        let group = if kernel.ends_with("fp8_kernel") { 32 } else { 16 };
+        let group = if kernel.ends_with("fp8_kernel") {
+            32
+        } else {
+            16
+        };
         let warps_per_block = 64 / self.warp_size() as usize;
         let total_warps = tokens * (dims / group);
         let grid = total_warps.div_ceil(warps_per_block);
@@ -289,13 +301,23 @@ impl Kernels {
         eps: f32,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(rows > 0 && hd > 0 && latent > 0 && latent <= hd, InvalidArgument, "latent norm needs 0 < latent <= hd");
+        ensure!(
+            rows > 0 && hd > 0 && latent > 0 && latent <= hd,
+            InvalidArgument,
+            "latent norm needs 0 < latent <= hd"
+        );
         self.launch1d(
             "di_latent_norm_kernel",
             rows,
             256,
             0,
-            KernelArgs::new().ptr(kv).ptr(gain).i32(rows as i32).i32(hd as i32).i32(latent as i32).f32(eps),
+            KernelArgs::new()
+                .ptr(kv)
+                .ptr(gain)
+                .i32(rows as i32)
+                .i32(hd as i32)
+                .i32(latent as i32)
+                .f32(eps),
             stream,
         )
     }
@@ -311,7 +333,11 @@ impl Kernels {
         floats: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(rows > 0 && floats > 0, InvalidArgument, "append_rows needs rows/floats > 0");
+        ensure!(
+            rows > 0 && floats > 0,
+            InvalidArgument,
+            "append_rows needs rows/floats > 0"
+        );
         self.launch1d(
             "di_append_rows_kernel",
             rows * floats,
@@ -338,7 +364,11 @@ impl Kernels {
         hd: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(rows > 0 && nh > 0 && hd > 0, InvalidArgument, "append_norm_rows needs positive dims");
+        ensure!(
+            rows > 0 && nh > 0 && hd > 0,
+            InvalidArgument,
+            "append_norm_rows needs positive dims"
+        );
         self.launch1d(
             "di_append_norm_rows_kernel",
             rows * nh,
@@ -370,7 +400,11 @@ impl Kernels {
         cols: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(rows > 0 && cols > 0, InvalidArgument, "copy_cols needs rows/cols > 0");
+        ensure!(
+            rows > 0 && cols > 0,
+            InvalidArgument,
+            "copy_cols needs rows/cols > 0"
+        );
         self.launch1d(
             "di_copy_cols_kernel",
             rows * cols,

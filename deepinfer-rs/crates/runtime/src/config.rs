@@ -268,8 +268,7 @@ impl ModelConfig {
             self.q_lora_rank
         );
         ensure!(
-            self.max_position_embeddings >= 1
-                && self.max_position_embeddings <= MAX_POSITIONS,
+            self.max_position_embeddings >= 1 && self.max_position_embeddings <= MAX_POSITIONS,
             OutOfRange,
             "max_position_embeddings must be in [1, {MAX_POSITIONS}] (got {})",
             self.max_position_embeddings
@@ -351,19 +350,52 @@ impl ModelConfig {
             );
         }
         let m = &self.moe;
-        ensure!(m.hidden == self.hidden_size, InvalidArgument,
-            "moe.hidden ({}) must equal hidden_size ({})", m.hidden, self.hidden_size);
-        ensure!(m.intermediate >= 1 && m.intermediate <= MAX_HIDDEN_SIZE,
-            OutOfRange, "moe.intermediate must be in [1, {MAX_HIDDEN_SIZE}] (got {})", m.intermediate);
-        ensure!(m.num_routed >= 1 && m.num_routed <= MAX_WINDOW,
-            OutOfRange, "moe.num_routed must be in [1, {MAX_WINDOW}] (got {})", m.num_routed);
-        ensure!(m.num_activated >= 1 && m.num_activated <= m.num_routed,
-            InvalidArgument, "moe.num_activated ({}) must be in [1, num_routed {}]", m.num_activated, m.num_routed);
-        ensure!(m.num_shared <= MAX_WINDOW, OutOfRange, "moe.num_shared must be <= {MAX_WINDOW} (got {})", m.num_shared);
-        ensure!(m.group_size >= 1, InvalidArgument, "moe.group_size must be >= 1 (got {})", m.group_size);
-        ensure!(m.num_routed % m.group_size == 0 && m.num_activated % m.group_size == 0,
-            InvalidArgument, "moe.group_size ({}) must divide num_routed ({}) and num_activated ({})",
-            m.group_size, m.num_routed, m.num_activated);
+        ensure!(
+            m.hidden == self.hidden_size,
+            InvalidArgument,
+            "moe.hidden ({}) must equal hidden_size ({})",
+            m.hidden,
+            self.hidden_size
+        );
+        ensure!(
+            m.intermediate >= 1 && m.intermediate <= MAX_HIDDEN_SIZE,
+            OutOfRange,
+            "moe.intermediate must be in [1, {MAX_HIDDEN_SIZE}] (got {})",
+            m.intermediate
+        );
+        ensure!(
+            m.num_routed >= 1 && m.num_routed <= MAX_WINDOW,
+            OutOfRange,
+            "moe.num_routed must be in [1, {MAX_WINDOW}] (got {})",
+            m.num_routed
+        );
+        ensure!(
+            m.num_activated >= 1 && m.num_activated <= m.num_routed,
+            InvalidArgument,
+            "moe.num_activated ({}) must be in [1, num_routed {}]",
+            m.num_activated,
+            m.num_routed
+        );
+        ensure!(
+            m.num_shared <= MAX_WINDOW,
+            OutOfRange,
+            "moe.num_shared must be <= {MAX_WINDOW} (got {})",
+            m.num_shared
+        );
+        ensure!(
+            m.group_size >= 1,
+            InvalidArgument,
+            "moe.group_size must be >= 1 (got {})",
+            m.group_size
+        );
+        ensure!(
+            m.num_routed % m.group_size == 0 && m.num_activated % m.group_size == 0,
+            InvalidArgument,
+            "moe.group_size ({}) must divide num_routed ({}) and num_activated ({})",
+            m.group_size,
+            m.num_routed,
+            m.num_activated
+        );
         self.mtp.validate()?;
         ensure!(
             self.mtp.hidden == self.hidden_size && self.mtp.vocab == self.vocab_size,
@@ -442,11 +474,10 @@ impl ModelConfig {
             Some(v) => usize_of(v, "vocab_size")?,
             None => 129_280,
         };
-        let max_position_embeddings =
-            match field(&["max_position_embeddings"]) {
-                Some(v) => usize_of(v, "max_position_embeddings")?,
-                None => 163_840,
-            };
+        let max_position_embeddings = match field(&["max_position_embeddings"]) {
+            Some(v) => usize_of(v, "max_position_embeddings")?,
+            None => 163_840,
+        };
         let o_groups = match field(&["o_groups", "n_wv_group"]) {
             Some(v) => usize_of(v, "o_groups")?,
             None => 8,
@@ -532,7 +563,11 @@ impl ModelConfig {
             None
         };
         let usize_of = |v: u64, what: &str| -> Result<usize> {
-            ensure!(v <= usize::MAX as u64, Checkpoint, "{what} value {v} exceeds usize");
+            ensure!(
+                v <= usize::MAX as u64,
+                Checkpoint,
+                "{what} value {v} exceeds usize"
+            );
             Ok(v as usize)
         };
         let conv_kernels = match node.get("conv_kernels").and_then(Json::as_arr) {
@@ -615,7 +650,11 @@ impl ModelConfig {
             None
         };
         let usize_of = |v: u64, what: &str| -> Result<usize> {
-            ensure!(v <= usize::MAX as u64, Checkpoint, "{what} value {v} exceeds usize");
+            ensure!(
+                v <= usize::MAX as u64,
+                Checkpoint,
+                "{what} value {v} exceeds usize"
+            );
             Ok(v as usize)
         };
         Ok(MoeConfig {
@@ -628,7 +667,11 @@ impl ModelConfig {
                 Some(v) => usize_of(v, "moe.num_routed")?,
                 None => default.num_routed,
             },
-            num_activated: match get(&["num_activated", "num_experts_per_tok", "n_activated_experts"]) {
+            num_activated: match get(&[
+                "num_activated",
+                "num_experts_per_tok",
+                "n_activated_experts",
+            ]) {
                 Some(v) => usize_of(v, "moe.num_activated")?,
                 None => default.num_activated,
             },
@@ -753,19 +796,15 @@ mod tests {
 
     #[test]
     fn from_json_rejects_inconsistent_yoco_split() {
-        let json = Json::parse(
-            r#"{"n_layers": 4, "n_self_layers": 3, "n_cross_layers": 3}"#,
-        )
-        .unwrap();
+        let json =
+            Json::parse(r#"{"n_layers": 4, "n_self_layers": 3, "n_cross_layers": 3}"#).unwrap();
         assert!(ModelConfig::from_json(&json).is_err());
     }
 
     #[test]
     fn from_json_rejects_absorbed_dim_mismatch() {
-        let json = Json::parse(
-            r#"{"head_dim": 512, "rope_dim": 64, "kv_lora_rank": 384}"#,
-        )
-        .unwrap();
+        let json =
+            Json::parse(r#"{"head_dim": 512, "rope_dim": 64, "kv_lora_rank": 384}"#).unwrap();
         let err = ModelConfig::from_json(&json).unwrap_err();
         assert!(err.to_string().contains("kv_lora_rank"), "{err}");
     }

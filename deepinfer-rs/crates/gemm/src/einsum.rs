@@ -50,14 +50,24 @@ pub fn fp8_einsum_bhr_hdr_bhd(
     let out_len = prod(bh, d, "b*h*d")?;
     let w_len = prod(hd, r, "h*d*r")?;
     let wsf_len = prod(hd, rb, "h*d*r_blocks")?;
-    ensure!(q.len() == q_len, DimensionMismatch, "q has {} bytes, expected b*h*r = {q_len}", q.len());
+    ensure!(
+        q.len() == q_len,
+        DimensionMismatch,
+        "q has {} bytes, expected b*h*r = {q_len}",
+        q.len()
+    );
     ensure!(
         q_sf.len() == qsf_len,
         DimensionMismatch,
         "q_sf has {} scales, expected b*h*ceil(r/group) = {qsf_len}",
         q_sf.len()
     );
-    ensure!(w.len() == w_len, DimensionMismatch, "w has {} bytes, expected h*d*r = {w_len}", w.len());
+    ensure!(
+        w.len() == w_len,
+        DimensionMismatch,
+        "w has {} bytes, expected h*d*r = {w_len}",
+        w.len()
+    );
     ensure!(
         w_sf.len() == wsf_len,
         DimensionMismatch,
@@ -97,7 +107,9 @@ pub fn fp8_einsum_bhr_hdr_bhd(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deepinfer_core::format::{e4m3_to_f32, e8m0_to_f32, f32_to_e4m3_rne, f32_to_e8m0, E8M0Round};
+    use deepinfer_core::format::{
+        e4m3_to_f32, e8m0_to_f32, f32_to_e4m3_rne, f32_to_e8m0, E8M0Round,
+    };
     use deepinfer_core::prop::{prop, random_vec};
     use deepinfer_core::rng::Philox;
     use deepinfer_core::Result;
@@ -129,7 +141,8 @@ mod tests {
             let s = e8m0_to_f32(sb);
             scales[g] = sb;
             for (kk, &v) in seg.iter().enumerate() {
-                values[g * group + kk] = f32_to_e4m3_rne(if v.is_nan() { 0.0 } else { v } / s, true);
+                values[g * group + kk] =
+                    f32_to_e4m3_rne(if v.is_nan() { 0.0 } else { v } / s, true);
             }
         }
         (values, scales)
@@ -155,7 +168,8 @@ mod tests {
             let s = e4m3_to_f32(s_byte);
             scales[g] = s_byte;
             for (kk, &v) in seg.iter().enumerate() {
-                values[g * group + kk] = f32_to_e4m3_rne(if v.is_nan() { 0.0 } else { v } / s, true);
+                values[g * group + kk] =
+                    f32_to_e4m3_rne(if v.is_nan() { 0.0 } else { v } / s, true);
             }
         }
         Ok((values, scales))
@@ -216,9 +230,13 @@ mod tests {
             w_bytes.extend_from_slice(&wv);
             wsf_bytes.extend_from_slice(&ws);
         }
-        let out = fp8_einsum_bhr_hdr_bhd(&q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group)?;
+        let out = fp8_einsum_bhr_hdr_bhd(
+            &q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group,
+        )?;
         assert_eq!(out.len(), b * h * d);
-        let reference = einsum_reference(&q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group);
+        let reference = einsum_reference(
+            &q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group,
+        );
         for (idx, (&o, &rf)) in out.iter().zip(reference.iter()).enumerate() {
             let tol = 1e-3 * (1.0 + rf.abs());
             assert!(
@@ -228,7 +246,9 @@ mod tests {
             );
         }
         // Determinism.
-        let out2 = fp8_einsum_bhr_hdr_bhd(&q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group)?;
+        let out2 = fp8_einsum_bhr_hdr_bhd(
+            &q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group,
+        )?;
         assert_eq!(out, out2);
         Ok(())
     }
@@ -258,8 +278,12 @@ mod tests {
             w_bytes.extend_from_slice(&wv);
             wsf_bytes.extend_from_slice(&ws);
         }
-        let out = fp8_einsum_bhr_hdr_bhd(&q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group)?;
-        let reference = einsum_reference(&q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group);
+        let out = fp8_einsum_bhr_hdr_bhd(
+            &q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group,
+        )?;
+        let reference = einsum_reference(
+            &q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group,
+        );
         for (idx, (&o, &rf)) in out.iter().zip(reference.iter()).enumerate() {
             let tol = 1e-3 * (1.0 + rf.abs());
             assert!((o - rf).abs() <= tol, "index {idx}: {o} vs {rf}");
@@ -315,14 +339,19 @@ mod tests {
                 w_bytes.extend_from_slice(&wv);
                 wsf_bytes.extend_from_slice(&ws);
             }
-            let out = fp8_einsum_bhr_hdr_bhd(&q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group)?;
-            let reference =
-                einsum_reference(&q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group);
+            let out = fp8_einsum_bhr_hdr_bhd(
+                &q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group,
+            )?;
+            let reference = einsum_reference(
+                &q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group,
+            );
             for (idx, (&o, &rf)) in out.iter().zip(reference.iter()).enumerate() {
                 let tol = 1e-3 * (1.0 + rf.abs());
                 ensure!((o - rf).abs() <= tol, Internal, "idx {idx}: {o} vs {rf}");
             }
-            let out2 = fp8_einsum_bhr_hdr_bhd(&q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group)?;
+            let out2 = fp8_einsum_bhr_hdr_bhd(
+                &q_bytes, &qsf_bytes, &w_bytes, &wsf_bytes, b, h, d, r, group,
+            )?;
             ensure!(out == out2, Internal, "nondeterministic");
             Ok(())
         });

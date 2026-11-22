@@ -76,9 +76,8 @@ pub(crate) fn sigmoid(x: f32) -> f32 {
 
 /// Checked multiplication for allocation-size math (DoS guard).
 pub(crate) fn checked_dim(a: usize, b: usize, what: &str) -> Result<usize> {
-    a.checked_mul(b).ok_or_else(|| {
-        Error::CapacityExceeded(format!("{what}: {a} * {b} overflows usize"))
-    })
+    a.checked_mul(b)
+        .ok_or_else(|| Error::CapacityExceeded(format!("{what}: {a} * {b} overflows usize")))
 }
 
 /// Ensures every element of `x` is finite.
@@ -122,12 +121,28 @@ pub fn indexer_forward(
     s_q: usize,
     s_kv: usize,
 ) -> Result<Vec<i32>> {
-    ensure!(cfg.hidden_size >= 1, InvalidArgument, "hidden_size must be >= 1");
-    ensure!(cfg.num_heads >= 1, InvalidArgument, "num_heads must be >= 1");
+    ensure!(
+        cfg.hidden_size >= 1,
+        InvalidArgument,
+        "hidden_size must be >= 1"
+    );
+    ensure!(
+        cfg.num_heads >= 1,
+        InvalidArgument,
+        "num_heads must be >= 1"
+    );
     ensure!(cfg.head_dim >= 1, InvalidArgument, "head_dim must be >= 1");
-    ensure!(cfg.quant_block >= 1, InvalidArgument, "quant_block must be >= 1");
+    ensure!(
+        cfg.quant_block >= 1,
+        InvalidArgument,
+        "quant_block must be >= 1"
+    );
     if let Some(xw) = cfg.extrapolation_window {
-        ensure!(xw >= 1, InvalidArgument, "extrapolation_window must be >= 1");
+        ensure!(
+            xw >= 1,
+            InvalidArgument,
+            "extrapolation_window must be >= 1"
+        );
     }
     let hidden = cfg.hidden_size;
     let index_dim = checked_dim(cfg.num_heads, cfg.head_dim, "index dim")?;
@@ -218,8 +233,10 @@ pub fn indexer_forward(
     for i in 0..s_q {
         let qi = &q[i * index_dim..(i + 1) * index_dim];
         for h in 0..cfg.num_heads {
-            hw[i * cfg.num_heads + h] =
-                dot(&w.weights_proj[h * index_dim..h * index_dim + index_dim], qi);
+            hw[i * cfg.num_heads + h] = dot(
+                &w.weights_proj[h * index_dim..h * index_dim + index_dim],
+                qi,
+            );
         }
     }
 
@@ -278,13 +295,19 @@ mod tests {
         let mut q = vec![0.0f32; s_q * d];
         for i in 0..s_q {
             for r in 0..d {
-                q[i * d + r] = dot(&w.wq[r * hidden..r * hidden + hidden], &qh[i * hidden..(i + 1) * hidden]);
+                q[i * d + r] = dot(
+                    &w.wq[r * hidden..r * hidden + hidden],
+                    &qh[i * hidden..(i + 1) * hidden],
+                );
             }
         }
         let mut k = vec![0.0f32; s_kv * d];
         for j in 0..s_kv {
             for r in 0..d {
-                k[j * d + r] = dot(&w.wk[r * hidden..r * hidden + hidden], &kh[j * hidden..(j + 1) * hidden]);
+                k[j * d + r] = dot(
+                    &w.wk[r * hidden..r * hidden + hidden],
+                    &kh[j * hidden..(j + 1) * hidden],
+                );
             }
         }
         let mut hw = vec![0.0f32; s_q * cfg.num_heads];
@@ -294,9 +317,18 @@ mod tests {
                     dot(&w.weights_proj[h * d..h * d + d], &q[i * d..(i + 1) * d]);
             }
         }
-        let mut thunder =
-            thunder_scores(&q, &k, &hw, s_q, s_kv, cfg.num_heads, cfg.head_dim, cfg.quant_block, true)
-                .unwrap();
+        let mut thunder = thunder_scores(
+            &q,
+            &k,
+            &hw,
+            s_q,
+            s_kv,
+            cfg.num_heads,
+            cfg.head_dim,
+            cfg.quant_block,
+            true,
+        )
+        .unwrap();
         let gain = weights::conv_norm_gain_from_wk(&w.wk, d, hidden);
         let conv = conv_scores(&q, &k, s_q, s_kv, d, &w.conv_weights, &gain, true).unwrap();
         gate_and_combine(&qh, s_q, hidden, &w.gate_proj, &mut thunder, &conv).unwrap();

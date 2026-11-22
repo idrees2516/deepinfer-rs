@@ -608,11 +608,7 @@ impl Kernels {
         f.launch(
             self.device(),
             Launch {
-                grid: (
-                    splits as u32,
-                    h.div_ceil(8).max(1) as u32,
-                    (b * sq) as u32,
-                ),
+                grid: (splits as u32, h.div_ceil(8).max(1) as u32, (b * sq) as u32),
                 block: (8 * 32, 1, 1),
                 shared: 0,
             },
@@ -704,11 +700,7 @@ impl Kernels {
         f.launch(
             self.device(),
             Launch {
-                grid: (
-                    sq.div_ceil(8).max(1) as u32,
-                    h as u32,
-                    b as u32,
-                ),
+                grid: (sq.div_ceil(8).max(1) as u32, h as u32, b as u32),
                 block: (8 * 32, 1, 1),
                 shared: 0,
             },
@@ -752,11 +744,7 @@ impl Kernels {
         f.launch(
             self.device(),
             Launch {
-                grid: (
-                    sq.div_ceil(8).max(1) as u32,
-                    h as u32,
-                    b as u32,
-                ),
+                grid: (sq.div_ceil(8).max(1) as u32, h as u32, b as u32),
                 block: (8 * 32, 1, 1),
                 shared: 0,
             },

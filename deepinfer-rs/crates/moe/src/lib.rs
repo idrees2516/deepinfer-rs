@@ -122,7 +122,9 @@ pub fn moe_forward(w: &MoeWeights, cfg: &MoeConfig, x: &[f32], tokens: usize) ->
     w.validate_against(cfg)?;
     let h = cfg.hidden;
     let need = tokens.checked_mul(h).ok_or_else(|| {
-        Error::CapacityExceeded(format!("moe_forward: tokens ({tokens}) * hidden ({h}) overflows usize"))
+        Error::CapacityExceeded(format!(
+            "moe_forward: tokens ({tokens}) * hidden ({h}) overflows usize"
+        ))
     })?;
     ensure!(
         x.len() == need,
@@ -139,7 +141,11 @@ pub fn moe_forward(w: &MoeWeights, cfg: &MoeConfig, x: &[f32], tokens: usize) ->
     let routings = w.route_batch(cfg, x, tokens)?;
     for t in 0..tokens {
         let xt = &x[t * h..(t + 1) * h];
-        for (&e, &wgt) in routings[t].topk_idx.iter().zip(routings[t].topk_weights.iter()) {
+        for (&e, &wgt) in routings[t]
+            .topk_idx
+            .iter()
+            .zip(routings[t].topk_weights.iter())
+        {
             let ew = w.routed.get(e as usize).ok_or_else(|| {
                 Error::OutOfRange(format!(
                     "moe_forward: routing selected expert {e} but only {} routed experts exist",
@@ -265,10 +271,16 @@ mod tests {
         let y = moe_forward(&w, &cfg, &x, tokens).unwrap();
         let r = w.route(&cfg, &x).unwrap();
         assert_eq!(r.topk_idx.len(), 1);
-        let routed = w.expert_forward(r.topk_idx[0] as usize, &x, tokens).unwrap();
+        let routed = w
+            .expert_forward(r.topk_idx[0] as usize, &x, tokens)
+            .unwrap();
         for d in 0..cfg.hidden {
             let expect = shared[d] + r.topk_weights[0] * routed[d];
-            assert!((y[d] - expect).abs() < 1e-5, "y[{d}] = {} vs {expect}", y[d]);
+            assert!(
+                (y[d] - expect).abs() < 1e-5,
+                "y[{d}] = {} vs {expect}",
+                y[d]
+            );
         }
     }
 

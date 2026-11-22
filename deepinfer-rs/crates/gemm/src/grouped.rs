@@ -73,15 +73,29 @@ pub fn m_grouped_fp8_gemm_nt_contiguous(
     let out_len = prod(m, n, "m*n")?;
     let nb = n.div_ceil(SF_GROUP_K);
     let b_len = prod(prod(num_groups, n, "num_groups*n")?, k, "num_groups*n*k")?;
-    let bsf_len = prod(prod(num_groups, nb, "num_groups*n_blocks")?, kb, "group scale count")?;
-    ensure!(a.len() == mk, DimensionMismatch, "a has {} bytes, expected m*k = {mk}", a.len());
+    let bsf_len = prod(
+        prod(num_groups, nb, "num_groups*n_blocks")?,
+        kb,
+        "group scale count",
+    )?;
+    ensure!(
+        a.len() == mk,
+        DimensionMismatch,
+        "a has {} bytes, expected m*k = {mk}",
+        a.len()
+    );
     ensure!(
         a_sf.len() == asf_len,
         DimensionMismatch,
         "a_sf has {} scales, expected m*(k/128) = {asf_len}",
         a_sf.len()
     );
-    ensure!(b.len() == b_len, DimensionMismatch, "b has {} bytes, expected num_groups*n*k = {b_len}", b.len());
+    ensure!(
+        b.len() == b_len,
+        DimensionMismatch,
+        "b has {} bytes, expected num_groups*n*k = {b_len}",
+        b.len()
+    );
     ensure!(
         b_sf.len() == bsf_len,
         DimensionMismatch,
@@ -201,16 +215,30 @@ pub fn m_grouped_fp8_gemm_nt_masked(
         masked_m.len()
     );
     for (g, &mm) in masked_m.iter().enumerate() {
-        ensure!(mm <= m_max, OutOfRange, "masked_m[{g}] = {mm} exceeds m_max = {m_max}");
+        ensure!(
+            mm <= m_max,
+            OutOfRange,
+            "masked_m[{g}] = {mm} exceeds m_max = {m_max}"
+        );
     }
-    ensure!(a.len() == a_len, DimensionMismatch, "a has {} bytes, expected num_groups*m_max*k = {a_len}", a.len());
+    ensure!(
+        a.len() == a_len,
+        DimensionMismatch,
+        "a has {} bytes, expected num_groups*m_max*k = {a_len}",
+        a.len()
+    );
     ensure!(
         a_sf.len() == asf_len,
         DimensionMismatch,
         "a_sf has {} scales, expected num_groups*m_max*(k/128) = {asf_len}",
         a_sf.len()
     );
-    ensure!(b.len() == b_len, DimensionMismatch, "b has {} bytes, expected num_groups*n*k = {b_len}", b.len());
+    ensure!(
+        b.len() == b_len,
+        DimensionMismatch,
+        "b has {} bytes, expected num_groups*n*k = {b_len}",
+        b.len()
+    );
     ensure!(
         b_sf.len() == bsf_len,
         DimensionMismatch,
@@ -282,7 +310,12 @@ mod tests {
         n: usize,
         k: usize,
     ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
-        let num_groups = layout.iter().copied().max().map(|g| g as usize + 1).unwrap_or(0);
+        let num_groups = layout
+            .iter()
+            .copied()
+            .max()
+            .map(|g| g as usize + 1)
+            .unwrap_or(0);
         let m = layout.len() * 128;
         let a = random_matrix(rng, m, k, 1.0);
         let mut bq_all = Vec::new();
@@ -311,8 +344,7 @@ mod tests {
             let nb = n.div_ceil(128);
             let b_g = &bq_all[g * n * k..(g + 1) * n * k];
             let bsf_g = &bsf_all[g * nb * (k / 128)..(g + 1) * nb * (k / 128)];
-            let dense =
-                fp8_gemm_nt(a_g, asf_g, b_g, bsf_g, rows, n, k, None)?;
+            let dense = fp8_gemm_nt(a_g, asf_g, b_g, bsf_g, rows, n, k, None)?;
             expected.push(dense);
         }
         Ok((out, expected))
@@ -363,33 +395,93 @@ mod tests {
         for &g in &[0u32, 1, 0, 1] {
             mi.extend(std::iter::repeat_n(g, 128));
         }
-        assert!(m_grouped_fp8_gemm_nt_contiguous(&aq, &asf, &bq, &bsf, &mi, 256, n, k, num_groups).is_err());
+        assert!(
+            m_grouped_fp8_gemm_nt_contiguous(&aq, &asf, &bq, &bsf, &mi, 256, n, k, num_groups)
+                .is_err()
+        );
         // k not a multiple of 128.
         let mi4 = vec![0u32; 256];
-        assert!(m_grouped_fp8_gemm_nt_contiguous(&aq, &asf, &bq, &bsf, &mi4, 256, n, 127, num_groups).is_err());
+        assert!(m_grouped_fp8_gemm_nt_contiguous(
+            &aq, &asf, &bq, &bsf, &mi4, 256, n, 127, num_groups
+        )
+        .is_err());
         // Buffer length mismatches.
-        assert!(m_grouped_fp8_gemm_nt_contiguous(&aq[..mk - 1], &asf, &bq, &bsf, &mi4, 256, n, k, num_groups)
-            .is_err());
-        assert!(m_grouped_fp8_gemm_nt_contiguous(&aq, &asf[..255], &bq, &bsf, &mi4, 256, n, k, num_groups)
-            .is_err());
-        assert!(m_grouped_fp8_gemm_nt_contiguous(&aq, &asf, &bq[..num_groups * n * k - 1], &bsf, &mi4, 256, n, k, num_groups)
-            .is_err());
-        assert!(m_grouped_fp8_gemm_nt_contiguous(&aq, &asf, &bq, &bsf[..bsf.len() - 1], &mi4, 256, n, k, num_groups)
-            .is_err());
+        assert!(m_grouped_fp8_gemm_nt_contiguous(
+            &aq[..mk - 1],
+            &asf,
+            &bq,
+            &bsf,
+            &mi4,
+            256,
+            n,
+            k,
+            num_groups
+        )
+        .is_err());
+        assert!(m_grouped_fp8_gemm_nt_contiguous(
+            &aq,
+            &asf[..255],
+            &bq,
+            &bsf,
+            &mi4,
+            256,
+            n,
+            k,
+            num_groups
+        )
+        .is_err());
+        assert!(m_grouped_fp8_gemm_nt_contiguous(
+            &aq,
+            &asf,
+            &bq[..num_groups * n * k - 1],
+            &bsf,
+            &mi4,
+            256,
+            n,
+            k,
+            num_groups
+        )
+        .is_err());
+        assert!(m_grouped_fp8_gemm_nt_contiguous(
+            &aq,
+            &asf,
+            &bq,
+            &bsf[..bsf.len() - 1],
+            &mi4,
+            256,
+            n,
+            k,
+            num_groups
+        )
+        .is_err());
         // Unaligned group row count: 100 rows of group 0 (m = 100).
         let a100 = random_matrix(&mut rng, 100, k, 1.0);
         let (aq100, asf100) = quantize_per_token_group(&a100, k, 128)?;
         let mi100 = vec![0u32; 100];
-        assert!(m_grouped_fp8_gemm_nt_contiguous(&aq100, &asf100, &bq, &bsf, &mi100, 100, n, k, num_groups)
-            .is_err());
+        assert!(m_grouped_fp8_gemm_nt_contiguous(
+            &aq100, &asf100, &bq, &bsf, &mi100, 100, n, k, num_groups
+        )
+        .is_err());
         // Index out of range and m_indices length mismatch (m = 128).
         let a128 = random_matrix(&mut rng, 128, k, 1.0);
         let (aq128, asf128) = quantize_per_token_group(&a128, k, 128)?;
         let mi3 = vec![5u32; 128];
-        assert!(m_grouped_fp8_gemm_nt_contiguous(&aq128, &asf128, &bq, &bsf, &mi3, 128, n, k, num_groups)
-            .is_err());
-        assert!(m_grouped_fp8_gemm_nt_contiguous(&aq128, &asf128, &bq, &bsf, &mi3[..127], 128, n, k, num_groups)
-            .is_err());
+        assert!(m_grouped_fp8_gemm_nt_contiguous(
+            &aq128, &asf128, &bq, &bsf, &mi3, 128, n, k, num_groups
+        )
+        .is_err());
+        assert!(m_grouped_fp8_gemm_nt_contiguous(
+            &aq128,
+            &asf128,
+            &bq,
+            &bsf,
+            &mi3[..127],
+            128,
+            n,
+            k,
+            num_groups
+        )
+        .is_err());
         Ok(())
     }
 
@@ -454,22 +546,73 @@ mod tests {
             bsf.extend_from_slice(&bsf_g);
         }
         let masked = [2usize, 4];
-        let ok = m_grouped_fp8_gemm_nt_masked(&aq, &asf, &bq, &bsf, &masked, m_max, n, k, num_groups);
+        let ok =
+            m_grouped_fp8_gemm_nt_masked(&aq, &asf, &bq, &bsf, &masked, m_max, n, k, num_groups);
         assert!(ok.is_ok());
-        assert!(m_grouped_fp8_gemm_nt_masked(&aq, &asf, &bq, &bsf, &masked[..1], m_max, n, k, num_groups)
-            .is_err());
-        assert!(m_grouped_fp8_gemm_nt_masked(&aq, &asf, &bq, &bsf, &[5, 1], m_max, n, k, num_groups)
-            .is_err());
-        assert!(m_grouped_fp8_gemm_nt_masked(&aq, &asf, &bq, &bsf, &masked, m_max, n, 127, num_groups)
-            .is_err());
         assert!(m_grouped_fp8_gemm_nt_masked(
-            &aq[..aq.len() - 1], &asf, &bq, &bsf, &masked, m_max, n, k, num_groups
+            &aq,
+            &asf,
+            &bq,
+            &bsf,
+            &masked[..1],
+            m_max,
+            n,
+            k,
+            num_groups
         )
         .is_err());
-        assert!(m_grouped_fp8_gemm_nt_masked(&aq, &asf[..asf.len() - 1], &bq, &bsf, &masked, m_max, n, k, num_groups)
-            .is_err());
-        assert!(m_grouped_fp8_gemm_nt_masked(&aq, &asf, &bq, &bsf[..bsf.len() - 1], &masked, m_max, n, k, num_groups)
-            .is_err());
+        assert!(m_grouped_fp8_gemm_nt_masked(
+            &aq,
+            &asf,
+            &bq,
+            &bsf,
+            &[5, 1],
+            m_max,
+            n,
+            k,
+            num_groups
+        )
+        .is_err());
+        assert!(m_grouped_fp8_gemm_nt_masked(
+            &aq, &asf, &bq, &bsf, &masked, m_max, n, 127, num_groups
+        )
+        .is_err());
+        assert!(m_grouped_fp8_gemm_nt_masked(
+            &aq[..aq.len() - 1],
+            &asf,
+            &bq,
+            &bsf,
+            &masked,
+            m_max,
+            n,
+            k,
+            num_groups
+        )
+        .is_err());
+        assert!(m_grouped_fp8_gemm_nt_masked(
+            &aq,
+            &asf[..asf.len() - 1],
+            &bq,
+            &bsf,
+            &masked,
+            m_max,
+            n,
+            k,
+            num_groups
+        )
+        .is_err());
+        assert!(m_grouped_fp8_gemm_nt_masked(
+            &aq,
+            &asf,
+            &bq,
+            &bsf[..bsf.len() - 1],
+            &masked,
+            m_max,
+            n,
+            k,
+            num_groups
+        )
+        .is_err());
         Ok(())
     }
 
@@ -501,7 +644,9 @@ mod tests {
             let m_max = rng.uniform_usize(1, 6);
             let n = rng.uniform_usize(2, 7);
             let k = 128 * rng.uniform_usize(1, 2);
-            let masked_m: Vec<usize> = (0..num_groups).map(|_| rng.uniform_usize(0, m_max + 1)).collect();
+            let masked_m: Vec<usize> = (0..num_groups)
+                .map(|_| rng.uniform_usize(0, m_max + 1))
+                .collect();
             let a = random_matrix(rng, num_groups * m_max, k, 1.0);
             let (aq, asf) = quantize_per_token_group(&a, k, 128)?;
             let mut bq_all = Vec::new();
@@ -520,10 +665,15 @@ mod tests {
                 for i in 0..m_max {
                     let row = &out[(g * m_max + i) * n..(g * m_max + i + 1) * n];
                     if i >= masked_m[g] {
-                        ensure!(row.iter().all(|&v| v == 0.0), Internal, "row ({g},{i}) not zero");
+                        ensure!(
+                            row.iter().all(|&v| v == 0.0),
+                            Internal,
+                            "row ({g},{i}) not zero"
+                        );
                     } else {
                         let a_row = &aq[(g * m_max + i) * k..(g * m_max + i + 1) * k];
-                        let asf_row = &asf[(g * m_max + i) * (k / 128)..(g * m_max + i + 1) * (k / 128)];
+                        let asf_row =
+                            &asf[(g * m_max + i) * (k / 128)..(g * m_max + i + 1) * (k / 128)];
                         let b_g = &bq_all[g * n * k..(g + 1) * n * k];
                         let bsf_g = &bsf_all[g * nb * (k / 128)..(g + 1) * nb * (k / 128)];
                         let dense = fp8_gemm_nt(a_row, asf_row, b_g, bsf_g, 1, n, k, None)?;

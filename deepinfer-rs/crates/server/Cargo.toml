@@ -1,0 +1,26 @@
+[package]
+name = "deepinfer-server"
+description = "Production serving layer for DeepInfer-rs: a zero-dependency HTTP/1.1 server exposing an OpenAI-compatible API (chat/completions with SSE streaming, completions, models, health, Prometheus metrics) on top of the continuous-batching scheduler and the DeepSeek-V4.1-Flash model — CPU golden engine by default, the GPU DeviceModel serve engine with --gpu."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["deepseek", "inference", "server", "openai-api", "llm"]
+categories = ["science"]
+
+[lints]
+workspace = true
+
+[dependencies]
+deepinfer-core = { workspace = true }
+deepinfer-runtime = { path = "../runtime" }
+deepinfer-scheduler = { workspace = true }
+deepinfer-sampler = { workspace = true }
+deepinfer-grammar = { workspace = true }
+deepinfer-mtp = { workspace = true }
+deepinfer-kernels = { path = "../kernels" }
+
+[[bin]]
+name = "deepinfer-server"
+path = "src/bin/deepinfer-server.rs"

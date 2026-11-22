@@ -192,7 +192,13 @@ mod tests {
             h.update(&chunk);
         }
         let d = h.finish();
-        let s: String = d.iter().map(|b| format!("{b:02x}")).collect();
+        let s: String = d
+            .iter()
+            .fold(String::with_capacity(d.len() * 2), |mut acc, b| {
+                use std::fmt::Write as _;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
         assert_eq!(
             s,
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
@@ -208,7 +214,13 @@ mod tests {
             h.update(piece);
         }
         let d = h.finish();
-        let b: String = d.iter().map(|x| format!("{x:02x}")).collect();
+        let b: String = d
+            .iter()
+            .fold(String::with_capacity(d.len() * 2), |mut acc, x| {
+                use std::fmt::Write as _;
+                let _ = write!(acc, "{x:02x}");
+                acc
+            });
         assert_eq!(a, b);
     }
 }

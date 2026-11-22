@@ -162,7 +162,15 @@ mod tests {
         // wk rows: [3, 4] -> RMS sqrt(12.5); [1, 0] -> RMS sqrt(0.5).
         let wk = [3.0f32, 4.0, 1.0, 0.0];
         let gain = conv_norm_gain_from_wk(&wk, 2, 2);
-        assert!((gain[0] - 12.5f32.sqrt()).abs() < 1e-6, "gain[0] = {}", gain[0]);
-        assert!((gain[1] - 0.5f32.sqrt()).abs() < 1e-6, "gain[1] = {}", gain[1]);
+        assert!(
+            (gain[0] - 12.5f32.sqrt()).abs() < 1e-6,
+            "gain[0] = {}",
+            gain[0]
+        );
+        assert!(
+            (gain[1] - 0.5f32.sqrt()).abs() < 1e-6,
+            "gain[1] = {}",
+            gain[1]
+        );
     }
 }

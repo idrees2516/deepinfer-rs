@@ -183,7 +183,8 @@ mod tests {
     fn record_is_deterministic() {
         let mut a = ExpertStats::new(3, 3);
         let mut b = ExpertStats::new(3, 3);
-        let batches: Vec<Vec<u64>> = vec![vec![1, 2, 3], vec![9, 8, 7], vec![4, 5, 6], vec![0, 1, 2]];
+        let batches: Vec<Vec<u64>> =
+            vec![vec![1, 2, 3], vec![9, 8, 7], vec![4, 5, 6], vec![0, 1, 2]];
         for bth in &batches {
             a.record(bth);
             b.record(bth);

@@ -27,10 +27,12 @@ pub(crate) const ATTR_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
 pub(crate) const CU_INIT_FLAGS: u32 = 0;
 
 pub(crate) type FnCuInit = unsafe extern "C" fn(u32) -> CuResult;
-pub(crate) type FnCuGetErrorString = unsafe extern "C" fn(CuResult, *mut *const std::ffi::c_char) -> CuResult;
+pub(crate) type FnCuGetErrorString =
+    unsafe extern "C" fn(CuResult, *mut *const std::ffi::c_char) -> CuResult;
 pub(crate) type FnCuDeviceGetCount = unsafe extern "C" fn(*mut i32) -> CuResult;
 pub(crate) type FnCuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> CuResult;
-pub(crate) type FnCuDeviceGetName = unsafe extern "C" fn(*mut std::ffi::c_char, i32, i32) -> CuResult;
+pub(crate) type FnCuDeviceGetName =
+    unsafe extern "C" fn(*mut std::ffi::c_char, i32, i32) -> CuResult;
 pub(crate) type FnCuDeviceTotalMem = unsafe extern "C" fn(*mut usize, i32) -> CuResult;
 pub(crate) type FnCuDeviceGetAttribute = unsafe extern "C" fn(*mut i32, i32, i32) -> CuResult;
 pub(crate) type FnCuDeviceCanAccessPeer = unsafe extern "C" fn(*mut i32, i32, i32) -> CuResult;
@@ -96,18 +98,18 @@ pub(crate) type FnCuGraphExecDestroy = unsafe extern "C" fn(Handle) -> CuResult;
 // ---- TMA tensor-map encoding (CUDA >= 12.0) ---------------------------------
 /// `CUtensorMap` is 128 bytes; we treat it as opaque.
 pub(crate) type FnCuTensorMapEncodeTiled = unsafe extern "C" fn(
-    *mut u8, // CUtensorMap*
-    u32,    // CUtensorMapDataType
-    u32,    // tensorRank
+    *mut u8,     // CUtensorMap*
+    u32,         // CUtensorMapDataType
+    u32,         // tensorRank
     *mut c_void, // globalAddress
-    *const u64, // globalDim[rank]
-    *const u64, // globalStrides[rank-1] (bytes)
-    *const u32, // boxDim[rank]
-    *const u32, // elementStrides[rank]
-    u32,    // CUtensorMapInterleave
-    u32,    // CUtensorMapSwizzle
-    u32,    // CUtensorMapL2promotion
-    u32,    // CUtensorMapFloatOOBfill
+    *const u64,  // globalDim[rank]
+    *const u64,  // globalStrides[rank-1] (bytes)
+    *const u32,  // boxDim[rank]
+    *const u32,  // elementStrides[rank]
+    u32,         // CUtensorMapInterleave
+    u32,         // CUtensorMapSwizzle
+    u32,         // CUtensorMapL2promotion
+    u32,         // CUtensorMapFloatOOBfill
 ) -> CuResult;
 
 /// `CUtensorMapDataType` selectors (cuda.h values).
@@ -133,8 +135,7 @@ pub(crate) const TMAP_L2_128B: u32 = 2;
 pub(crate) const TMAP_OOB_NONE: u32 = 0;
 
 // ---- Function attributes (needed for > 48 KiB dynamic shared memory) --------
-pub(crate) type FnCuFuncSetAttribute =
-    unsafe extern "C" fn(Handle, i32, i32) -> CuResult;
+pub(crate) type FnCuFuncSetAttribute = unsafe extern "C" fn(Handle, i32, i32) -> CuResult;
 /// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`.
 pub(crate) const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 
@@ -272,7 +273,9 @@ impl Cuda {
         let r = unsafe { (self.get_error_string)(code, &mut p) };
         if r == 0 && !p.is_null() {
             // SAFETY: vendor contract: points to a static NUL-terminated string.
-            unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+            unsafe { std::ffi::CStr::from_ptr(p) }
+                .to_string_lossy()
+                .into_owned()
         } else {
             format!("CUDA error {code}")
         }

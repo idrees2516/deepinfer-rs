@@ -117,7 +117,9 @@ fn round_trip_f32_single_sender() {
     let c = cfg(1, 8);
     let (tokens, k) = (5usize, 2);
     let mut rng = Philox::new(0xE9, 1);
-    let x: Vec<f32> = (0..tokens * 8).map(|_| rng.uniform_f32(-1.0, 1.0)).collect();
+    let x: Vec<f32> = (0..tokens * 8)
+        .map(|_| rng.uniform_f32(-1.0, 1.0))
+        .collect();
     let idx: Vec<u32> = (0..tokens * k).map(|i| (i % 4) as u32).collect();
     let w: Vec<f32> = (0..tokens * k).map(|_| rng.uniform_f32(0.1, 0.9)).collect();
 
@@ -216,7 +218,9 @@ fn fp8_payload_round_trip_bounds() {
     let c = cfg(1, 128); // hidden must be a multiple of the 128 quant group
     let mut rng = Philox::new(0xE8, 7);
     let (tokens, k) = (4usize, 2);
-    let x: Vec<f32> = (0..tokens * 128).map(|_| rng.uniform_f32(-2.0, 2.0)).collect();
+    let x: Vec<f32> = (0..tokens * 128)
+        .map(|_| rng.uniform_f32(-2.0, 2.0))
+        .collect();
     let idx = vec![0u32, 1, 2, 3, 0, 1, 2, 3];
     let w = vec![0.25f32; 8];
     let (p32, h32) = dispatch(&c, 0, &x, &idx, &w, tokens, k, false).unwrap();
@@ -234,7 +238,17 @@ fn fp8_payload_round_trip_bounds() {
     assert!(worst <= 0.2, "fp8 relative error {worst} exceeds 0.2");
     // Non-multiple-of-128 hidden must fail FP8 dispatch.
     let bad = cfg(1, 100);
-    assert!(dispatch(&bad, 0, &vec![0.1; 2 * 100], &[0, 1], &[0.5, 0.5], 2, 1, true).is_err());
+    assert!(dispatch(
+        &bad,
+        0,
+        &vec![0.1; 2 * 100],
+        &[0, 1],
+        &[0.5, 0.5],
+        2,
+        1,
+        true
+    )
+    .is_err());
 }
 
 #[test]
@@ -249,7 +263,7 @@ fn low_latency_layout_and_drops() {
     let res = low_latency_dispatch(&c, 0, &x, &idx, &w, tokens, k, capacity, false).unwrap();
     assert_eq!(res.masked_m, vec![2usize, 0]);
     assert_eq!(res.recv_x.len(), 2 * 2 * 8); // 2 local experts * capacity 2
-    // Rows beyond counts are zero.
+                                             // Rows beyond counts are zero.
     assert!(res.recv_x[2 * 8..].iter().all(|&v| v == 0.0));
     // Dropped pairs reported deterministically ((token, k) order):
     // expert 0 receives 5 pairs, capacity 2 keeps (0,0),(0,1).
@@ -282,9 +296,15 @@ fn determinism_property() {
         let c = cfg(1, 8);
         let tokens = rng.uniform_usize(1, 6);
         let k = rng.uniform_usize(1, 3);
-        let x: Vec<f32> = (0..tokens * 8).map(|_| rng.uniform_f32(-1.0, 1.0)).collect();
-        let idx: Vec<u32> = (0..tokens * k).map(|_| rng.uniform_usize(0, 4) as u32).collect();
-        let w: Vec<f32> = (0..tokens * k).map(|_| rng.uniform_f32(0.05, 0.95)).collect();
+        let x: Vec<f32> = (0..tokens * 8)
+            .map(|_| rng.uniform_f32(-1.0, 1.0))
+            .collect();
+        let idx: Vec<u32> = (0..tokens * k)
+            .map(|_| rng.uniform_usize(0, 4) as u32)
+            .collect();
+        let w: Vec<f32> = (0..tokens * k)
+            .map(|_| rng.uniform_f32(0.05, 0.95))
+            .collect();
         type Outs = Vec<(Vec<f32>, Vec<u32>, Vec<u32>)>;
         let run = || -> deepinfer_core::Result<Outs> {
             let mut outs: Outs = Vec::new();
@@ -312,46 +332,62 @@ fn determinism_property() {
 
 #[test]
 fn round_trip_property() {
-    prop("ep dispatch/recv/combine == local moe", 0xE6, 40, |_i, rng| {
-        let c = cfg(1, 8);
-        let tokens = rng.uniform_usize(1, 5);
-        let k = rng.uniform_usize(1, 3);
-        let x: Vec<f32> = (0..tokens * 8).map(|_| rng.uniform_f32(-1.0, 1.0)).collect();
-        let idx: Vec<u32> = (0..tokens * k).map(|_| rng.uniform_usize(0, 4) as u32).collect();
-        let w: Vec<f32> = (0..tokens * k).map(|_| rng.uniform_f32(0.05, 0.95)).collect();
+    prop(
+        "ep dispatch/recv/combine == local moe",
+        0xE6,
+        40,
+        |_i, rng| {
+            let c = cfg(1, 8);
+            let tokens = rng.uniform_usize(1, 5);
+            let k = rng.uniform_usize(1, 3);
+            let x: Vec<f32> = (0..tokens * 8)
+                .map(|_| rng.uniform_f32(-1.0, 1.0))
+                .collect();
+            let idx: Vec<u32> = (0..tokens * k)
+                .map(|_| rng.uniform_usize(0, 4) as u32)
+                .collect();
+            let w: Vec<f32> = (0..tokens * k)
+                .map(|_| rng.uniform_f32(0.05, 0.95))
+                .collect();
 
-        let (payload, handle) = dispatch(&c, 0, &x, &idx, &w, tokens, k, false)?;
-        let res = recv(&c, 0, &[(payload, handle)])?;
-        let true_rows = res.handle.token_slots.len();
-        let mut expert_out = Vec::with_capacity(true_rows * 8);
-        for r in 0..true_rows {
-            expert_out.extend_from_slice(&expert_fn(&res.recv_x[r * 8..(r + 1) * 8]));
-        }
-        let y = combine(&c, &res.handle, &expert_out)?;
-        // Expected over rank-0-owned pairs only (single-sender recv per rank
-        // keeps token indices disjoint in the mirror handle).
-        let mut expect = vec![0.0f32; tokens * 8];
-        for t in 0..tokens {
-            for ki in 0..k {
-                let i = t * k + ki;
-                if c.owner_rank(idx[i]) != 0 {
-                    continue;
-                }
-                let f = expert_fn(row(&x, tokens, t));
-                for d in 0..8 {
-                    expect[t * 8 + d] += w[i] * f[d];
+            let (payload, handle) = dispatch(&c, 0, &x, &idx, &w, tokens, k, false)?;
+            let res = recv(&c, 0, &[(payload, handle)])?;
+            let true_rows = res.handle.token_slots.len();
+            let mut expert_out = Vec::with_capacity(true_rows * 8);
+            for r in 0..true_rows {
+                expert_out.extend_from_slice(&expert_fn(&res.recv_x[r * 8..(r + 1) * 8]));
+            }
+            let y = combine(&c, &res.handle, &expert_out)?;
+            // Expected over rank-0-owned pairs only (single-sender recv per rank
+            // keeps token indices disjoint in the mirror handle).
+            let mut expect = vec![0.0f32; tokens * 8];
+            for t in 0..tokens {
+                for ki in 0..k {
+                    let i = t * k + ki;
+                    if c.owner_rank(idx[i]) != 0 {
+                        continue;
+                    }
+                    let f = expert_fn(row(&x, tokens, t));
+                    for d in 0..8 {
+                        expect[t * 8 + d] += w[i] * f[d];
+                    }
                 }
             }
-        }
-        let mut covered = vec![false; tokens];
-        for &(t, _) in &res.handle.token_slots {
-            covered[t as usize] = true;
-        }
-        for t in 0..tokens {
-            if covered[t] {
-                assert_close_slice(&y[t * 8..(t + 1) * 8], &expect[t * 8..(t + 1) * 8], 1e-5, "prop");
+            let mut covered = vec![false; tokens];
+            for &(t, _) in &res.handle.token_slots {
+                covered[t as usize] = true;
             }
-        }
-        Ok(())
-    });
+            for t in 0..tokens {
+                if covered[t] {
+                    assert_close_slice(
+                        &y[t * 8..(t + 1) * 8],
+                        &expect[t * 8..(t + 1) * 8],
+                        1e-5,
+                        "prop",
+                    );
+                }
+            }
+            Ok(())
+        },
+    );
 }

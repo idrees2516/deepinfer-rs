@@ -8,7 +8,6 @@
 //! attention-conjugate rotation used by FlashMLA's fused kernel.
 use crate::ensure;
 
-
 use crate::error::Result;
 
 /// Pairing layout of the RoPE dimensions.
@@ -90,8 +89,16 @@ impl Rope {
         scaling: Option<YarnConfig>,
         max_position: usize,
     ) -> Result<Rope> {
-        ensure!(dim % 2 == 0 && dim > 0, InvalidArgument, "rope dim must be even and positive, got {dim}");
-        ensure!(max_position > 0, InvalidArgument, "max_position must be positive");
+        ensure!(
+            dim % 2 == 0 && dim > 0,
+            InvalidArgument,
+            "rope dim must be even and positive, got {dim}"
+        );
+        ensure!(
+            max_position > 0,
+            InvalidArgument,
+            "max_position must be positive"
+        );
         ensure!(base > 1.0, InvalidArgument, "rope base must exceed 1.0");
         let half = dim / 2;
 
@@ -102,14 +109,16 @@ impl Rope {
             *f = base.powf(-e);
         }
         if let Some(y) = &scaling {
-            let low = yarn_correction_dim(y.beta_fast, dim, base, y.original_max_position_embeddings)
-                .floor()
-                .max(0.0)
-                .min(half as f64);
-            let high = yarn_correction_dim(y.beta_slow, dim, base, y.original_max_position_embeddings)
-                .ceil()
-                .max(low + 1e-3)
-                .min(half as f64);
+            let low =
+                yarn_correction_dim(y.beta_fast, dim, base, y.original_max_position_embeddings)
+                    .floor()
+                    .max(0.0)
+                    .min(half as f64);
+            let high =
+                yarn_correction_dim(y.beta_slow, dim, base, y.original_max_position_embeddings)
+                    .ceil()
+                    .max(low + 1e-3)
+                    .min(half as f64);
             let denom = (high - low).max(1e-9);
             for (j, f) in inv_freq.iter_mut().enumerate() {
                 let jf = j as f64;
@@ -191,7 +200,12 @@ impl Rope {
         );
         let half = self.dim / 2;
         for (r, &p) in positions.iter().enumerate() {
-            ensure!(p < self.max_pos as u32, OutOfRange, "position {p} >= cached max {}", self.max_pos);
+            ensure!(
+                p < self.max_pos as u32,
+                OutOfRange,
+                "position {p} >= cached max {}",
+                self.max_pos
+            );
             let pos = p as usize;
             let row = &mut x[r * row_len..(r + 1) * row_len];
             match self.style {
@@ -242,7 +256,12 @@ impl Rope {
         );
         let half = self.dim / 2;
         for (r, &p) in positions.iter().enumerate() {
-            ensure!(p < self.max_pos as u32, OutOfRange, "position {p} >= cached max {}", self.max_pos);
+            ensure!(
+                p < self.max_pos as u32,
+                OutOfRange,
+                "position {p} >= cached max {}",
+                self.max_pos
+            );
             let pos = p as usize;
             let row = &mut x[r * row_len..(r + 1) * row_len];
             match self.style {

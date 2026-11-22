@@ -115,9 +115,8 @@ impl MlaPagedCache {
             "page byte size {len} exceeds the {MAX_PAGE_BYTES}-byte limit"
         );
         let mut page = Vec::new();
-        page.try_reserve_exact(len).map_err(|_| {
-            Error::CapacityExceeded(format!("cannot allocate a {len}-byte page"))
-        })?;
+        page.try_reserve_exact(len)
+            .map_err(|_| Error::CapacityExceeded(format!("cannot allocate a {len}-byte page")))?;
         page.resize(len, 0u8);
         self.pages.push(page);
         self.page_fill.push(0);
@@ -197,13 +196,10 @@ impl MlaPagedCache {
         let page = &mut self.pages[pid as usize];
         page[start..start + bpt].copy_from_slice(&buf);
         self.page_fill[pid as usize] = (off + 1) as u32;
-        let entry = self
-            .seqs
-            .entry(seq)
-            .or_insert_with(|| SeqEntry {
-                pages: Vec::new(),
-                tokens: 0,
-            });
+        let entry = self.seqs.entry(seq).or_insert_with(|| SeqEntry {
+            pages: Vec::new(),
+            tokens: 0,
+        });
         if !newly.is_empty() {
             entry.pages.extend_from_slice(&newly);
         }
@@ -254,7 +250,11 @@ impl MlaPagedCache {
         let d = self
             .head_dim
             .ok_or_else(|| Error::invalid("KV cache is empty; no rows have been appended"))?;
-        ensure!(phys >= 0, OutOfRange, "physical index must be non-negative, got {phys}");
+        ensure!(
+            phys >= 0,
+            OutOfRange,
+            "physical index must be non-negative, got {phys}"
+        );
         let p = phys as usize / self.page_size;
         let off = phys as usize % self.page_size;
         ensure!(
@@ -279,6 +279,79 @@ impl MlaPagedCache {
     /// Total stored tokens across all sequences.
     pub fn total_tokens(&self) -> usize {
         self.seqs.values().map(|e| e.tokens).sum()
+    }
+
+    /// Number of pages currently allocated (live plus recycled).
+    pub fn allocated_pages(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Truncates `seq` to its first `new_len` tokens, recycling every
+    /// page that no longer holds a kept row. This is the targeted
+    /// rollback primitive for speculative decoding: the surviving rows
+    /// are untouched (bit-identical quantized contents), and the freed
+    /// pages return to the free list for first-fit reuse by any later
+    /// append. `new_len == 0` removes the sequence entirely.
+    ///
+    /// After a truncation the next append re-uses the sequence's kept
+    /// block table and overwrites the tail position of its last kept
+    /// page, exactly like a plain append to a cache that never grew
+    /// past `new_len`.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] when `new_len` exceeds the stored
+    /// length (rolling back tokens that were never appended).
+    pub fn truncate(&mut self, seq: u32, new_len: usize) -> Result<()> {
+        let tokens = self.seqs.get(&seq).map(|e| e.tokens).unwrap_or(0);
+        ensure!(
+            new_len <= tokens,
+            InvalidArgument,
+            "cannot truncate sequence {seq} to {new_len} tokens: only {tokens} are stored"
+        );
+        if new_len == tokens {
+            return Ok(());
+        }
+        if new_len == 0 {
+            if let Some(entry) = self.seqs.remove(&seq) {
+                for pid in entry.pages {
+                    self.page_fill[pid as usize] = 0;
+                    self.recycle(pid);
+                }
+            }
+            return Ok(());
+        }
+        let keep_pages = new_len.div_ceil(self.page_size);
+        let (freed, last_pid) = {
+            let entry = self
+                .seqs
+                .get_mut(&seq)
+                .ok_or_else(|| Error::internal("truncate: entry vanished after length check"))?;
+            let freed = if keep_pages < entry.pages.len() {
+                entry.pages.split_off(keep_pages)
+            } else {
+                Vec::new()
+            };
+            (freed, entry.pages[keep_pages - 1])
+        };
+        for pid in freed {
+            self.page_fill[pid as usize] = 0;
+            self.recycle(pid);
+        }
+        let fill = if new_len % self.page_size == 0 {
+            self.page_size as u32
+        } else {
+            (new_len % self.page_size) as u32
+        };
+        self.page_fill[last_pid as usize] = fill;
+        self.seqs.get_mut(&seq).expect("entry kept").tokens = new_len;
+        Ok(())
+    }
+
+    /// Returns one page id to the free list, restoring the
+    /// lowest-id-first allocation order.
+    fn recycle(&mut self, pid: u32) {
+        let pos = self.free.partition_point(|&p| p < pid);
+        self.free.insert(pos, pid);
     }
 }
 
@@ -329,7 +402,10 @@ mod tests {
             let expected = (pos / 64) as i32 * 64 + (pos % 64) as i32;
             assert_eq!(phys, expected);
             let back = cache.row_f32(phys).unwrap();
-            let quantized: Vec<f32> = row.iter().map(|&v| bf16_to_f32(f32_to_bf16_rne(v))).collect();
+            let quantized: Vec<f32> = row
+                .iter()
+                .map(|&v| bf16_to_f32(f32_to_bf16_rne(v)))
+                .collect();
             assert_close_slice(&back, &quantized, 1e-12, "bf16 roundtrip");
         }
         assert!(cache.physical_index(3, 70).is_err());
@@ -431,7 +507,9 @@ mod tests {
         // sequence 1's two pages).
         assert_eq!(cache.block_table(2)[0], 2);
         let row = cache.row_f32(cache.physical_index(2, 0).unwrap()).unwrap();
-        assert!(row.iter().all(|&v| v == bf16_to_f32(f32_to_bf16_rne(-0.25))));
+        assert!(row
+            .iter()
+            .all(|&v| v == bf16_to_f32(f32_to_bf16_rne(-0.25))));
     }
 
     #[test]
@@ -447,9 +525,114 @@ mod tests {
                 cache.append(0, row).unwrap();
             }
             for (pos, row) in data.iter().enumerate() {
-                let back = cache.row_f32(cache.physical_index(0, pos).unwrap()).unwrap();
+                let back = cache
+                    .row_f32(cache.physical_index(0, pos).unwrap())
+                    .unwrap();
                 assert_close_slice(&back, row, tol, "{format:?} row {pos}");
             }
+        }
+    }
+
+    #[test]
+    fn truncate_keeps_prefix_rows_bit_exact() {
+        // 150 rows over 3 pages; truncate to 70 (keeps page 0 fully and
+        // 6 rows of page 1) — the kept rows must read back identical.
+        let data = rows(150, 16, 41);
+        let mut cache = MlaPagedCache::new(CacheFormat::Bf16, 64, 10);
+        for row in &data {
+            cache.append(7, row).unwrap();
+        }
+        cache.truncate(7, 70).unwrap();
+        assert_eq!(cache.seq_len(7), 70);
+        assert_eq!(cache.block_table(7), &[0, 1]);
+        for pos in 0..70 {
+            let back = cache
+                .row_f32(cache.physical_index(7, pos).unwrap())
+                .unwrap();
+            let q: Vec<f32> = data[pos]
+                .iter()
+                .map(|&v| bf16_to_f32(f32_to_bf16_rne(v)))
+                .collect();
+            assert_close_slice(&back, &q, 1e-12, "kept row {pos}");
+        }
+        assert!(
+            cache.physical_index(7, 70).is_err(),
+            "rolled-back rows must be unreachable"
+        );
+    }
+
+    #[test]
+    fn truncate_recycles_pages_first_fit() {
+        let data = rows(130, 16, 43);
+        let mut cache = MlaPagedCache::new(CacheFormat::Bf16, 64, 4);
+        for row in &data {
+            cache.append(1, row).unwrap();
+        }
+        assert_eq!(cache.block_table(1).len(), 3);
+        // Roll back to 65 (2 pages kept, page 2 recycled).
+        cache.truncate(1, 65).unwrap();
+        assert_eq!(cache.allocated_pages(), 3);
+        // A second sequence re-uses the recycled page 2 before growing.
+        for row in &data[..64] {
+            cache.append(2, row).unwrap();
+        }
+        assert_eq!(cache.block_table(2), &[2]);
+        assert_eq!(
+            cache.allocated_pages(),
+            3,
+            "page 2 must be recycled, not re-allocated"
+        );
+        // Rolling back to a page boundary keeps the fill at page_size.
+        cache.truncate(1, 64).unwrap();
+        assert_eq!(cache.block_table(1), &[0]);
+        for row in &data[64..70] {
+            cache.append(1, row).unwrap();
+        }
+        // Page 1 was freed by the boundary truncation and is the lowest
+        // free id, so the re-appended rows land there (first-fit).
+        assert_eq!(cache.block_table(1), &[0, 1]);
+        // Truncate to zero removes the sequence and frees everything.
+        cache.truncate(2, 0).unwrap();
+        assert_eq!(cache.seq_len(2), 0);
+        assert!(cache.block_table(2).is_empty());
+        assert_eq!(cache.total_tokens(), 70);
+        // Over-truncation is an error; same-length truncation is a no-op.
+        assert!(matches!(
+            cache.truncate(1, 71).unwrap_err(),
+            Error::InvalidArgument(_)
+        ));
+        cache.truncate(1, 70).unwrap();
+        assert_eq!(cache.seq_len(1), 70);
+        // Unknown sequences truncate to zero harmlessly.
+        cache.truncate(99, 0).unwrap();
+    }
+
+    #[test]
+    fn truncate_then_reappend_matches_cold_cache() {
+        // The spec-decode invariant: rows appended after a rollback are
+        // identical to the rows a cache that never grew past the
+        // rollback point would hold.
+        let data = rows(96, 24, 47);
+        let q = |v: f32| bf16_to_f32(f32_to_bf16_rne(v));
+        let mut warm = MlaPagedCache::new(CacheFormat::Bf16, 16, 8);
+        for row in &data {
+            warm.append(5, row).unwrap();
+        }
+        warm.truncate(5, 48).unwrap();
+        for row in &data[48..] {
+            warm.append(5, row).unwrap();
+        }
+        let mut cold = MlaPagedCache::new(CacheFormat::Bf16, 16, 8);
+        for row in &data {
+            cold.append(5, row).unwrap();
+        }
+        assert_eq!(warm.seq_len(5), cold.seq_len(5));
+        for pos in 0..96 {
+            let a = warm.row_f32(warm.physical_index(5, pos).unwrap()).unwrap();
+            let b = cold.row_f32(cold.physical_index(5, pos).unwrap()).unwrap();
+            assert_eq!(a, b, "row {pos} differs after rollback+re-append");
+            let expect: Vec<f32> = data[pos].iter().map(|&v| q(v)).collect();
+            assert_eq!(a, expect);
         }
     }
 }

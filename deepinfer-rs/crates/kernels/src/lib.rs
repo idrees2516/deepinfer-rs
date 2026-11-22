@@ -45,11 +45,11 @@ use deepinfer_gpu::{
     compile_and_load, Backend, Buffer, Device, Function, GpuArch, Module, Stream, TensorMap,
 };
 
+mod attention;
+mod decode;
+mod dsamoe;
 mod elementwise;
 mod gemm;
-mod attention;
-mod dsamoe;
-mod decode;
 mod peer;
 mod peer_ll;
 mod serve;
@@ -186,7 +186,12 @@ impl Kernels {
         let ca = format!("{}\n{}", source::COMMON, source::ATTENTION);
         let cd = format!("{}\n{}", source::COMMON, source::DSA);
         let cm = format!("{}\n{}", source::COMMON, source::MOE);
-        let ck = format!("{}\n{}\n{}", source::COMMON, source::DECODE_PARAMS, source::DECODE);
+        let ck = format!(
+            "{}\n{}\n{}",
+            source::COMMON,
+            source::DECODE_PARAMS,
+            source::DECODE
+        );
         let cpl = format!("{}\n{}", source::COMMON, source::PEER_LL);
         let csv = format!("{}\n{}", source::COMMON, source::SERVE);
         // The tcgen05 module targets the architecture-specific family
@@ -241,12 +246,11 @@ impl Kernels {
             }
             n if n.starts_with("di_gather_rows") => &self.m_att,
             n if n.starts_with("di_silu_mul_masked") => &self.m_moe,
-            n if n.starts_with("di_gemm_fp8_nt_sm100a") => self
-                .m_gemm100
-                .as_ref()
-                .ok_or_else(|| {
+            n if n.starts_with("di_gemm_fp8_nt_sm100a") => {
+                self.m_gemm100.as_ref().ok_or_else(|| {
                     Error::invalid("the tcgen05 GEMM needs CUDA compute capability >= 10.0")
-                })?,
+                })?
+            }
             n if n.starts_with("di_ep_") => &self.m_peer_ll,
             n if n.starts_with("di_serve_") => &self.m_serve,
             n if n.starts_with("di_rmsnorm")
@@ -271,8 +275,14 @@ impl Kernels {
                 || n.starts_with("di_gate")
                 || n.starts_with("di_causal")
                 || n.starts_with("di_block_preselect")
-                || n.starts_with("di_topk") => &self.m_dsa,
-            n if n.starts_with("di_moe") || n.starts_with("di_fill") || n.starts_with("di_sigmoid") => {
+                || n.starts_with("di_topk") =>
+            {
+                &self.m_dsa
+            }
+            n if n.starts_with("di_moe")
+                || n.starts_with("di_fill")
+                || n.starts_with("di_sigmoid") =>
+            {
                 &self.m_moe
             }
             _ => return Err(Error::internal(format!("unknown kernel `{name}`"))),
@@ -333,7 +343,10 @@ mod tests {
             ("decode", source::DECODE),
         ] {
             assert!(s.len() > 1000, "{name} source suspiciously short");
-            assert!(s.contains("extern \"C\" __global__"), "{name} has no kernels");
+            assert!(
+                s.contains("extern \"C\" __global__"),
+                "{name} has no kernels"
+            );
         }
         assert!(source::DECODE_PARAMS.contains("DP_COUNT"));
     }

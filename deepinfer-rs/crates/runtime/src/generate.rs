@@ -92,9 +92,9 @@ pub fn generate(
         "eos_id {eos_id} is outside the vocabulary ({vocab})"
     );
     for (i, req) in requests.iter().enumerate() {
-        req.params.validate(vocab).map_err(|e| {
-            Error::invalid(format!("request {i}: invalid sampling params: {e}"))
-        })?;
+        req.params
+            .validate(vocab)
+            .map_err(|e| Error::invalid(format!("request {i}: invalid sampling params: {e}")))?;
         ensure!(
             !req.prompt.is_empty(),
             InvalidArgument,
@@ -158,9 +158,8 @@ fn generate_one(
             SchemaType::Ebnf => "ebnf",
         };
         let g = Grammar::from_so_args(type_str, &so.schema)?;
-        let vb = vocab_bytes.ok_or_else(|| {
-            Error::invalid("structured output requires vocabulary bytes")
-        })?;
+        let vb = vocab_bytes
+            .ok_or_else(|| Error::invalid("structured output requires vocabulary bytes"))?;
         gstate = g.initial_state();
         masker = Some(TokenMaskComputer::new(vb.to_vec()));
         grammar = Some(g);
@@ -277,7 +276,14 @@ fn speculative_round(
             .ok_or_else(|| Error::internal("prompt cannot be empty here"))?
     };
     while drafts.len() < max_draft && sched.should_verify(&drafts) == Decision::ContinueDraft {
-        let d = draft_token(mtp, &model.weights.embed, vocab, hidden_len, last_tok, hidden)?;
+        let d = draft_token(
+            mtp,
+            &model.weights.embed,
+            vocab,
+            hidden_len,
+            last_tok,
+            hidden,
+        )?;
         last_tok = d.token;
         drafts.push(d);
     }
@@ -337,7 +343,7 @@ fn speculative_round(
 /// greedy-argmax + softmax-confidence step over
 /// [`deepinfer_mtp::MtpWeights::forward_logits`] and the model's shared
 /// embedding).
-fn draft_token(
+pub(crate) fn draft_token(
     mtp: &deepinfer_mtp::MtpWeights,
     embed: &[f32],
     vocab: usize,
@@ -394,8 +400,7 @@ mod tests {
             b"The quick brown fox".iter().map(|&b| b as u32).collect(),
         ];
         let run = || {
-            let mut model =
-                DeepSeekModel::random_init(&ModelConfig::v41_tiny(), 42).unwrap();
+            let mut model = DeepSeekModel::random_init(&ModelConfig::v41_tiny(), 42).unwrap();
             let reqs: Vec<GenerateRequest> = prompts
                 .iter()
                 .cloned()
@@ -425,19 +430,15 @@ mod tests {
         // THE speculative-decoding correctness property: greedy (temp 0)
         // generation with MTP enabled produces the exact same tokens as
         // the plain autoregressive path.
-        let prompts: Vec<Vec<u32>> = vec![
-            vec![9, 8, 7, 6],
-            vec![1, 2, 3, 4, 5],
-            vec![200, 150, 100],
-        ];
+        let prompts: Vec<Vec<u32>> =
+            vec![vec![9, 8, 7, 6], vec![1, 2, 3, 4, 5], vec![200, 150, 100]];
         let greedy_params = |n| SamplingParams {
             temperature: 0.0,
             max_tokens: n,
             ..Default::default()
         };
         for nextn in [1usize, 2, 3, 5] {
-            let mut model =
-                DeepSeekModel::random_init(&ModelConfig::v41_tiny(), 2024).unwrap();
+            let mut model = DeepSeekModel::random_init(&ModelConfig::v41_tiny(), 2024).unwrap();
             assert!(model.has_mtp());
             let reqs: Vec<GenerateRequest> = prompts
                 .iter()
@@ -455,14 +456,10 @@ mod tests {
             if nextn == 1 {
                 // Reference: the plain path defines the expectation.
                 for (i, out) in outs.iter().enumerate() {
-                    assert!(
-                        !out.tokens.is_empty(),
-                        "nextn={nextn} prompt {i}: {out:?}"
-                    );
+                    assert!(!out.tokens.is_empty(), "nextn={nextn} prompt {i}: {out:?}");
                 }
                 // Compare against a second plain run to pin the tokens.
-                let mut again =
-                    DeepSeekModel::random_init(&ModelConfig::v41_tiny(), 2024).unwrap();
+                let mut again = DeepSeekModel::random_init(&ModelConfig::v41_tiny(), 2024).unwrap();
                 let reqs: Vec<GenerateRequest> = prompts
                     .iter()
                     .cloned()
@@ -478,10 +475,7 @@ mod tests {
             } else {
                 PLAIN_TOKENS.with(|c| {
                     let plain = c.borrow().clone().unwrap();
-                    assert_eq!(
-                        outs, plain,
-                        "greedy tokens diverged with MTP nextn={nextn}"
-                    );
+                    assert_eq!(outs, plain, "greedy tokens diverged with MTP nextn={nextn}");
                 });
             }
         }
@@ -495,8 +489,7 @@ mod tests {
     #[test]
     fn mtp_seeded_sampling_is_deterministic() {
         let run = || {
-            let mut model =
-                DeepSeekModel::random_init(&ModelConfig::v41_tiny(), 7).unwrap();
+            let mut model = DeepSeekModel::random_init(&ModelConfig::v41_tiny(), 7).unwrap();
             generate(
                 &mut model,
                 vec![GenerateRequest {
@@ -699,13 +692,7 @@ mod tests {
         // empty prompt.
         assert!(generate(&mut model, vec![mk(vec![], 0.0)], 0, &Env::default()).is_err());
         // out-of-vocab prompt token.
-        assert!(generate(
-            &mut model,
-            vec![mk(vec![1, 999], 0.0)],
-            0,
-            &Env::default()
-        )
-        .is_err());
+        assert!(generate(&mut model, vec![mk(vec![1, 999], 0.0)], 0, &Env::default()).is_err());
         // invalid params (top_p = 0).
         assert!(generate(
             &mut model,

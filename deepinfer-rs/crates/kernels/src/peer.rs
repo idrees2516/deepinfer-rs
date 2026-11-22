@@ -90,7 +90,11 @@ pub fn build_send_plan(
     num_experts: usize,
 ) -> Result<SendPlan> {
     ensure!(world >= 1, InvalidArgument, "world must be >= 1");
-    ensure!(num_experts >= 1, InvalidArgument, "num_experts must be >= 1");
+    ensure!(
+        num_experts >= 1,
+        InvalidArgument,
+        "num_experts must be >= 1"
+    );
     ensure!(k >= 1, InvalidArgument, "k must be >= 1");
     let n = tokens
         .checked_mul(k)
@@ -172,7 +176,11 @@ impl PeerMesh {
     /// [`Error::Internal`] when a pair cannot access each other over the
     /// fabric or a stream/event cannot be created.
     pub fn new(devices: &[Device]) -> Result<PeerMesh> {
-        ensure!(!devices.is_empty(), InvalidArgument, "PeerMesh needs at least one device");
+        ensure!(
+            !devices.is_empty(),
+            InvalidArgument,
+            "PeerMesh needs at least one device"
+        );
         let backend = devices[0].backend();
         for (i, d) in devices.iter().enumerate() {
             ensure!(
@@ -286,7 +294,11 @@ impl PeerMesh {
         hidden: usize,
     ) -> Result<Vec<(Buffer, Buffer)>> {
         let world = self.world();
-        ensure!(hidden % 128 == 0, InvalidArgument, "fp8 dispatch needs hidden % 128 == 0");
+        ensure!(
+            hidden % 128 == 0,
+            InvalidArgument,
+            "fp8 dispatch needs hidden % 128 == 0"
+        );
         ensure!(
             send_xq.len() == world && send_xsf.len() == world && plans.len() == world,
             InvalidArgument,
@@ -414,7 +426,12 @@ impl PeerMesh {
                 let rows = per_home[s];
                 let dst = recv_views[d].slice(send_base[s] * hidden * 4, rows * hidden * 4)?;
                 let src = send_out[s].slice(0, rows * hidden * 4)?;
-                self.devices[d].memcpy_peer_async(&dst, &self.devices[s], &src, &self.streams[d])?;
+                self.devices[d].memcpy_peer_async(
+                    &dst,
+                    &self.devices[s],
+                    &src,
+                    &self.streams[d],
+                )?;
             }
         }
         for r in 0..world {
@@ -480,7 +497,10 @@ mod tests {
             vec![(0, 1), (1, 1)]
         );
         // Padded entries skipped.
-        assert!(plan.per_dst.iter().all(|v| v.iter().all(|s| s.token != 2 || s.k != 0)));
+        assert!(plan
+            .per_dst
+            .iter()
+            .all(|v| v.iter().all(|s| s.token != 2 || s.k != 0)));
     }
 
     #[test]

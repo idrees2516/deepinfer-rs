@@ -28,7 +28,8 @@ pub(crate) const ATTR_MULTIPROCESSOR_COUNT: i32 = 16;
 pub(crate) type FnGetErrorString = unsafe extern "C" fn(HipResult) -> *const std::ffi::c_char;
 pub(crate) type FnGetDeviceCount = unsafe extern "C" fn(*mut i32) -> HipResult;
 pub(crate) type FnSetDevice = unsafe extern "C" fn(i32) -> HipResult;
-pub(crate) type FnDeviceGetName = unsafe extern "C" fn(*mut std::ffi::c_char, i32, i32) -> HipResult;
+pub(crate) type FnDeviceGetName =
+    unsafe extern "C" fn(*mut std::ffi::c_char, i32, i32) -> HipResult;
 pub(crate) type FnMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> HipResult;
 pub(crate) type FnDeviceGetAttribute = unsafe extern "C" fn(*mut i32, i32, i32) -> HipResult;
 /// Opaque-buffer form of hipGetDeviceProperties(hipDeviceProp_t*, int).
@@ -53,7 +54,7 @@ pub(crate) type FnModuleLoadDataEx = unsafe extern "C" fn(
     *mut Handle,
     *const c_void,
     u32,
-    *mut i32,       // hipJitOption*
+    *mut i32,         // hipJitOption*
     *mut *mut c_void, // option values
 ) -> HipResult;
 pub(crate) type FnModuleUnload = unsafe extern "C" fn(Handle) -> HipResult;
@@ -200,7 +201,9 @@ impl Hip {
             format!("HIP error {code}")
         } else {
             // SAFETY: static NUL-terminated.
-            unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+            unsafe { std::ffi::CStr::from_ptr(p) }
+                .to_string_lossy()
+                .into_owned()
         }
     }
 }

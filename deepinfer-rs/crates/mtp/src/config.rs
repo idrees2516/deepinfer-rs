@@ -107,32 +107,32 @@ mod tests {
             MtpConfig {
                 hidden: 0,
                 vocab: 16,
-                draft_len: 5
+                draft_len: 5,
             },
             MtpConfig {
                 hidden: MAX_HIDDEN + 1,
                 vocab: 16,
-                draft_len: 5
+                draft_len: 5,
             },
             MtpConfig {
                 hidden: 8,
                 vocab: 0,
-                draft_len: 5
+                draft_len: 5,
             },
             MtpConfig {
                 hidden: 8,
                 vocab: MAX_VOCAB + 1,
-                draft_len: 5
+                draft_len: 5,
             },
             MtpConfig {
                 hidden: 8,
                 vocab: 16,
-                draft_len: 0
+                draft_len: 0,
             },
             MtpConfig {
                 hidden: 8,
                 vocab: 16,
-                draft_len: MAX_DRAFT_LEN + 1
+                draft_len: MAX_DRAFT_LEN + 1,
             },
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");

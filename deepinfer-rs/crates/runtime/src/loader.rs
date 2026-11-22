@@ -25,9 +25,7 @@ use deepinfer_moe::{ExpertWeights, MoeWeights};
 use deepinfer_mtp::{MtpBlockWeights, MtpWeights};
 
 use crate::config::ModelConfig;
-use crate::weights::{
-    build_rope, CrossLayerWeights, ModelWeights, SelfLayerWeights,
-};
+use crate::weights::{build_rope, CrossLayerWeights, ModelWeights, SelfLayerWeights};
 
 /// Maximum number of missing tensor names listed in a load error.
 const MAX_MISSING_LISTED: usize = 5;
@@ -88,12 +86,12 @@ impl Resolver {
 
 /// Loads one tensor as flat f32 and checks its element count.
 fn tensor_f32(cp: &CheckpointDir, name: &str, expect: usize, what: &str) -> Result<Vec<f32>> {
-    let t = cp.tensor(name).map_err(|e| {
-        Error::Checkpoint(format!("reading {what} tensor {name:?}: {e}"))
-    })?;
-    let v = t.as_f32_flat().map_err(|e| {
-        Error::Checkpoint(format!("{what} tensor {name:?}: {e}"))
-    })?;
+    let t = cp
+        .tensor(name)
+        .map_err(|e| Error::Checkpoint(format!("reading {what} tensor {name:?}: {e}")))?;
+    let v = t
+        .as_f32_flat()
+        .map_err(|e| Error::Checkpoint(format!("{what} tensor {name:?}: {e}")))?;
     ensure!(
         v.len() == expect,
         Checkpoint,
@@ -152,10 +150,7 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
         .ok_or_else(|| Error::internal("unreachable: embedding pick"))?;
     let final_norm_name = r
         .pick(
-            &[
-                "model.norm.weight".to_string(),
-                "norm.weight".into(),
-            ],
+            &["model.norm.weight".to_string(), "norm.weight".into()],
             "final norm (norm)",
         )
         .ok_or_else(|| Error::internal("unreachable: final norm pick"))?;
@@ -238,8 +233,14 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
     for i in 0..cfg.n_self_layers {
         let p = self_prefixes(i);
         let layer = LayerPlan {
-            attn_norm: r.pick(&prefixed(&p, "input_layernorm.weight"), &format!("layer {i} input norm")),
-            ffn_norm: r.pick(&prefixed(&p, "post_attention_layernorm.weight"), &format!("layer {i} post-attention norm")),
+            attn_norm: r.pick(
+                &prefixed(&p, "input_layernorm.weight"),
+                &format!("layer {i} input norm"),
+            ),
+            ffn_norm: r.pick(
+                &prefixed(&p, "post_attention_layernorm.weight"),
+                &format!("layer {i} post-attention norm"),
+            ),
             moe: moe_plan(&mut r, &p),
         };
         let conv = (0..cfg.dsa.conv_kernels.len())
@@ -252,17 +253,47 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
             .collect();
         self_plans.push(SelfPlan {
             layer,
-            q_a: r.pick(&prefixed(&p, "mla.q_a_proj.weight"), &format!("layer {i} MLA q_a")),
-            q_b: r.pick(&prefixed(&p, "mla.q_b_proj.weight"), &format!("layer {i} MLA q_b")),
-            kv_a: r.pick(&prefixed(&p, "mla.kv_a_proj.weight"), &format!("layer {i} MLA kv_a")),
-            wv: r.pick(&prefixed(&p, "mla.wv_proj.weight"), &format!("layer {i} MLA wv")),
-            wo: r.pick(&prefixed(&p, "mla.wo_proj.weight"), &format!("layer {i} MLA wo")),
-            kv_norm: r.pick(&prefixed(&p, "mla.kv_norm.weight"), &format!("layer {i} MLA kv_norm")),
+            q_a: r.pick(
+                &prefixed(&p, "mla.q_a_proj.weight"),
+                &format!("layer {i} MLA q_a"),
+            ),
+            q_b: r.pick(
+                &prefixed(&p, "mla.q_b_proj.weight"),
+                &format!("layer {i} MLA q_b"),
+            ),
+            kv_a: r.pick(
+                &prefixed(&p, "mla.kv_a_proj.weight"),
+                &format!("layer {i} MLA kv_a"),
+            ),
+            wv: r.pick(
+                &prefixed(&p, "mla.wv_proj.weight"),
+                &format!("layer {i} MLA wv"),
+            ),
+            wo: r.pick(
+                &prefixed(&p, "mla.wo_proj.weight"),
+                &format!("layer {i} MLA wo"),
+            ),
+            kv_norm: r.pick(
+                &prefixed(&p, "mla.kv_norm.weight"),
+                &format!("layer {i} MLA kv_norm"),
+            ),
             attn_sink: r.opt(&prefixed(&p, "self_attn.attn_sink.weight")),
-            wq: r.pick(&prefixed(&p, "indexer.wq.weight"), &format!("layer {i} indexer wq")),
-            wk: r.pick(&prefixed(&p, "indexer.wk.weight"), &format!("layer {i} indexer wk")),
-            weights_proj: r.pick(&prefixed(&p, "indexer.weights_proj.weight"), &format!("layer {i} indexer weights_proj")),
-            gate_proj: r.pick(&prefixed(&p, "indexer.gate_proj.weight"), &format!("layer {i} indexer gate_proj")),
+            wq: r.pick(
+                &prefixed(&p, "indexer.wq.weight"),
+                &format!("layer {i} indexer wq"),
+            ),
+            wk: r.pick(
+                &prefixed(&p, "indexer.wk.weight"),
+                &format!("layer {i} indexer wk"),
+            ),
+            weights_proj: r.pick(
+                &prefixed(&p, "indexer.weights_proj.weight"),
+                &format!("layer {i} indexer weights_proj"),
+            ),
+            gate_proj: r.pick(
+                &prefixed(&p, "indexer.gate_proj.weight"),
+                &format!("layer {i} indexer gate_proj"),
+            ),
             conv,
         });
     }
@@ -277,12 +308,24 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
         let p = cross_prefixes(cfg.n_self_layers, j);
         cross_plans.push(CrossPlan {
             layer: LayerPlan {
-                attn_norm: r.pick(&prefixed(&p, "input_layernorm.weight"), &format!("cross layer {j} input norm")),
-                ffn_norm: r.pick(&prefixed(&p, "post_attention_layernorm.weight"), &format!("cross layer {j} post-attention norm")),
+                attn_norm: r.pick(
+                    &prefixed(&p, "input_layernorm.weight"),
+                    &format!("cross layer {j} input norm"),
+                ),
+                ffn_norm: r.pick(
+                    &prefixed(&p, "post_attention_layernorm.weight"),
+                    &format!("cross layer {j} post-attention norm"),
+                ),
                 moe: moe_plan(&mut r, &p),
             },
-            q_proj: r.pick(&prefixed(&p, "cross_attn.q_proj.weight"), &format!("cross layer {j} q_proj")),
-            o_proj: r.pick(&prefixed(&p, "cross_attn.o_proj.weight"), &format!("cross layer {j} o_proj")),
+            q_proj: r.pick(
+                &prefixed(&p, "cross_attn.q_proj.weight"),
+                &format!("cross layer {j} q_proj"),
+            ),
+            o_proj: r.pick(
+                &prefixed(&p, "cross_attn.o_proj.weight"),
+                &format!("cross layer {j} o_proj"),
+            ),
         });
     }
 
@@ -307,7 +350,10 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
             "block.w_gate_up.weight",
             "block.w_down.weight",
         ] {
-            let cands: Vec<String> = mtp_prefixes.iter().map(|p| format!("{p}{suffix}")).collect();
+            let cands: Vec<String> = mtp_prefixes
+                .iter()
+                .map(|p| format!("{p}{suffix}"))
+                .collect();
             let n = r.pick(&cands, &format!("MTP {suffix}"));
             names.push(n);
         }
@@ -328,15 +374,30 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
     };
 
     let load_moe = |plan: &MoePlan| -> Result<MoeWeights> {
-        let gate = tensor_f32(cp, plan.gate.as_ref().unwrap(), cfg.moe.num_routed * h, "MoE gate")?;
+        let gate = tensor_f32(
+            cp,
+            plan.gate.as_ref().unwrap(),
+            cfg.moe.num_routed * h,
+            "MoE gate",
+        )?;
         let gate_bias = match &plan.gate_bias {
             Some(n) => tensor_f32(cp, n, cfg.moe.num_routed, "MoE gate bias")?,
             None => vec![0.0; cfg.moe.num_routed],
         };
         let expert = |gu: &Option<String>, dn: &Option<String>| -> Result<ExpertWeights> {
             Ok(ExpertWeights {
-                w_gate_up: tensor_f32(cp, gu.as_ref().unwrap(), 2 * cfg.moe.intermediate * h, "expert gate_up")?,
-                w_down: tensor_f32(cp, dn.as_ref().unwrap(), h * cfg.moe.intermediate, "expert down")?,
+                w_gate_up: tensor_f32(
+                    cp,
+                    gu.as_ref().unwrap(),
+                    2 * cfg.moe.intermediate * h,
+                    "expert gate_up",
+                )?,
+                w_down: tensor_f32(
+                    cp,
+                    dn.as_ref().unwrap(),
+                    h * cfg.moe.intermediate,
+                    "expert down",
+                )?,
             })
         };
         let mut shared = Vec::with_capacity(plan.shared.len());
@@ -368,7 +429,12 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
             )?);
         }
         let mla = MlaWeights {
-            q_a_proj: tensor_f32(cp, plan.q_a.as_ref().unwrap(), cfg.q_lora_rank * h, "MLA q_a")?,
+            q_a_proj: tensor_f32(
+                cp,
+                plan.q_a.as_ref().unwrap(),
+                cfg.q_lora_rank * h,
+                "MLA q_a",
+            )?,
             q_b_proj: tensor_f32(
                 cp,
                 plan.q_b.as_ref().unwrap(),
@@ -405,7 +471,12 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
                 cfg.dsa.num_heads * idx,
                 "indexer weights_proj",
             )?,
-            gate_proj: tensor_f32(cp, plan.gate_proj.as_ref().unwrap(), 4 * h, "indexer gate_proj")?,
+            gate_proj: tensor_f32(
+                cp,
+                plan.gate_proj.as_ref().unwrap(),
+                4 * h,
+                "indexer gate_proj",
+            )?,
             conv_weights,
         };
         self_layers.push(SelfLayerWeights {
@@ -413,18 +484,38 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
             indexer,
             moe: load_moe(&plan.layer.moe)?,
             attn_norm: tensor_f32(cp, plan.layer.attn_norm.as_ref().unwrap(), h, "input norm")?,
-            ffn_norm: tensor_f32(cp, plan.layer.ffn_norm.as_ref().unwrap(), h, "post-attention norm")?,
+            ffn_norm: tensor_f32(
+                cp,
+                plan.layer.ffn_norm.as_ref().unwrap(),
+                h,
+                "post-attention norm",
+            )?,
         });
     }
 
     let mut cross_layers = Vec::with_capacity(cfg.n_cross_layers);
     for plan in &cross_plans {
         cross_layers.push(CrossLayerWeights {
-            q_proj: tensor_f32(cp, plan.q_proj.as_ref().unwrap(), cfg.n_heads * hd * h, "cross q_proj")?,
-            o_proj: tensor_f32(cp, plan.o_proj.as_ref().unwrap(), h * cfg.n_heads * hd, "cross o_proj")?,
+            q_proj: tensor_f32(
+                cp,
+                plan.q_proj.as_ref().unwrap(),
+                cfg.n_heads * hd * h,
+                "cross q_proj",
+            )?,
+            o_proj: tensor_f32(
+                cp,
+                plan.o_proj.as_ref().unwrap(),
+                h * cfg.n_heads * hd,
+                "cross o_proj",
+            )?,
             moe: load_moe(&plan.layer.moe)?,
             attn_norm: tensor_f32(cp, plan.layer.attn_norm.as_ref().unwrap(), h, "input norm")?,
-            ffn_norm: tensor_f32(cp, plan.layer.ffn_norm.as_ref().unwrap(), h, "post-attention norm")?,
+            ffn_norm: tensor_f32(
+                cp,
+                plan.layer.ffn_norm.as_ref().unwrap(),
+                h,
+                "post-attention norm",
+            )?,
         });
     }
 
@@ -436,16 +527,36 @@ pub(crate) fn load_weights(cp: &CheckpointDir, cfg: &ModelConfig) -> Result<Mode
                 shared_norm: tensor_f32(cp, names[1].as_ref().unwrap(), h, "MTP shared_norm")?,
                 depth_norm: tensor_f32(cp, names[2].as_ref().unwrap(), h, "MTP depth_norm")?,
                 block: MtpBlockWeights {
-                    attn_norm: tensor_f32(cp, names[4].as_ref().unwrap(), h, "MTP block attn_norm")?,
+                    attn_norm: tensor_f32(
+                        cp,
+                        names[4].as_ref().unwrap(),
+                        h,
+                        "MTP block attn_norm",
+                    )?,
                     wq: tensor_f32(cp, names[5].as_ref().unwrap(), h * h, "MTP block wq")?,
                     wk: tensor_f32(cp, names[6].as_ref().unwrap(), h * h, "MTP block wk")?,
                     wv: tensor_f32(cp, names[7].as_ref().unwrap(), h * h, "MTP block wv")?,
                     wo: tensor_f32(cp, names[8].as_ref().unwrap(), h * h, "MTP block wo")?,
                     mlp_norm: tensor_f32(cp, names[9].as_ref().unwrap(), h, "MTP block mlp_norm")?,
-                    w_gate_up: tensor_f32(cp, names[10].as_ref().unwrap(), 2 * gi * h, "MTP block w_gate_up")?,
-                    w_down: tensor_f32(cp, names[11].as_ref().unwrap(), h * gi, "MTP block w_down")?,
+                    w_gate_up: tensor_f32(
+                        cp,
+                        names[10].as_ref().unwrap(),
+                        2 * gi * h,
+                        "MTP block w_gate_up",
+                    )?,
+                    w_down: tensor_f32(
+                        cp,
+                        names[11].as_ref().unwrap(),
+                        h * gi,
+                        "MTP block w_down",
+                    )?,
                 },
-                head: tensor_f32(cp, names[3].as_ref().unwrap(), cfg.vocab_size * h, "MTP head")?,
+                head: tensor_f32(
+                    cp,
+                    names[3].as_ref().unwrap(),
+                    cfg.vocab_size * h,
+                    "MTP head",
+                )?,
             })
         }
         None => None,
@@ -496,7 +607,10 @@ mod tests {
                 name.clone(),
                 Json::Obj(vec![
                     ("dtype".into(), Json::Str("F32".into())),
-                    ("shape".into(), Json::Arr(vec![Json::U64(data.len() as u64)])),
+                    (
+                        "shape".into(),
+                        Json::Arr(vec![Json::U64(data.len() as u64)]),
+                    ),
                     (
                         "data_offsets".into(),
                         Json::Arr(vec![Json::U64(offset as u64), Json::U64(end as u64)]),
@@ -541,11 +655,20 @@ mod tests {
                 } else {
                     String::new()
                 };
-                t.push((format!("{p}mlp.shared_experts{tag}.gate_up.weight"), s.w_gate_up.clone()));
-                t.push((format!("{p}mlp.shared_experts{tag}.down.weight"), s.w_down.clone()));
+                t.push((
+                    format!("{p}mlp.shared_experts{tag}.gate_up.weight"),
+                    s.w_gate_up.clone(),
+                ));
+                t.push((
+                    format!("{p}mlp.shared_experts{tag}.down.weight"),
+                    s.w_down.clone(),
+                ));
             }
             for (e, w) in mo.routed.iter().enumerate() {
-                t.push((format!("{p}mlp.experts.{e}.gate_up.weight"), w.w_gate_up.clone()));
+                t.push((
+                    format!("{p}mlp.experts.{e}.gate_up.weight"),
+                    w.w_gate_up.clone(),
+                ));
                 t.push((format!("{p}mlp.experts.{e}.down.weight"), w.w_down.clone()));
             }
         };
@@ -553,7 +676,10 @@ mod tests {
             let p = format!("model.layers.{i}.");
             let p = pfx(&p);
             t.push((format!("{p}input_layernorm.weight"), sl.attn_norm.clone()));
-            t.push((format!("{p}post_attention_layernorm.weight"), sl.ffn_norm.clone()));
+            t.push((
+                format!("{p}post_attention_layernorm.weight"),
+                sl.ffn_norm.clone(),
+            ));
             t.push((format!("{p}mla.q_a_proj.weight"), sl.mla.q_a_proj.clone()));
             t.push((format!("{p}mla.q_b_proj.weight"), sl.mla.q_b_proj.clone()));
             t.push((format!("{p}mla.kv_a_proj.weight"), sl.mla.kv_a_proj.clone()));
@@ -562,8 +688,14 @@ mod tests {
             t.push((format!("{p}mla.kv_norm.weight"), sl.mla.kv_norm.clone()));
             t.push((format!("{p}indexer.wq.weight"), sl.indexer.wq.clone()));
             t.push((format!("{p}indexer.wk.weight"), sl.indexer.wk.clone()));
-            t.push((format!("{p}indexer.weights_proj.weight"), sl.indexer.weights_proj.clone()));
-            t.push((format!("{p}indexer.gate_proj.weight"), sl.indexer.gate_proj.clone()));
+            t.push((
+                format!("{p}indexer.weights_proj.weight"),
+                sl.indexer.weights_proj.clone(),
+            ));
+            t.push((
+                format!("{p}indexer.gate_proj.weight"),
+                sl.indexer.gate_proj.clone(),
+            ));
             for (c, cw) in sl.indexer.conv_weights.iter().enumerate() {
                 t.push((format!("{p}indexer.conv.weights.{c}"), cw.clone()));
             }
@@ -573,7 +705,10 @@ mod tests {
             let g = cfg.n_self_layers + j;
             let p = pfx(&format!("model.layers.{g}."));
             t.push((format!("{p}input_layernorm.weight"), cl.attn_norm.clone()));
-            t.push((format!("{p}post_attention_layernorm.weight"), cl.ffn_norm.clone()));
+            t.push((
+                format!("{p}post_attention_layernorm.weight"),
+                cl.ffn_norm.clone(),
+            ));
             t.push((format!("{p}cross_attn.q_proj.weight"), cl.q_proj.clone()));
             t.push((format!("{p}cross_attn.o_proj.weight"), cl.o_proj.clone()));
             moe(&mut t, p, &cl.moe);
@@ -584,13 +719,22 @@ mod tests {
             t.push((format!("{p}shared_norm.weight"), mtp.shared_norm.clone()));
             t.push((format!("{p}depth_norm.weight"), mtp.depth_norm.clone()));
             t.push((format!("{p}head.weight"), mtp.head.clone()));
-            t.push((format!("{p}block.attn_norm.weight"), mtp.block.attn_norm.clone()));
+            t.push((
+                format!("{p}block.attn_norm.weight"),
+                mtp.block.attn_norm.clone(),
+            ));
             t.push((format!("{p}block.wq.weight"), mtp.block.wq.clone()));
             t.push((format!("{p}block.wk.weight"), mtp.block.wk.clone()));
             t.push((format!("{p}block.wv.weight"), mtp.block.wv.clone()));
             t.push((format!("{p}block.wo.weight"), mtp.block.wo.clone()));
-            t.push((format!("{p}block.mlp_norm.weight"), mtp.block.mlp_norm.clone()));
-            t.push((format!("{p}block.w_gate_up.weight"), mtp.block.w_gate_up.clone()));
+            t.push((
+                format!("{p}block.mlp_norm.weight"),
+                mtp.block.mlp_norm.clone(),
+            ));
+            t.push((
+                format!("{p}block.w_gate_up.weight"),
+                mtp.block.w_gate_up.clone(),
+            ));
             t.push((format!("{p}block.w_down.weight"), mtp.block.w_down.clone()));
         }
         t
@@ -601,7 +745,10 @@ mod tests {
             ("hidden_size".into(), Json::U64(cfg.hidden_size as u64)),
             ("n_layers".into(), Json::U64(cfg.n_layers as u64)),
             ("n_self_layers".into(), Json::U64(cfg.n_self_layers as u64)),
-            ("n_cross_layers".into(), Json::U64(cfg.n_cross_layers as u64)),
+            (
+                "n_cross_layers".into(),
+                Json::U64(cfg.n_cross_layers as u64),
+            ),
             ("vocab_size".into(), Json::U64(cfg.vocab_size as u64)),
         ]);
         fs::write(dir.join("config.json"), json.to_json_string()).unwrap();
@@ -613,7 +760,8 @@ mod tests {
             std::path::Path::new("/nonexistent/deepinfer/model"),
             &ModelConfig::v41_tiny(),
         )
-        .err().expect("expected an error");
+        .err()
+        .expect("expected an error");
         assert!(matches!(err, Error::Checkpoint(_)), "{err}");
         assert!(err.to_string().contains("nonexistent"), "{err}");
     }
@@ -621,7 +769,9 @@ mod tests {
     #[test]
     fn load_checkpoint_empty_dir_errors() {
         let dir = temp_dir("empty");
-        let err = DeepSeekModel::load_checkpoint(&dir, &ModelConfig::v41_tiny()).err().expect("expected an error");
+        let err = DeepSeekModel::load_checkpoint(&dir, &ModelConfig::v41_tiny())
+            .err()
+            .expect("expected an error");
         assert!(matches!(err, Error::Checkpoint(_)), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -631,8 +781,11 @@ mod tests {
         let cfg = ModelConfig::v41_tiny();
         let mut model = DeepSeekModel::random_init(&cfg, 1234).unwrap();
         let dir = temp_dir("rt_hf");
-        write_safetensors(&dir.join("model.safetensors"), &checkpoint_tensors(&model, false))
-            .unwrap();
+        write_safetensors(
+            &dir.join("model.safetensors"),
+            &checkpoint_tensors(&model, false),
+        )
+        .unwrap();
         write_config_json(&dir, &cfg);
         let mut loaded = DeepSeekModel::load_checkpoint(&dir, &cfg).unwrap();
         assert!(loaded.has_mtp());
@@ -656,7 +809,11 @@ mod tests {
         let cfg = ModelConfig::v41_tiny();
         let mut model = DeepSeekModel::random_init(&cfg, 99).unwrap();
         let dir = temp_dir("rt_flat");
-        write_safetensors(&dir.join("m.safetensors"), &checkpoint_tensors(&model, true)).unwrap();
+        write_safetensors(
+            &dir.join("m.safetensors"),
+            &checkpoint_tensors(&model, true),
+        )
+        .unwrap();
         let mut loaded = DeepSeekModel::load_checkpoint(&dir, &cfg).unwrap();
         let a = model.prefill(1, &[1, 2, 3]).unwrap();
         let b = loaded.prefill(1, &[1, 2, 3]).unwrap();
@@ -703,12 +860,12 @@ mod tests {
         // Drop lm_head (untied) and one indexer conv kernel.
         let tensors: Vec<(String, Vec<f32>)> = checkpoint_tensors(&model, false)
             .into_iter()
-            .filter(|(n, _)| {
-                n != "lm_head.weight" && n != "model.layers.1.indexer.conv.weights.0"
-            })
+            .filter(|(n, _)| n != "lm_head.weight" && n != "model.layers.1.indexer.conv.weights.0")
             .collect();
         write_safetensors(&dir.join("model.safetensors"), &tensors).unwrap();
-        let err = DeepSeekModel::load_checkpoint(&dir, &cfg).err().expect("expected an error");
+        let err = DeepSeekModel::load_checkpoint(&dir, &cfg)
+            .err()
+            .expect("expected an error");
         let msg = err.to_string();
         assert!(msg.contains("missing 2 required tensor"), "{msg}");
         assert!(msg.contains("lm_head") || msg.contains("conv"), "{msg}");
@@ -727,7 +884,9 @@ mod tests {
             }
         }
         write_safetensors(&dir.join("model.safetensors"), &tensors).unwrap();
-        let err = DeepSeekModel::load_checkpoint(&dir, &cfg).err().expect("expected an error");
+        let err = DeepSeekModel::load_checkpoint(&dir, &cfg)
+            .err()
+            .expect("expected an error");
         assert!(matches!(err, Error::Checkpoint(_)), "{err}");
         assert!(err.to_string().contains("final norm"), "{err}");
         let _ = fs::remove_dir_all(&dir);
@@ -738,11 +897,16 @@ mod tests {
         let cfg = ModelConfig::v41_tiny();
         let model = DeepSeekModel::random_init(&cfg, 9).unwrap();
         let dir = temp_dir("cfgmismatch");
-        write_safetensors(&dir.join("model.safetensors"), &checkpoint_tensors(&model, false))
-            .unwrap();
+        write_safetensors(
+            &dir.join("model.safetensors"),
+            &checkpoint_tensors(&model, false),
+        )
+        .unwrap();
         let mut other = cfg.clone();
         other.vocab_size = 255;
-        let err = DeepSeekModel::load_checkpoint(&dir, &other).err().expect("expected an error");
+        let err = DeepSeekModel::load_checkpoint(&dir, &other)
+            .err()
+            .expect("expected an error");
         assert!(
             err.to_string().contains("vocab_size") || err.to_string().contains("mtp shape"),
             "{err}"

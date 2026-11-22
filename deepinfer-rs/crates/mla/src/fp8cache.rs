@@ -255,7 +255,7 @@ mod tests {
         group[0] = 100.0;
         group[7] = -50.0;
         assert_eq!(fp8_group_scale(&group).unwrap(), 125); // 127 - 2
-        // amax = 449 -> 449/448 = 1.0022 -> ceil(log2) = 1 -> scale 2^1.
+                                                           // amax = 449 -> 449/448 = 1.0022 -> ceil(log2) = 1 -> scale 2^1.
         group[0] = 449.0;
         assert_eq!(fp8_group_scale(&group).unwrap(), 128);
         // All-zero group -> byte 0 (2^-127); zeros dequantize to zeros.
@@ -276,15 +276,19 @@ mod tests {
         dims[0] = 6.0; // even index -> LOW nibble, code 7
         dims[1] = 0.5; // odd index -> high nibble, code 1
         let mut bytes = [0u8; 288];
-        quantize_row(CacheFormat::Fp4Group16, &{
-            let mut v = [0.0f32; 512];
-            v[..16].copy_from_slice(&dims);
-            v
-        }, &mut bytes)
+        quantize_row(
+            CacheFormat::Fp4Group16,
+            &{
+                let mut v = [0.0f32; 512];
+                v[..16].copy_from_slice(&dims);
+                v
+            },
+            &mut bytes,
+        )
         .unwrap();
         assert_eq!(bytes[0], 7 | (1 << 4));
         assert_eq!(bytes[256], 0x38); // e4m3(1.0)
-        // Tiny amax: 0.03/6 = 0.005 -> RNE -> subnormal -> floored to 2^-6.
+                                      // Tiny amax: 0.03/6 = 0.005 -> RNE -> subnormal -> floored to 2^-6.
         let tiny = [0.03f32; 16];
         assert!((fp4_group_scale(&tiny).unwrap() - E4M3_MIN_NORMAL).abs() < 1e-12);
     }

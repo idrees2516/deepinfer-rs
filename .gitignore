@@ -1,2 +1,15 @@
-skills/
-node_modules/
+# Workspace scaffolding around the deepinfer-rs repo — never commit.
+/toolchain/
+/tool-results/
+/scratch/
+/logs/
+/download/
+/scripts/
+/skills/
+/upload/
+/db/
+/node_modules/
+/zcode/
+/worklog.md
+/.env
+/.venv/

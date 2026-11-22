@@ -38,6 +38,7 @@ use crate::device_model::{
     kv_row_bytes, DeviceModel, MoeW, Precision, DEVICE_MAX_PREFILL_TOKENS, MOE_ALIGN,
     MOE_CHUNK_TOKENS,
 };
+use crate::prefix_cache::{ksf_seg_range, GpuPrefixTree, PrefixCacheStats};
 
 /// Page size (kept in lockstep with the kernels).
 const PAGE: usize = deepinfer_kernels::SERVE_PAGE;
@@ -54,11 +55,7 @@ struct Pool {
 }
 
 impl Pool {
-    fn new(
-        dev: &deepinfer_gpu::Device,
-        total_pages: usize,
-        row_bytes: usize,
-    ) -> Result<Pool> {
+    fn new(dev: &deepinfer_gpu::Device, total_pages: usize, row_bytes: usize) -> Result<Pool> {
         ensure!(total_pages > 0, InvalidArgument, "pool needs pages");
         let bytes = total_pages
             .checked_mul(PAGE)
@@ -94,6 +91,15 @@ struct ServeSeq {
     k_sf: Buffer,
     /// Per cross layer: `[swa_window, hidden]` f32 ring.
     rings: Vec<Buffer>,
+    /// Full token history (the prefix-cache key; truncated on
+    /// rollback exactly like `len`).
+    tokens: Vec<u32>,
+    /// Rows `[0..shared)` sit on tree-leased pages: content frozen,
+    /// writes trigger copy-on-write (see `serve_prefix_cow`).
+    shared: usize,
+    /// Rows `[0..inserted)` of the current token history are already
+    /// radix-tree nodes (block-aligned; the insert starting point).
+    inserted: usize,
 }
 
 /// Serve scratch (fixed maxima; every buffer is allocated once).
@@ -165,6 +171,14 @@ pub(crate) struct PagedState {
     layers: Vec<LayerPools>,
     /// The one shared free list (page ids are global across layers/kinds).
     free: Vec<u32>,
+    /// Per-page lease counts: a page is in `free` iff its count is 0.
+    /// Lease holders: attached sequences and radix-tree nodes.
+    refs: Vec<u32>,
+    /// The prefix cache (block-granular radix tree over the pools).
+    prefix: GpuPrefixTree,
+    /// Device bytes one page id holds (all layers, all five pools) —
+    /// the ring-snapshot cost converter for the tree budget.
+    page_units_bytes: usize,
     seqs: BTreeMap<u32, ServeSeq>,
     max_seqs: usize,
     max_len: usize,
@@ -178,6 +192,9 @@ impl PagedState {
         PagedState {
             layers: Vec::new(),
             free: Vec::new(),
+            refs: Vec::new(),
+            prefix: GpuPrefixTree::new(0, 0),
+            page_units_bytes: 1,
             seqs: BTreeMap::new(),
             max_seqs: 0,
             max_len: 0,
@@ -209,7 +226,11 @@ impl DeviceModel {
     ) -> Result<()> {
         ensure!(max_seqs >= 1, InvalidArgument, "max_seqs must be >= 1");
         ensure!(max_len >= 1, InvalidArgument, "max_len must be >= 1");
-        ensure!(pages_per_layer >= 1, InvalidArgument, "pages_per_layer must be >= 1");
+        ensure!(
+            pages_per_layer >= 1,
+            InvalidArgument,
+            "pages_per_layer must be >= 1"
+        );
         ensure!(
             self.paged.seqs.is_empty(),
             InvalidArgument,
@@ -231,8 +252,16 @@ impl DeviceModel {
             })
             .collect();
         let layers = layers?;
+        // One cached page id holds rows in every layer's five pools; the
+        // honest per-page device cost drives the prefix-cache budget.
+        let idx_dim = cfg.dsa.num_heads * cfg.dsa.head_dim;
+        let row_bytes_per_layer = kv_rb + idx_dim * 4 + idx_dim * 4 + idx_dim + idx_dim * 4;
+        let page_units_bytes = row_bytes_per_layer * PAGE * cfg.n_self_layers;
         self.paged = PagedState {
             free: (0..pages_per_layer as u32).rev().collect(),
+            refs: vec![0; pages_per_layer],
+            prefix: GpuPrefixTree::new(0, 0),
+            page_units_bytes,
             layers,
             seqs: BTreeMap::new(),
             max_seqs,
@@ -322,7 +351,11 @@ impl DeviceModel {
             moe_drops: b(4)?,
             moe_perm: f(e * cap * hidden)?,
             moe_map: b(score_rows * ki * 4)?,
-            moe_aq: if fp8 { Some(b(e * cap * hidden)?) } else { None },
+            moe_aq: if fp8 {
+                Some(b(e * cap * hidden)?)
+            } else {
+                None
+            },
             moe_asf: if fp8 {
                 Some(b(e * cap * (hidden / 128))?)
             } else {
@@ -336,7 +369,11 @@ impl DeviceModel {
             } else {
                 None
             },
-            moe_a16: if fp8 { None } else { Some(f(e * cap * 2 * inter)?) },
+            moe_a16: if fp8 {
+                None
+            } else {
+                Some(f(e * cap * 2 * inter)?)
+            },
             moe_down: f(e * cap * hidden)?,
             moe_y: f(score_rows * hidden)?,
             topk_w: f(score_rows * ki)?,
@@ -382,12 +419,17 @@ impl DeviceModel {
                 tbl,
                 k_sf,
                 rings: rings?,
+                tokens: Vec::new(),
+                shared: 0,
+                inserted: 0,
             },
         );
         Ok(())
     }
 
-    /// Detach a sequence; its pages return to the shared free list.
+    /// Detach a sequence; its page leases drop (pages shared with the
+    /// radix tree or other sequences survive until their last lease
+    /// ends; only then do they return to the free list).
     ///
     /// # Errors
     /// [`Error::InvalidArgument`] for an unknown sequence.
@@ -397,9 +439,9 @@ impl DeviceModel {
             .seqs
             .remove(&seq)
             .ok_or_else(|| Error::invalid(format!("sequence {seq} is not attached")))?;
-        let mut pages = s.pages;
-        self.paged.free.extend_from_slice(&pages);
-        pages.clear();
+        for p in s.pages {
+            self.release_page(p);
+        }
         Ok(())
     }
 
@@ -415,7 +457,9 @@ impl DeviceModel {
 
     /// Roll back `n` cached rows of an attached sequence (page tables keep
     /// their entries; re-appended rows overwrite their slots, exactly like
-    /// the arena rollback).
+    /// the arena rollback). Tree-leased rows stay frozen: if a later append
+    /// re-enters the shared region the affected pages are copied-on-write,
+    /// so the radix tree's snapshots never see overwritten content.
     ///
     /// # Errors
     /// [`Error::InvalidArgument`] for an unknown sequence or `n > len`.
@@ -427,10 +471,21 @@ impl DeviceModel {
             .ok_or_else(|| Error::invalid(format!("sequence {seq} is not attached")))?;
         ensure!(n <= s.len, InvalidArgument, "rollback beyond cached length");
         s.len -= n;
+        // Blocks at or beyond the new length will be re-appended with
+        // different tokens: they are no longer tree members of this
+        // history. (Block-aligned clamp; rows below keep their tokens.)
+        // `shared` is deliberately NOT clamped: the tree nodes for the
+        // old history still lease those pages, so the copy-on-write
+        // guard must keep protecting them.
+        let t = (s.len / PAGE) * PAGE;
+        s.inserted = s.inserted.min(t);
+        s.tokens.truncate(s.len);
         Ok(())
     }
 
     /// Grow `seq`'s page table to cover `total` rows and upload it.
+    /// Page grants run through the pressure valve: when the free list
+    /// runs dry, radix-tree leaves are evicted before the call fails.
     fn serve_ensure_pages(&mut self, seq: u32, total: usize) -> Result<()> {
         let need = total.div_ceil(PAGE);
         ensure!(
@@ -440,33 +495,373 @@ impl DeviceModel {
             self.paged.max_pages_per_seq
         );
         let have = {
-            let s = self.paged.seqs.get(&seq).ok_or_else(|| {
-                Error::invalid(format!("sequence {seq} is not attached"))
-            })?;
+            let s = self
+                .paged
+                .seqs
+                .get(&seq)
+                .ok_or_else(|| Error::invalid(format!("sequence {seq} is not attached")))?;
             s.pages.len()
         };
         if need > have {
             let take = need - have;
-            ensure!(
-                self.paged.free.len() >= take,
-                CapacityExceeded,
-                "paged cache exhausted ({} free of {} pages); raise the pool budget",
-                self.paged.free.len(),
-                self.paged.total_pages
-            );
-            let granted: Vec<u32> = (0..take)
-                .map(|_| self.paged.free.pop().expect("checked above"))
-                .collect();
+            let mut granted = Vec::with_capacity(take);
+            for _ in 0..take {
+                match self.serve_alloc_page() {
+                    Ok(p) => granted.push(p),
+                    Err(e) => {
+                        // Return what we took before failing.
+                        for p in granted {
+                            self.release_page(p);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
             let tbl_words: Vec<i32> = {
                 let s = self.paged.seqs.get_mut(&seq).expect("checked above");
                 s.pages.extend_from_slice(&granted);
                 s.pages.iter().map(|&p| p as i32).collect()
             };
-            let view = self.paged.seqs[&seq]
-                .tbl
-                .slice(0, tbl_words.len() * 4)?;
+            let view = self.paged.seqs[&seq].tbl.slice(0, tbl_words.len() * 4)?;
             self.stream.write_async(&self.dev, &view, &tbl_words)?;
         }
+        Ok(())
+    }
+
+    /// Pop a page from the free list; when empty, evict radix-tree
+    /// leaves (the prefix cache is the pressure valve — live sequences
+    /// always outrank cached prefixes) until a page frees.
+    ///
+    /// # Errors
+    /// [`Error::CapacityExceeded`] when the pools are exhausted even
+    /// after evicting the whole tree.
+    fn serve_alloc_page(&mut self) -> Result<u32> {
+        if let Some(p) = self.paged.free.pop() {
+            return Ok(p);
+        }
+        while self.paged.prefix.holds_pages() {
+            let Some(p) = self.paged.prefix.evict_lru_leaf() else {
+                break;
+            };
+            if self.release_page(p) {
+                return Ok(p);
+            }
+        }
+        Err(Error::CapacityExceeded(format!(
+            "paged cache exhausted ({} pages); raise the pool budget",
+            self.paged.total_pages
+        )))
+    }
+
+    /// Drop one lease on `p`; the page returns to the free list iff
+    /// that was the last one. Returns whether the page was freed.
+    fn release_page(&mut self, p: u32) -> bool {
+        let r = &mut self.paged.refs[p as usize];
+        if *r > 0 {
+            *r -= 1;
+        }
+        if *r == 0 {
+            self.paged.free.push(p);
+            true
+        } else {
+            false
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // GPU prefix caching (block radix tree over the shared pools)
+    // ------------------------------------------------------------------
+
+    /// Configure the GPU prefix cache: at most `budget_tokens` prompt
+    /// tokens of shared pages plus ring snapshots (0 disables; the
+    /// default after [`DeviceModel::serve_configure`]). The budget is
+    /// honest about device bytes: a node costs its page plus its ring
+    /// snapshot, both counted in page-units, so ring-heavy configs
+    /// cache proportionally fewer blocks. Call after every
+    /// `serve_configure` (reconfiguration resets the budget to 0).
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] before [`DeviceModel::serve_configure`].
+    pub fn serve_prefix_configure(&mut self, budget_tokens: usize) -> Result<()> {
+        ensure!(
+            !self.paged.layers.is_empty(),
+            InvalidArgument,
+            "call serve_configure first"
+        );
+        let ring_bytes =
+            self.cfg.n_cross_layers * self.cfg.swa_window.max(1) * self.cfg.hidden_size * 4;
+        let ring_units = ring_bytes / self.paged.page_units_bytes.max(1);
+        self.paged
+            .prefix
+            .set_budget(budget_tokens.div_ceil(PAGE), ring_units);
+        for p in self.paged.prefix.evict_to_budget() {
+            self.release_page(p);
+        }
+        Ok(())
+    }
+
+    /// The prefix-cache counters (hits, reused tokens, inserts,
+    /// evictions, live nodes, budget) — the GPU analogue of the CPU
+    /// server's `PrefixIndex` gauges.
+    pub fn serve_prefix_stats(&self) -> PrefixCacheStats {
+        self.paged.prefix.stats()
+    }
+
+    /// Drop every cached prefix (tree leases end; pages shared with
+    /// live sequences survive them). The budget and the allocation
+    /// pressure valve manage the tree automatically — this is for
+    /// benchmarks and cache-off measurements.
+    pub fn serve_prefix_reset(&mut self) {
+        for p in self.paged.prefix.clear() {
+            self.release_page(p);
+        }
+    }
+
+    /// Match and adopt a cached prefix for a **fresh** sequence: shares
+    /// the radix path's pages (bumping their leases), uploads the page
+    /// table, restores the `k_sf` scale prefix and copies the ring
+    /// snapshot — a handful of pointer writes and device-to-device
+    /// copies replacing a compute-bound prefill. Returns the restored
+    /// row count (a page-aligned 0 when the cache misses).
+    ///
+    /// The restored state is bit-identical to a cold prefill of the
+    /// same tokens at the same chunk boundary: the pages hold the
+    /// donor's exact rows and the rings its exact window.
+    fn serve_prefix_restore(&mut self, seq: u32, tokens: &[u32]) -> Result<usize> {
+        if !self.paged.prefix.enabled() || tokens.is_empty() {
+            return Ok(0);
+        }
+        // At least one token must remain for the suffix prefill.
+        let limit = (tokens.len() - 1) / PAGE;
+        if limit == 0 {
+            return Ok(0);
+        }
+        let m = self.paged.prefix.match_blocks(&tokens[..limit * PAGE]);
+        if m == 0 {
+            return Ok(0);
+        }
+        let rows = m * PAGE;
+        let (pages, ksf) = self.paged.prefix.restore_payload(tokens, m);
+        if pages.len() != m {
+            return Ok(0); // evicted between match and collect: cold path
+        }
+        // Adopt the pages (disjoint-field borrows: prefix vs seqs vs refs).
+        for &p in &pages {
+            self.paged.refs[p as usize] += 1;
+        }
+        let tbl_words: Vec<i32>;
+        {
+            let s = self
+                .paged
+                .seqs
+                .get_mut(&seq)
+                .ok_or_else(|| Error::invalid(format!("sequence {seq} is not attached")))?;
+            s.pages = pages;
+            s.tokens = tokens[..rows].to_vec();
+            s.shared = rows;
+            s.inserted = rows;
+            s.len = rows;
+            tbl_words = s.pages.iter().map(|&p| p as i32).collect();
+        }
+        let view = self.paged.seqs[&seq].tbl.slice(0, tbl_words.len() * 4)?;
+        self.stream.write_async(&self.dev, &view, &tbl_words)?;
+        if !ksf.is_empty() {
+            let sf = self.paged.seqs[&seq].k_sf.slice(0, ksf.len())?;
+            self.stream.write_async(&self.dev, &sf, &ksf)?;
+        }
+        // Ring snapshot -> the sequence's rings (stream-ordered D2D).
+        if let Some(src) = self.paged.prefix.endpoint_rings(tokens, m) {
+            let s = &self.paged.seqs[&seq];
+            for (l, ring) in s.rings.iter().enumerate() {
+                if let Some(from) = src.get(l) {
+                    self.dev.memcpy_dtod_async(ring, from, &self.stream)?;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Insert the sequence's newly completed blocks into the radix
+    /// tree: pages leased (frozen), `k_sf` segments read back, ring
+    /// snapshots copied. Called after every committed prefill chunk and
+    /// decode step; speculative-verify chunks never insert (their rows
+    /// are reversible). Blocks another sequence already cached are
+    /// skipped (LRU-touched, no new lease). Ring allocation failures
+    /// degrade the node to a walk-through (not a match endpoint)
+    /// rather than failing the step.
+    fn serve_prefix_insert(&mut self, seq: u32) -> Result<()> {
+        if !self.paged.prefix.enabled() {
+            return Ok(());
+        }
+        // Cheap no-op check first: the decode hot path calls this every
+        // step, and blocks complete only once per PAGE tokens.
+        let (len, inserted) = {
+            let Some(s) = self.paged.seqs.get(&seq) else {
+                return Ok(());
+            };
+            (s.len, s.inserted)
+        };
+        let nb = len / PAGE;
+        if nb <= inserted / PAGE {
+            if self.paged.prefix.holds_pages() {
+                for p in self.paged.prefix.evict_to_budget() {
+                    self.release_page(p);
+                }
+            }
+            return Ok(());
+        }
+        let (pages, n_rings, ksf_len) = {
+            let Some(s) = self.paged.seqs.get(&seq) else {
+                return Ok(());
+            };
+            (s.pages.clone(), s.rings.len(), s.k_sf.len())
+        };
+        let tokens = {
+            let Some(s) = self.paged.seqs.get(&seq) else {
+                return Ok(());
+            };
+            s.tokens.clone()
+        };
+        if tokens.len() < len {
+            return Ok(()); // history desync: never cache wrong tokens
+        }
+        // Leading blocks already present (ours or another sequence's).
+        let start = self
+            .paged
+            .prefix
+            .shared_blocks(&tokens)
+            .max(inserted / PAGE);
+        let qb = self.cfg.dsa.quant_block;
+        let ring_bytes = self.cfg.swa_window.max(1) * self.cfg.hidden_size * 4;
+        let mut done = start * PAGE;
+        for b in start..nb {
+            if b >= pages.len() {
+                break;
+            }
+            // The k_sf bytes completing inside this block.
+            let (s0, s1) = ksf_seg_range(b, qb);
+            let mut seg = Vec::new();
+            if s1 > s0 && s1 <= ksf_len {
+                self.stream.synchronize()?;
+                let view = self.paged.seqs[&seq].k_sf.slice(s0, s1 - s0)?;
+                seg = vec![0u8; s1 - s0];
+                self.dev.read(&view, &mut seg)?;
+            }
+            // The ring snapshot (device-owned; freed when the node is).
+            let rings = if n_rings == 0 {
+                Some(Vec::new()) // zero cross layers: a valid endpoint
+            } else {
+                let bufs: Result<Vec<Buffer>> =
+                    (0..n_rings).map(|_| self.dev.alloc(ring_bytes)).collect();
+                match bufs {
+                    Ok(dst) => {
+                        let s = &self.paged.seqs[&seq];
+                        for (l, d) in dst.iter().enumerate() {
+                            if let Some(src) = s.rings.get(l) {
+                                self.dev.memcpy_dtod_async(d, src, &self.stream)?;
+                            }
+                        }
+                        Some(dst)
+                    }
+                    // VRAM pressure: a walk-through node still shares
+                    // the page for deeper matches.
+                    Err(_) => None,
+                }
+            };
+            let p = pages[b];
+            self.paged.refs[p as usize] += 1; // the tree lease
+            if self
+                .paged
+                .prefix
+                .insert_block(&tokens, b, p, seg, rings)
+                .is_err()
+            {
+                // Never fail the serving step for a cache insert.
+                self.release_page(p);
+                break;
+            }
+            done = (b + 1) * PAGE;
+        }
+        if let Some(s) = self.paged.seqs.get_mut(&seq) {
+            s.inserted = done;
+            // Older-history nodes may still lease pages beyond `done`
+            // (rollback kept them frozen); the freeze range only grows.
+            s.shared = s.shared.max(done);
+        }
+        for p in self.paged.prefix.evict_to_budget() {
+            self.release_page(p);
+        }
+        Ok(())
+    }
+
+    /// Copy-on-write guard: appends starting at `pos0` that would
+    /// rewrite tree-frozen rows get fresh private pages (full-page
+    /// device copies; the tail rows are stale but always rewritten
+    /// before any reader can see them). The old pages stay leased by
+    /// the radix tree with their frozen content intact. Blocks whose
+    /// frozen content the re-append reproduces exactly (the scheduler
+    /// rewind case: same prompt re-prefilled) skip the copy.
+    fn serve_prefix_cow(&mut self, seq: u32, pos0: usize) -> Result<()> {
+        let (shared_blocks, tokens) = {
+            let Some(s) = self.paged.seqs.get(&seq) else {
+                return Ok(());
+            };
+            (s.shared / PAGE, s.tokens.clone())
+        };
+        let fb = pos0 / PAGE;
+        if fb >= shared_blocks {
+            return Ok(());
+        }
+        // Leading blocks whose cached content the current history
+        // reproduces exactly: rewrites there are no-ops on the pages.
+        let matched = self
+            .paged
+            .prefix
+            .matching_blocks(&tokens)
+            .min(shared_blocks);
+        let from = fb.max(matched);
+        if from >= shared_blocks {
+            return Ok(()); // identical rewrite (rewind): nothing to do
+        }
+        // Per-kind row bytes (the pool geometry from serve_configure).
+        let idx_dim = self.cfg.dsa.num_heads * self.cfg.dsa.head_dim;
+        let kv_rb = kv_row_bytes(self.fmt, self.cfg.head_dim);
+        let rbs = [kv_rb, idx_dim * 4, idx_dim * 4, idx_dim, idx_dim * 4];
+        for b in from..shared_blocks {
+            let old = self.paged.seqs[&seq].pages[b];
+            let fresh = self.serve_alloc_page()?;
+            {
+                // Enqueue the five per-layer page copies (immutable
+                // borrows; mutations follow once the stream has them).
+                for l in &self.paged.layers {
+                    let bufs = [
+                        (&l.kv.buf, rbs[0]),
+                        (&l.k_raw.buf, rbs[1]),
+                        (&l.k_norm.buf, rbs[2]),
+                        (&l.k_u8.buf, rbs[3]),
+                        (&l.feat.buf, rbs[4]),
+                    ];
+                    for (buf, rb) in bufs {
+                        let bytes = rb * PAGE;
+                        let dst = buf.slice(fresh as usize * bytes, bytes)?;
+                        let src = buf.slice(old as usize * bytes, bytes)?;
+                        self.dev.memcpy_dtod_async(&dst, &src, &self.stream)?;
+                    }
+                }
+            }
+            let s = self.paged.seqs.get_mut(&seq).expect("attached");
+            s.pages[b] = fresh;
+            self.release_page(old);
+        }
+        // Re-upload the page table and drop the frozen range.
+        let tbl_words: Vec<i32> = {
+            let s = self.paged.seqs.get_mut(&seq).expect("attached");
+            s.shared = from * PAGE;
+            s.inserted = s.inserted.min(from * PAGE);
+            s.pages.iter().map(|&p| p as i32).collect()
+        };
+        let view = self.paged.seqs[&seq].tbl.slice(0, tbl_words.len() * 4)?;
+        self.stream.write_async(&self.dev, &view, &tbl_words)?;
         Ok(())
     }
 
@@ -479,7 +874,11 @@ impl DeviceModel {
             .as_ref()
             .ok_or_else(|| Error::internal("serve workspace missing"))?;
         let b = slots.len();
-        ensure!(b <= ws_rows_bound(self), InvalidArgument, "batch exceeds max_seqs");
+        ensure!(
+            b <= ws_rows_bound(self),
+            InvalidArgument,
+            "batch exceeds max_seqs"
+        );
         let mut in_cells = Vec::with_capacity(b * 5);
         let mut tbl = Vec::with_capacity(b);
         let mut sf = Vec::with_capacity(b);
@@ -497,7 +896,8 @@ impl DeviceModel {
                 rings[l * b + i] = ring.ptr();
             }
         }
-        self.stream.write_async(&self.dev, &ws.cells_in, &in_cells)?;
+        self.stream
+            .write_async(&self.dev, &ws.cells_in, &in_cells)?;
         self.stream.write_async(&self.dev, &ws.tbl_ptrs, &tbl)?;
         self.stream.write_async(&self.dev, &ws.sf_ptrs, &sf)?;
         self.stream.write_async(&self.dev, &ws.ring_ptrs, &rings)?;
@@ -541,26 +941,123 @@ impl DeviceModel {
             );
         }
         let mut logits = Vec::new();
-        let mut done = 0usize;
+        // Fresh sequence: adopt any cached prefix (page sharing) before
+        // the first chunk; the suffix prefill starts at `skip`.
+        let skip = if take_seq_len(&self.paged, seq)? == 0 {
+            self.serve_prefix_restore(seq, tokens)?
+        } else {
+            0
+        };
+        let mut done = skip;
         while done < tokens.len() {
             let take = SERVE_CHUNK.min(tokens.len() - done);
             let chunk = &tokens[done..done + take];
-            let l = self.serve_prefill_chunk(seq, chunk)?;
+            let rows = self.serve_chunk_rows(seq, chunk)?;
+            self.serve_prefix_insert(seq)?;
             if done + take == tokens.len() {
-                logits = l;
+                logits = rows.into_iter().next_back().expect("non-empty chunk");
             }
             done += take;
         }
         Ok(logits)
     }
 
-    /// One prefill chunk (B = 1 slot, sq = chunk).
-    fn serve_prefill_chunk(&mut self, seq: u32, tokens: &[u32]) -> Result<Vec<f32>> {
+    /// [`DeviceModel::serve_prefill`] with the full speculative-decoding
+    /// anchor: the final position's logits **and** residual hidden state
+    /// (see [`crate::model::ForwardOut`]).
+    ///
+    /// # Errors
+    /// Same as [`DeviceModel::serve_prefill`].
+    pub fn serve_prefill_out(
+        &mut self,
+        seq: u32,
+        tokens: &[u32],
+    ) -> Result<crate::model::ForwardOut> {
+        let mut last = None;
+        // Fresh sequence: adopt any cached prefix before chunking.
+        let skip = if take_seq_len(&self.paged, seq)? == 0 {
+            self.serve_prefix_restore(seq, tokens)?
+        } else {
+            0
+        };
+        let mut done = skip;
+        while done < tokens.len() {
+            let take = SERVE_CHUNK.min(tokens.len() - done);
+            let chunk = &tokens[done..done + take];
+            let (logits, hidden) = self.serve_chunk_rows_out(seq, chunk)?;
+            self.serve_prefix_insert(seq)?;
+            if done + take == tokens.len() {
+                last = Some(crate::model::ForwardOut { logits, hidden });
+            }
+            done += take;
+        }
+        last.ok_or_else(|| Error::invalid("serve_prefill_out requires tokens"))
+    }
+
+    /// One prefill/verify chunk (B = 1 slot, sq = chunk): runs the shared
+    /// serve forward and reads **every** position's logit row plus the
+    /// last position's residual hidden state.
+    fn serve_chunk_rows_out(&mut self, seq: u32, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        let rows = self.serve_chunk_rows(seq, tokens)?;
+        let hidden = self.read_last_hidden(tokens.len())?;
+        let logits = rows.into_iter().next_back().expect("non-empty chunk");
+        Ok((logits, hidden))
+    }
+
+    /// Reads the residual hidden state of the last row from the serve
+    /// workspace (`ws.h` keeps the pre-final-norm residual; the final
+    /// norm writes into `ws.x`).
+    fn read_last_hidden(&self, sq: usize) -> Result<Vec<f32>> {
+        let hidden = self.cfg.hidden_size;
+        let ws = self.paged.ws.as_ref().expect("configured");
+        self.stream.synchronize()?;
+        let mut out = vec![0.0f32; hidden];
+        let row = ws.h.slice((sq - 1) * hidden * 4, hidden * 4)?;
+        self.dev.read(&row, &mut out)?;
+        Ok(out)
+    }
+
+    /// Speculative-verification forward for the paged serve engine: the
+    /// whole draft chain `tokens` runs as **one chunked multi-row
+    /// forward** (B = 1 slot, sq = chain length) and every per-position
+    /// logit row is read back. Row `j` is the distribution over the token
+    /// after `tokens[j]` — the verification contract
+    /// `deepinfer_mtp::verify_greedy` / `verify_stochastic` expect when
+    /// prefixed with the anchor row. The sequence advances by
+    /// `tokens.len()`; rejected tails roll back with
+    /// [`DeviceModel::serve_rollback`].
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] for unknown sequences / bad tokens /
+    /// an empty chain; [`Error::CapacityExceeded`] over the page or
+    /// position bounds.
+    pub fn serve_verify(&mut self, seq: u32, tokens: &[u32]) -> Result<Vec<Vec<f32>>> {
+        ensure!(
+            !tokens.is_empty(),
+            InvalidArgument,
+            "verify needs draft tokens"
+        );
+        for &t in tokens {
+            ensure!(
+                (t as usize) < self.cfg.vocab_size,
+                OutOfRange,
+                "token {t} outside the vocabulary"
+            );
+        }
+        self.serve_chunk_rows(seq, tokens)
+    }
+
+    /// One prefill/verify chunk (B = 1 slot, sq = chunk): runs the shared
+    /// serve forward and reads **every** position's logit row.
+    fn serve_chunk_rows(&mut self, seq: u32, tokens: &[u32]) -> Result<Vec<Vec<f32>>> {
         let cfg = self.cfg.clone();
         let s = take_seq_len(&self.paged, seq)?;
         let pos0 = s;
         let sq = tokens.len();
         let total = pos0 + sq;
+        // Copy-on-write: a rewound sequence re-entering its tree-frozen
+        // region must not overwrite radix-shared pages.
+        self.serve_prefix_cow(seq, pos0)?;
         ensure!(
             total <= self.paged.max_len,
             CapacityExceeded,
@@ -588,13 +1085,25 @@ impl DeviceModel {
         let ws = self.paged.ws.as_ref().expect("configured");
         let b = 1usize;
         self.run_serve_forward(sq, b, Some(tokens), seq)?;
-        // Read the last row's logits.
+        // Read every row's logits.
         self.stream.synchronize()?;
-        let mut logits = vec![0.0f32; cfg.vocab_size];
-        let row = ws.logits.slice((sq - 1) * cfg.vocab_size * 4, cfg.vocab_size * 4)?;
-        self.dev.read(&row, &mut logits)?;
+        let mut out = Vec::with_capacity(sq);
+        for j in 0..sq {
+            let mut logits = vec![0.0f32; cfg.vocab_size];
+            let row = ws
+                .logits
+                .slice(j * cfg.vocab_size * 4, cfg.vocab_size * 4)?;
+            self.dev.read(&row, &mut logits)?;
+            out.push(logits);
+        }
         self.paged.seqs.get_mut(&seq).expect("attached").len = total;
-        Ok(logits)
+        self.paged
+            .seqs
+            .get_mut(&seq)
+            .expect("attached")
+            .tokens
+            .extend_from_slice(tokens);
+        Ok(out)
     }
 
     // ------------------------------------------------------------------
@@ -608,6 +1117,24 @@ impl DeviceModel {
     /// [`Error::InvalidArgument`] on unknown sequences / empty batch /
     /// bad tokens; [`Error::CapacityExceeded`] when the page budget is hit.
     pub fn serve_decode(&mut self, batch: &[(u32, u32)]) -> Result<Vec<Vec<f32>>> {
+        Ok(self
+            .serve_decode_out(batch)?
+            .into_iter()
+            .map(|o| o.logits)
+            .collect())
+    }
+
+    /// [`DeviceModel::serve_decode`] with the full speculative-decoding
+    /// anchor: per-sequence `(logits, residual hidden)` in batch order
+    /// (see [`crate::model::ForwardOut`]) — the hidden row feeds the
+    /// host-side MTP draft step between decodes.
+    ///
+    /// # Errors
+    /// Same as [`DeviceModel::serve_decode`].
+    pub fn serve_decode_out(
+        &mut self,
+        batch: &[(u32, u32)],
+    ) -> Result<Vec<crate::model::ForwardOut>> {
         ensure!(!batch.is_empty(), InvalidArgument, "decode batch is empty");
         let cfg = self.cfg.clone();
         for &(seq, t) in batch {
@@ -643,6 +1170,9 @@ impl DeviceModel {
         let b = slots.len();
         for (seq, cell) in &slots {
             let total = cell.len as usize + 1;
+            // Copy-on-write guard (a rewound sequence re-entering its
+            // tree-frozen region) before any page is granted.
+            self.serve_prefix_cow(*seq, cell.len as usize)?;
             ensure!(
                 total <= self.paged.max_len,
                 CapacityExceeded,
@@ -656,24 +1186,34 @@ impl DeviceModel {
             self.serve_ensure_pages(*seq, total)?;
         }
         self.serve_begin_step(&slots)?;
-        let tokens: Vec<u32> = slots.iter().map(|(seq, _)| {
-            batch.iter().find(|&&(s, _)| s == *seq).expect("present").1
-        })
-        .collect();
+        let tokens: Vec<u32> = slots
+            .iter()
+            .map(|(seq, _)| batch.iter().find(|&&(s, _)| s == *seq).expect("present").1)
+            .collect();
         self.run_serve_forward(1, b, Some(&tokens), slots[0].0)?;
-        // Read per-sequence logits.
+        // Read per-sequence logits and the anchor hidden rows.
         self.stream.synchronize()?;
         let ws = self.paged.ws.as_ref().expect("configured");
         let mut out = Vec::with_capacity(b);
         for i in 0..b {
             let mut logits = vec![0.0f32; cfg.vocab_size];
-            let row = ws.logits.slice(i * cfg.vocab_size * 4, cfg.vocab_size * 4)?;
+            let row = ws
+                .logits
+                .slice(i * cfg.vocab_size * 4, cfg.vocab_size * 4)?;
             self.dev.read(&row, &mut logits)?;
-            out.push(logits);
+            let mut hidden = vec![0.0f32; cfg.hidden_size];
+            let hrow = ws.h.slice(i * cfg.hidden_size * 4, cfg.hidden_size * 4)?;
+            self.dev.read(&hrow, &mut hidden)?;
+            out.push(crate::model::ForwardOut { logits, hidden });
         }
-        for (seq, cell) in &slots {
+        for ((seq, cell), tok) in slots.iter().zip(tokens.iter()) {
             let s = self.paged.seqs.get_mut(seq).expect("attached");
             s.len = cell.len as usize + 1;
+            s.tokens.push(*tok);
+        }
+        // Blocks completed by this step enter the radix tree.
+        for (seq, _) in &slots {
+            self.serve_prefix_insert(*seq)?;
         }
         Ok(out)
     }
@@ -698,7 +1238,11 @@ impl DeviceModel {
     ) -> Result<()> {
         let cfg = &self.cfg;
         let s = &self.stream;
-        let ws = self.paged.ws.as_ref().ok_or_else(|| Error::internal("serve ws"))?;
+        let ws = self
+            .paged
+            .ws
+            .as_ref()
+            .ok_or_else(|| Error::internal("serve ws"))?;
         let rows = sq * b;
         let hidden = cfg.hidden_size;
         let hd = cfg.head_dim;
@@ -717,15 +1261,10 @@ impl DeviceModel {
         if let Some(toks) = tokens {
             self.stream.write_async(&self.dev, &ws.tokens, toks)?;
         }
-        self.k.gather_indexed(
-            &self.root.embed,
-            &ws.h,
-            &ws.tokens,
-            rows,
-            hidden * 4,
-            s,
-        )?;
-        self.k.serve_pos_fill(&ws.cells, &ws.pos_kv, &ws.pos_q, b, sq, cfg.n_heads, s)?;
+        self.k
+            .gather_indexed(&self.root.embed, &ws.h, &ws.tokens, rows, hidden * 4, s)?;
+        self.k
+            .serve_pos_fill(&ws.cells, &ws.pos_kv, &ws.pos_q, b, sq, cfg.n_heads, s)?;
 
         for l in 0..cfg.n_self_layers {
             let (w, pools) = (&self.self_layers[l].0, &self.paged.layers[l]);
@@ -792,13 +1331,30 @@ impl DeviceModel {
                 DevCacheFormat::Fp8Group32 => deepinfer_kernels::CacheFormat::Fp8Group32,
                 DevCacheFormat::Fp4Group16 => deepinfer_kernels::CacheFormat::Fp4Group16,
             };
-            self.k
-                .serve_kv_encode(&ws.kv_rows, &pools.kv.buf, &ws.tbl_ptrs, &ws.cells, hd, fmt, sq, b, s)?;
+            self.k.serve_kv_encode(
+                &ws.kv_rows,
+                &pools.kv.buf,
+                &ws.tbl_ptrs,
+                &ws.cells,
+                hd,
+                fmt,
+                sq,
+                b,
+                s,
+            )?;
             // DSA indexer.
             self.gemm(&w.wq, &ws.h, &ws.q_idx, rows)?;
             self.gemm(&w.wk, &ws.h, &ws.k_new, rows)?;
-            self.k
-                .serve_append_rows(&ws.k_new, &pools.k_raw.buf, &ws.tbl_ptrs, &ws.cells, idx_dim, sq, b, s)?;
+            self.k.serve_append_rows(
+                &ws.k_new,
+                &pools.k_raw.buf,
+                &ws.tbl_ptrs,
+                &ws.cells,
+                idx_dim,
+                sq,
+                b,
+                s,
+            )?;
             self.k.serve_append_norm_rows(
                 &ws.k_new,
                 &pools.k_norm.buf,
@@ -910,9 +1466,13 @@ impl DeviceModel {
                 hidden,
                 s,
             )?;
-            self.k.serve_gate_blend(&ws.gt, &ws.gc, &ws.conv, &ws.scores, &ws.cells, max_cols, sq, b, s)?;
-            self.k.serve_causal_clip(&ws.scores, &ws.cells, max_cols, window, sq, b, s)?;
-            self.k.fill_zero(&ws.cands, rows * self.geo.cands_cap * 8, s)?;
+            self.k.serve_gate_blend(
+                &ws.gt, &ws.gc, &ws.conv, &ws.scores, &ws.cells, max_cols, sq, b, s,
+            )?;
+            self.k
+                .serve_causal_clip(&ws.scores, &ws.cells, max_cols, window, sq, b, s)?;
+            self.k
+                .fill_zero(&ws.cands, rows * self.geo.cands_cap * 8, s)?;
             self.k.serve_block_preselect(
                 &ws.scores,
                 &ws.cands,
@@ -925,8 +1485,17 @@ impl DeviceModel {
                 b,
                 s,
             )?;
-            self.k
-                .serve_topk(&ws.cands, &ws.sel, &ws.cells, self.geo.num_blocks, self.geo.per, topk, sq, b, s)?;
+            self.k.serve_topk(
+                &ws.cands,
+                &ws.sel,
+                &ws.cells,
+                self.geo.num_blocks,
+                self.geo.per,
+                topk,
+                sq,
+                b,
+                s,
+            )?;
             // Attention: sparse prefill (sq > 1) or split-KV decode (sq == 1).
             let last = cfg.n_self_layers - 1;
             let kv_pool = &self.paged.layers[last].kv.buf;
@@ -1067,9 +1636,7 @@ impl DeviceModel {
                     s,
                 )?;
                 // SWA per cross layer (layer-major ring view).
-                let ring_view = ws
-                    .ring_ptrs
-                    .slice(l * b * 8, b * 8)?;
+                let ring_view = ws.ring_ptrs.slice(l * b * 8, b * 8)?;
                 let f = self.k.f("di_serve_swa_attention_kernel")?;
                 f.launch(
                     &self.dev,
@@ -1214,7 +1781,8 @@ impl DeviceModel {
             GemmDType::Fp8 => {
                 let aq = self.dev.alloc(m_total.max(1) * hidden)?;
                 let asf = self.dev.alloc(m_total.max(1) * (hidden / 128).max(1))?;
-                self.k.quant_per_token_group(&perm, &aq, &asf, m_total, hidden, 128, s)?;
+                self.k
+                    .quant_per_token_group(&perm, &aq, &asf, m_total, hidden, 128, s)?;
                 self.k.gemm_fp8_grouped_nt(
                     &aq,
                     &asf,
@@ -1275,7 +1843,8 @@ impl DeviceModel {
             GemmDType::Fp8 => {
                 let aq = self.dev.alloc(m_total.max(1) * inter)?;
                 let asf = self.dev.alloc(m_total.max(1) * (inter / 128).max(1))?;
-                self.k.quant_per_token_group(&silu, &aq, &asf, m_total, inter, 128, s)?;
+                self.k
+                    .quant_per_token_group(&silu, &aq, &asf, m_total, inter, 128, s)?;
                 self.k.gemm_fp8_grouped_nt(
                     &aq,
                     &asf,
@@ -1392,7 +1961,8 @@ impl DeviceModel {
             GemmDType::Fp8 => {
                 let aq = ws.moe_aq.as_ref().unwrap();
                 let asf = ws.moe_asf.as_ref().unwrap();
-                self.k.quant_per_token_group(&ws.moe_perm, aq, asf, rows, hidden, 128, s)?;
+                self.k
+                    .quant_per_token_group(&ws.moe_perm, aq, asf, rows, hidden, 128, s)?;
                 self.k.gemm_grouped_masked_nt(
                     aq,
                     Some(asf),
@@ -1443,12 +2013,21 @@ impl DeviceModel {
                 )?;
             }
         }
-        self.k.silu_mul_masked(&ws.moe_act, &ws.moe_silu, &ws.moe_counters, cap, e, inter, s)?;
+        self.k.silu_mul_masked(
+            &ws.moe_act,
+            &ws.moe_silu,
+            &ws.moe_counters,
+            cap,
+            e,
+            inter,
+            s,
+        )?;
         match m.routed_down.dtype {
             GemmDType::Fp8 => {
                 let aq = ws.moe_aq2.as_ref().unwrap();
                 let asf = ws.moe_asf2.as_ref().unwrap();
-                self.k.quant_per_token_group(&ws.moe_silu, aq, asf, rows, inter, 128, s)?;
+                self.k
+                    .quant_per_token_group(&ws.moe_silu, aq, asf, rows, inter, 128, s)?;
                 self.k.gemm_grouped_masked_nt(
                     aq,
                     Some(asf),

@@ -6,7 +6,6 @@
 //! indexing is checked, and the parser never panics.
 use crate::ensure;
 
-
 use crate::error::{Error, Result};
 use std::fmt::Write as _;
 
@@ -100,7 +99,9 @@ impl Json {
         match self {
             Json::U64(v) => Some(*v),
             Json::I64(v) if *v >= 0 => Some(*v as u64),
-            Json::F64(v) if *v >= 0.0 && v.fract() == 0.0 && *v <= u64::MAX as f64 => Some(*v as u64),
+            Json::F64(v) if *v >= 0.0 && v.fract() == 0.0 && *v <= u64::MAX as f64 => {
+                Some(*v as u64)
+            }
             _ => None,
         }
     }
@@ -217,7 +218,7 @@ struct Parser<'a> {
     pos: usize,
 }
 
-impl<'a> Parser<'a> {
+impl Parser<'_> {
     fn skip_ws(&mut self) {
         while self.pos < self.bytes.len()
             && matches!(self.bytes[self.pos], b' ' | b'\t' | b'\n' | b'\r')
@@ -243,7 +244,11 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self, depth: usize) -> Result<Json> {
-        ensure!(depth <= MAX_DEPTH, CapacityExceeded, "json nesting exceeds {MAX_DEPTH}");
+        ensure!(
+            depth <= MAX_DEPTH,
+            CapacityExceeded,
+            "json nesting exceeds {MAX_DEPTH}"
+        );
         match self.peek() {
             Some(b'{') => self.object(depth),
             Some(b'[') => self.array(depth),
@@ -262,7 +267,8 @@ impl<'a> Parser<'a> {
 
     fn literal(&mut self, lit: &[u8], v: Json) -> Result<Json> {
         ensure!(
-            self.bytes.len() - self.pos >= lit.len() && &self.bytes[self.pos..self.pos + lit.len()] == lit,
+            self.bytes.len() - self.pos >= lit.len()
+                && &self.bytes[self.pos..self.pos + lit.len()] == lit,
             Checkpoint,
             "invalid literal at offset {}",
             self.pos
@@ -371,7 +377,11 @@ impl<'a> Parser<'a> {
                                     self.pos
                                 );
                                 self.pos += 1;
-                                ensure!(self.peek() == Some(b'u'), Checkpoint, "expected low surrogate");
+                                ensure!(
+                                    self.peek() == Some(b'u'),
+                                    Checkpoint,
+                                    "expected low surrogate"
+                                );
                                 self.pos += 1;
                                 let lo = self.hex4()?;
                                 ensure!(
@@ -380,17 +390,15 @@ impl<'a> Parser<'a> {
                                     "invalid low surrogate"
                                 );
                                 let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                out.push(
-                                    char::from_u32(c)
-                                        .ok_or_else(|| Error::Checkpoint("invalid codepoint".into()))?,
-                                );
+                                out.push(char::from_u32(c).ok_or_else(|| {
+                                    Error::Checkpoint("invalid codepoint".into())
+                                })?);
                             } else if (0xDC00..0xE000).contains(&cp) {
                                 return Err(Error::Checkpoint("lone low surrogate".into()));
                             } else {
-                                out.push(
-                                    char::from_u32(cp)
-                                        .ok_or_else(|| Error::Checkpoint("invalid codepoint".into()))?,
-                                );
+                                out.push(char::from_u32(cp).ok_or_else(|| {
+                                    Error::Checkpoint("invalid codepoint".into())
+                                })?);
                             }
                         }
                         other => {
@@ -429,7 +437,11 @@ impl<'a> Parser<'a> {
     }
 
     fn hex4(&mut self) -> Result<u32> {
-        ensure!(self.pos + 4 <= self.bytes.len(), Checkpoint, "truncated \\u escape");
+        ensure!(
+            self.pos + 4 <= self.bytes.len(),
+            Checkpoint,
+            "truncated \\u escape"
+        );
         let mut v = 0u32;
         for i in 0..4 {
             let c = self.bytes[self.pos + i];
@@ -447,11 +459,7 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(b'-') {
             self.pos += 1;
         }
-        while self
-            .peek()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-        {
+        while self.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
             self.pos += 1;
         }
         let mut is_float = false;
@@ -500,10 +508,7 @@ mod tests {
         assert_eq!(v.get("a").unwrap().as_arr().unwrap().len(), 3);
         assert_eq!(v.get("a").unwrap().as_arr().unwrap()[0], Json::U64(1));
         assert_eq!(v.get("a").unwrap().as_arr().unwrap()[1], Json::F64(2.5));
-        assert_eq!(
-            v.get("f").unwrap(),
-            &Json::U64(u64::MAX)
-        );
+        assert_eq!(v.get("f").unwrap(), &Json::U64(u64::MAX));
         let back = Json::parse(&v.to_json_string()).unwrap();
         assert_eq!(v, back);
     }
@@ -525,10 +530,7 @@ mod tests {
         for _ in 0..200 {
             s.push('[');
         }
-        assert!(matches!(
-            Json::parse(&s),
-            Err(Error::CapacityExceeded(_))
-        ));
+        assert!(matches!(Json::parse(&s), Err(Error::CapacityExceeded(_))));
     }
 
     #[test]

@@ -79,9 +79,9 @@ pub(crate) fn decode_payload(payload: &DispatchPayload, cfg: &EpConfig) -> Resul
                 data.len()
             );
             let rows = data.len() / hidden;
-            let sf_needed = rows
-                .checked_mul(hidden / group)
-                .ok_or_else(|| Error::CapacityExceeded("Fp8 payload scale count overflows".into()))?;
+            let sf_needed = rows.checked_mul(hidden / group).ok_or_else(|| {
+                Error::CapacityExceeded("Fp8 payload scale count overflows".into())
+            })?;
             ensure!(
                 sf.len() == sf_needed,
                 DimensionMismatch,

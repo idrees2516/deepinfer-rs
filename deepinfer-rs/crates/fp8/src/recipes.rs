@@ -12,8 +12,7 @@
 //!   payload), `±Inf` saturates to `±448` after scaling. Never panics.
 
 use deepinfer_core::format::{
-    e2m1_to_f32, e4m3_to_f32, e8m0_to_f32, f32_to_e2m1_rne, f32_to_e4m3_rne, f32_to_e8m0,
-    E8M0Round,
+    e2m1_to_f32, e4m3_to_f32, e8m0_to_f32, f32_to_e2m1_rne, f32_to_e4m3_rne, f32_to_e8m0, E8M0Round,
 };
 use deepinfer_core::{ensure, Error, Result};
 
@@ -90,7 +89,11 @@ fn sanitize(v: f32) -> f32 {
 /// - `group == 0`, `cols == 0`, `x.len() % cols != 0`, or
 ///   `cols % group != 0` (DeepGEMM requires K aligned to the granularity).
 /// - The scale-buffer length overflows `usize` (DoS guard).
-pub fn quantize_per_token_group(x: &[f32], cols: usize, group: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn quantize_per_token_group(
+    x: &[f32],
+    cols: usize,
+    group: usize,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     ensure!(group > 0, InvalidArgument, "group must be > 0, got {group}");
     ensure!(cols > 0, InvalidArgument, "cols must be > 0, got {cols}");
     ensure!(
@@ -191,8 +194,16 @@ pub fn quantize_weight_per_block(
     block_n: usize,
     block_k: usize,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    ensure!(block_n > 0, InvalidArgument, "block_n must be > 0, got {block_n}");
-    ensure!(block_k > 0, InvalidArgument, "block_k must be > 0, got {block_k}");
+    ensure!(
+        block_n > 0,
+        InvalidArgument,
+        "block_n must be > 0, got {block_n}"
+    );
+    ensure!(
+        block_k > 0,
+        InvalidArgument,
+        "block_k must be > 0, got {block_k}"
+    );
     let nk = row_checked_mul(n, k, "n*k")?;
     ensure!(
         b.len() == nk,
@@ -249,8 +260,16 @@ pub fn dequantize_weight_per_block(
     block_n: usize,
     block_k: usize,
 ) -> Result<Vec<f32>> {
-    ensure!(block_n > 0, InvalidArgument, "block_n must be > 0, got {block_n}");
-    ensure!(block_k > 0, InvalidArgument, "block_k must be > 0, got {block_k}");
+    ensure!(
+        block_n > 0,
+        InvalidArgument,
+        "block_n must be > 0, got {block_n}"
+    );
+    ensure!(
+        block_k > 0,
+        InvalidArgument,
+        "block_k must be > 0, got {block_k}"
+    );
     let nk = row_checked_mul(n, k, "n*k")?;
     ensure!(
         v.len() == nk,
@@ -416,7 +435,11 @@ pub fn dequantize_kv_cache_v41_fp4(bytes: &[u8; KV_FP4_BYTES]) -> [f32; KV_DIMS]
 /// `x` is empty (a token must have at least one dim) or `group == 0` or
 /// `x.len() % group != 0`.
 pub fn per_token_cast_row(x: &[f32], group: usize) -> Result<(Vec<u8>, Vec<u8>)> {
-    ensure!(!x.is_empty(), InvalidArgument, "per-token cast needs a non-empty row");
+    ensure!(
+        !x.is_empty(),
+        InvalidArgument,
+        "per-token cast needs a non-empty row"
+    );
     quantize_per_token_group(x, x.len(), group)
 }
 
@@ -569,7 +592,8 @@ mod tests {
         assert!(quantize_weight_per_block(&[0.0; 10], 5, 2, 1, 0).is_err()); // block_k == 0
         assert!(quantize_weight_per_block(&[0.0; 9], 5, 2, 4, 4).is_err()); // len != n*k
         assert!(dequantize_weight_per_block(&[0; 4], &[0; 1], 2, 2, 1, 1).is_err()); // sf len
-        assert!(dequantize_weight_per_block(&[0; 5], &[0; 4], 2, 2, 1, 1).is_err()); // len != n*k
+        assert!(dequantize_weight_per_block(&[0; 5], &[0; 4], 2, 2, 1, 1).is_err());
+        // len != n*k
     }
 
     #[test]
@@ -602,8 +626,14 @@ mod tests {
 
     #[test]
     fn pack_unpack_layout_and_round_trip() {
-        assert_eq!(pack_ue8m0_x4(&[0x01, 0x02, 0x03, 0x04]).unwrap(), vec![0x0403_0201u32]);
-        assert_eq!(unpack_ue8m0_x4(&[0x0403_0201]), vec![0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(
+            pack_ue8m0_x4(&[0x01, 0x02, 0x03, 0x04]).unwrap(),
+            vec![0x0403_0201u32]
+        );
+        assert_eq!(
+            unpack_ue8m0_x4(&[0x0403_0201]),
+            vec![0x01, 0x02, 0x03, 0x04]
+        );
         assert_eq!(pack_ue8m0_x4(&[]).unwrap(), Vec::<u32>::new());
         assert_eq!(unpack_ue8m0_x4(&[]), Vec::<u8>::new());
         assert!(pack_ue8m0_x4(&[1, 2, 3]).is_err());
@@ -679,7 +709,11 @@ mod tests {
         assert_eq!(bytes.len(), 288);
         // Even-indexed dim in the LOW nibble, odd-indexed in the HIGH nibble.
         assert_eq!(bytes[0], 0x7, "dims0=6 (low) | dims1=0 (high)");
-        assert_eq!(bytes[1], 0x5 | (0xB << 4), "dims2=3 (low) | dims3=-1.5 (high)");
+        assert_eq!(
+            bytes[1],
+            0x5 | (0xB << 4),
+            "dims2=3 (low) | dims3=-1.5 (high)"
+        );
         assert_eq!(bytes[2], 0xF, "dims4=-6 (low) | dims5->0 (high)");
         // Scale bytes: group 0 -> 0x38; zero groups -> clamped to 2^-9 = 0x01.
         assert_eq!(bytes[256], 0x38);
@@ -724,7 +758,11 @@ mod tests {
         big[7] = 1e6;
         let bb = quantize_kv_cache_v41_fp4(&big).unwrap();
         assert_eq!(bb[256], 0x7E);
-        assert_eq!(bb[3] >> 4, 0x7, "odd dim 7 saturates to 6 in the high nibble");
+        assert_eq!(
+            bb[3] >> 4,
+            0x7,
+            "odd dim 7 saturates to 6 in the high nibble"
+        );
         assert_eq!(bb[3] & 0x0F, 0x0, "even dim 6 stays 0 in the low nibble");
     }
 
@@ -732,7 +770,9 @@ mod tests {
     fn kv_fp8_all_zeros() {
         let bytes = quantize_kv_cache_v41_fp8(&[0.0; 512]).unwrap();
         assert!(bytes.iter().all(|&b| b == 0));
-        assert!(dequantize_kv_cache_v41_fp8(&bytes).iter().all(|&v| v == 0.0));
+        assert!(dequantize_kv_cache_v41_fp8(&bytes)
+            .iter()
+            .all(|&v| v == 0.0));
     }
 
     #[test]
@@ -754,7 +794,10 @@ mod tests {
         assert_eq!(deq[0], 0.0);
         assert_eq!(deq[1], f32::INFINITY);
         assert_eq!(deq[2], f32::NEG_INFINITY);
-        assert!(v.iter().all(|&b| b != 0x7F && b != 0xFF), "no NaN encodings");
+        assert!(
+            v.iter().all(|&b| b != 0x7F && b != 0xFF),
+            "no NaN encodings"
+        );
 
         let mut w = vec![0.0f32; 256];
         w[0] = f32::NAN;
@@ -763,7 +806,10 @@ mod tests {
         assert_eq!(wsf[0], 247);
         assert_eq!(wv[0], 0x00);
         assert_eq!(wv[255], 0x7E);
-        assert!(wv.iter().all(|&b| b != 0x7F && b != 0xFF), "no NaN encodings");
+        assert!(
+            wv.iter().all(|&b| b != 0x7F && b != 0xFF),
+            "no NaN encodings"
+        );
         assert!(dequantize_weight_per_block(&wv, &wsf, 2, 128, 128, 128)
             .unwrap()
             .iter()

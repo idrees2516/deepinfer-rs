@@ -383,7 +383,11 @@ mod tests {
             let qb = rng.uniform_usize(1, 4);
             let got = thunder_scores(&q, &k, &w, s_q, s_kv, nh, hd, qb, causal)?;
             let want = naive_thunder(&q, &k, &w, s_q, s_kv, nh, hd, qb, causal);
-            ensure!(got == want, Internal, "thunder mismatch (qb={qb}, causal={causal})");
+            ensure!(
+                got == want,
+                Internal,
+                "thunder mismatch (qb={qb}, causal={causal})"
+            );
             Ok(())
         });
     }

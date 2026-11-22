@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use deepinfer_core::{ensure, Error, Result};
 
-use crate::ffi::{cuda, hip, hiprtc, nvrtc};
 use crate::dl;
+use crate::ffi::{cuda, hip, hiprtc, nvrtc};
 
 /// Which vendor stack is in use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,7 +226,11 @@ impl Gpu {
     /// inference server and removes a class of use-after-release bugs).
     pub fn device(&self, ordinal: usize) -> Result<Device> {
         let count = self.device_count()?;
-        ensure!(ordinal < count, InvalidArgument, "device ordinal out of range");
+        ensure!(
+            ordinal < count,
+            InvalidArgument,
+            "device ordinal out of range"
+        );
         match (&self.inner.cuda, &self.inner.hip) {
             (Some(c), _) => {
                 let mut dev: i32 = 0;
@@ -242,7 +246,12 @@ impl Gpu {
                     let mut v: i32 = 0;
                     // SAFETY: valid out-pointer; valid device.
                     let r = unsafe { (c.device_get_attribute)(&mut v, a, dev) };
-                    ensure!(r == 0, Internal, "cuDeviceGetAttribute: {}", c.error_string(r));
+                    ensure!(
+                        r == 0,
+                        Internal,
+                        "cuDeviceGetAttribute: {}",
+                        c.error_string(r)
+                    );
                     Ok(v)
                 };
                 let maj = attr(cuda::ATTR_CC_MAJOR)? as u32;
@@ -254,7 +263,12 @@ impl Gpu {
                 let mut ctx: cuda::Handle = std::ptr::null_mut();
                 // SAFETY: valid out-pointer; retained for process lifetime.
                 let r = unsafe { (c.primary_ctx_retain)(&mut ctx, dev) };
-                ensure!(r == 0, Internal, "cuDevicePrimaryCtxRetain: {}", c.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "cuDevicePrimaryCtxRetain: {}",
+                    c.error_string(r)
+                );
                 let props = DeviceProps {
                     backend: Backend::Cuda,
                     name,
@@ -262,7 +276,8 @@ impl Gpu {
                     sm_count: attr(cuda::ATTR_MULTIPROCESSOR_COUNT)?.max(1) as u32,
                     total_mem: total as u64,
                     max_threads_per_block: attr(cuda::ATTR_MAX_THREADS_PER_BLOCK)?.max(128) as u32,
-                    max_shared: attr(cuda::ATTR_SHARED_MEMORY_PER_BLOCK_OPTIN)?.max(16 * 1024) as u32,
+                    max_shared: attr(cuda::ATTR_SHARED_MEMORY_PER_BLOCK_OPTIN)?.max(16 * 1024)
+                        as u32,
                 };
                 Ok(Device {
                     gpu: self.clone(),
@@ -277,7 +292,9 @@ impl Gpu {
                 ensure!(r == 0, Internal, "hipSetDevice: {}", h.error_string(r));
                 let mut name = [0i8; 256];
                 // SAFETY: name buffer valid.
-                let r = unsafe { (h.device_get_name)(name.as_mut_ptr(), name.len() as i32, ordinal as i32) };
+                let r = unsafe {
+                    (h.device_get_name)(name.as_mut_ptr(), name.len() as i32, ordinal as i32)
+                };
                 ensure!(r == 0, Internal, "hipDeviceGetName: {}", h.error_string(r));
                 let name = i8_to_string(&name);
                 let mut free = 0usize;
@@ -290,7 +307,11 @@ impl Gpu {
                 let mut sm_attr: i32 = 0;
                 // SAFETY: valid out-pointer.
                 let sm_ok = unsafe {
-                    (h.device_get_attribute)(&mut sm_attr, hip::ATTR_MULTIPROCESSOR_COUNT, ordinal as i32)
+                    (h.device_get_attribute)(
+                        &mut sm_attr,
+                        hip::ATTR_MULTIPROCESSOR_COUNT,
+                        ordinal as i32,
+                    )
                 } == 0;
                 let sm = if sm_ok { sm_attr.max(1) as u32 } else { 120 };
                 let arch = amd_arch_from_env_or_scan(h, ordinal as i32);
@@ -478,7 +499,12 @@ impl Device {
                 let mut p: cuda::DevicePtr = 0;
                 // SAFETY: out-pointer valid; size checked above.
                 let r = unsafe { (c.mem_alloc)(&mut p, bytes) };
-                ensure!(r == 0, Internal, "cuMemAlloc({bytes}): {}", c.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "cuMemAlloc({bytes}): {}",
+                    c.error_string(r)
+                );
                 Ok(Buffer {
                     gpu: self.gpu.clone(),
                     ptr: p,
@@ -490,7 +516,12 @@ impl Device {
                 let mut p: hip::Handle = std::ptr::null_mut();
                 // SAFETY: out-pointer valid; size checked above.
                 let r = unsafe { (h.malloc)(&mut p, bytes) };
-                ensure!(r == 0, Internal, "hipMalloc({bytes}): {}", h.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "hipMalloc({bytes}): {}",
+                    h.error_string(r)
+                );
                 Ok(Buffer {
                     gpu: self.gpu.clone(),
                     ptr: p as u64,
@@ -513,7 +544,11 @@ impl Device {
     /// Upload a host slice into an existing buffer (synchronous).
     pub fn write<T: Copy>(&self, buf: &Buffer, data: &[T]) -> Result<()> {
         let bytes = std::mem::size_of_val(data);
-        ensure!(bytes <= buf.len, InvalidArgument, "host slice larger than buffer");
+        ensure!(
+            bytes <= buf.len,
+            InvalidArgument,
+            "host slice larger than buffer"
+        );
         self.make_current()?;
         // SAFETY: data is a valid host buffer of `bytes` readable bytes; the
         // device pointer was allocated with `buf.len >= bytes`.
@@ -522,7 +557,11 @@ impl Device {
                 (c.memcpy_htod)(buf.ptr, data.as_ptr() as *const c_void, bytes)
             },
             (_, Some(h)) => unsafe {
-                (h.memcpy_htod)(buf.ptr as *mut c_void, data.as_ptr() as *const c_void, bytes)
+                (h.memcpy_htod)(
+                    buf.ptr as *mut c_void,
+                    data.as_ptr() as *const c_void,
+                    bytes,
+                )
             },
             _ => unreachable!(),
         };
@@ -533,13 +572,23 @@ impl Device {
     /// Download a buffer into a host slice (synchronous).
     pub fn read<T: Copy>(&self, buf: &Buffer, out: &mut [T]) -> Result<()> {
         let bytes = std::mem::size_of_val(out);
-        ensure!(bytes <= buf.len, InvalidArgument, "host slice larger than buffer");
+        ensure!(
+            bytes <= buf.len,
+            InvalidArgument,
+            "host slice larger than buffer"
+        );
         self.make_current()?;
         // SAFETY: out is a valid writable host buffer; device pointer valid.
         let r = match (&self.gpu.inner.cuda, &self.gpu.inner.hip) {
-            (Some(c), _) => unsafe { (c.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, buf.ptr, bytes) },
+            (Some(c), _) => unsafe {
+                (c.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, buf.ptr, bytes)
+            },
             (_, Some(h)) => unsafe {
-                (h.memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, buf.ptr as *mut c_void, bytes)
+                (h.memcpy_dtoh)(
+                    out.as_mut_ptr() as *mut c_void,
+                    buf.ptr as *mut c_void,
+                    bytes,
+                )
             },
             _ => unreachable!(),
         };
@@ -567,7 +616,11 @@ impl Device {
     /// Enable peer access from this device to `peer` (both must be from the
     /// same backend). Safe to call repeatedly; already-enabled is a no-op.
     pub fn enable_peer_access(&self, peer: &Device) -> Result<()> {
-        ensure!(self.backend() == peer.backend(), InvalidArgument, "peer devices must share a backend");
+        ensure!(
+            self.backend() == peer.backend(),
+            InvalidArgument,
+            "peer devices must share a backend"
+        );
         if self.id == peer.id {
             return Ok(());
         }
@@ -577,7 +630,12 @@ impl Device {
                 let mut ok: i32 = 0;
                 // SAFETY: valid device handles.
                 let r = unsafe { (c.device_can_access_peer)(&mut ok, self.id, peer.id) };
-                ensure!(r == 0, Internal, "cuDeviceCanAccessPeer: {}", c.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "cuDeviceCanAccessPeer: {}",
+                    c.error_string(r)
+                );
                 if ok == 0 {
                     return Err(Error::internal("peer access not supported between devices"));
                 }
@@ -596,7 +654,12 @@ impl Device {
                 let mut ok: i32 = 0;
                 // SAFETY: valid ordinals.
                 let r = unsafe { (h.device_can_access_peer)(&mut ok, self.id, peer.id) };
-                ensure!(r == 0, Internal, "hipDeviceCanAccessPeer: {}", h.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "hipDeviceCanAccessPeer: {}",
+                    h.error_string(r)
+                );
                 if ok == 0 {
                     return Err(Error::internal("peer access not supported between devices"));
                 }
@@ -626,13 +689,24 @@ impl Device {
     ) -> Result<()> {
         let bytes = dst.len.min(src.len);
         ensure!(bytes > 0, InvalidArgument, "empty peer copy");
-        ensure!(self.backend() == src_dev.backend(), InvalidArgument, "peer copy across backends");
+        ensure!(
+            self.backend() == src_dev.backend(),
+            InvalidArgument,
+            "peer copy across backends"
+        );
         self.make_current()?;
         // SAFETY: pointers valid on their devices for `bytes`; peer access
         // enabled by the caller via enable_peer_access.
         let r = match (&self.gpu.inner.cuda, &self.gpu.inner.hip) {
             (Some(c), _) => unsafe {
-                (c.memcpy_peer_async)(dst.ptr, src_dev.ctx, src.ptr, self.ctx, bytes, stream.handle)
+                (c.memcpy_peer_async)(
+                    dst.ptr,
+                    src_dev.ctx,
+                    src.ptr,
+                    self.ctx,
+                    bytes,
+                    stream.handle,
+                )
             },
             (_, Some(h)) => unsafe {
                 (h.memcpy_peer_async)(
@@ -672,9 +746,20 @@ impl Device {
                 let mut m: hip::Handle = std::ptr::null_mut();
                 // SAFETY: image is a valid code object; zero JIT options.
                 let r = unsafe {
-                    (h.module_load_data_ex)(&mut m, image.as_ptr() as *const c_void, 0, std::ptr::null_mut(), std::ptr::null_mut())
+                    (h.module_load_data_ex)(
+                        &mut m,
+                        image.as_ptr() as *const c_void,
+                        0,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
                 };
-                ensure!(r == 0, Internal, "hipModuleLoadDataEx: {}", h.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "hipModuleLoadDataEx: {}",
+                    h.error_string(r)
+                );
                 Ok(Module {
                     gpu: self.gpu.clone(),
                     handle: m,
@@ -747,8 +832,16 @@ impl Device {
         box_rows: usize,
         swizzle: TensorMapSwizzle,
     ) -> Result<TensorMap> {
-        ensure!(inner_elems > 0 && rows > 0, InvalidArgument, "tensor map dims must be > 0");
-        ensure!(box_inner > 0 && box_rows > 0, InvalidArgument, "tensor map box must be > 0");
+        ensure!(
+            inner_elems > 0 && rows > 0,
+            InvalidArgument,
+            "tensor map dims must be > 0"
+        );
+        ensure!(
+            box_inner > 0 && box_rows > 0,
+            InvalidArgument,
+            "tensor map box must be > 0"
+        );
         ensure!(
             inner_elems % 16 == 0,
             InvalidArgument,
@@ -853,7 +946,12 @@ impl Device {
                 cuda::CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS,
             )
         };
-        ensure!(r == 0, Internal, "cuIpcOpenMemHandle: {}", c.error_string(r));
+        ensure!(
+            r == 0,
+            Internal,
+            "cuIpcOpenMemHandle: {}",
+            c.error_string(r)
+        );
         Ok(Buffer {
             gpu: self.gpu.clone(),
             ptr,
@@ -920,12 +1018,22 @@ impl Stream {
             (Some(c), _) => {
                 // SAFETY: stream handle valid.
                 let r = unsafe { (c.stream_synchronize)(self.handle) };
-                ensure!(r == 0, Internal, "cuStreamSynchronize: {}", c.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "cuStreamSynchronize: {}",
+                    c.error_string(r)
+                );
             }
             (_, Some(h)) => {
                 // SAFETY: stream handle valid.
                 let r = unsafe { (h.stream_synchronize)(self.handle) };
-                ensure!(r == 0, Internal, "hipStreamSynchronize: {}", h.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "hipStreamSynchronize: {}",
+                    h.error_string(r)
+                );
             }
             _ => unreachable!(),
         }
@@ -935,7 +1043,11 @@ impl Stream {
     /// Asynchronous H2D upload on this stream.
     pub fn write_async<T: Copy>(&self, dev: &Device, buf: &Buffer, data: &[T]) -> Result<()> {
         let bytes = std::mem::size_of_val(data);
-        ensure!(bytes <= buf.len, InvalidArgument, "host slice larger than buffer");
+        ensure!(
+            bytes <= buf.len,
+            InvalidArgument,
+            "host slice larger than buffer"
+        );
         dev.make_current()?;
         // SAFETY: host slice readable for `bytes`; device pointer valid.
         let r = match (&self.gpu.inner.cuda, &self.gpu.inner.hip) {
@@ -959,7 +1071,11 @@ impl Stream {
     /// Asynchronous D2H download on this stream.
     pub fn read_async<T: Copy>(&self, dev: &Device, buf: &Buffer, out: &mut [T]) -> Result<()> {
         let bytes = std::mem::size_of_val(out);
-        ensure!(bytes <= buf.len, InvalidArgument, "host slice larger than buffer");
+        ensure!(
+            bytes <= buf.len,
+            InvalidArgument,
+            "host slice larger than buffer"
+        );
         dev.make_current()?;
         // SAFETY: host slice writable for `bytes`; device pointer valid.
         let r = match (&self.gpu.inner.cuda, &self.gpu.inner.hip) {
@@ -1055,9 +1171,9 @@ impl Buffer {
     /// [`Error::InvalidArgument`] when the range is out of bounds or empty.
     pub fn slice(&self, offset: usize, len: usize) -> Result<Buffer> {
         ensure!(len > 0, InvalidArgument, "slice length must be > 0");
-        let end = offset.checked_add(len).ok_or_else(|| {
-            deepinfer_core::Error::invalid("slice range overflows usize")
-        })?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| deepinfer_core::Error::invalid("slice range overflows usize"))?;
         ensure!(
             end <= self.len,
             InvalidArgument,
@@ -1114,7 +1230,12 @@ impl Module {
                 let mut f: cuda::Handle = std::ptr::null_mut();
                 // SAFETY: module handle valid; name NUL-terminated.
                 let r = unsafe { (c.module_get_function)(&mut f, self.handle, cname.as_ptr()) };
-                ensure!(r == 0, Internal, "cuModuleGetFunction({name}): {}", c.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "cuModuleGetFunction({name}): {}",
+                    c.error_string(r)
+                );
                 Ok(Function {
                     gpu: self.gpu.clone(),
                     handle: f,
@@ -1124,7 +1245,12 @@ impl Module {
                 let mut f: hip::Handle = std::ptr::null_mut();
                 // SAFETY: module handle valid; name NUL-terminated.
                 let r = unsafe { (h.module_get_function)(&mut f, self.handle, cname.as_ptr()) };
-                ensure!(r == 0, Internal, "hipModuleGetFunction({name}): {}", h.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "hipModuleGetFunction({name}): {}",
+                    h.error_string(r)
+                );
                 Ok(Function {
                     gpu: self.gpu.clone(),
                     handle: f,
@@ -1180,9 +1306,10 @@ pub struct TensorMap {
 impl std::fmt::Debug for TensorMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TensorMap")
-            .field("first_word", &u64::from_le_bytes(
-                self.opaque[0..8].try_into().unwrap_or([0; 8]),
-            ))
+            .field(
+                "first_word",
+                &u64::from_le_bytes(self.opaque[0..8].try_into().unwrap_or([0; 8])),
+            )
             .finish()
     }
 }
@@ -1289,8 +1416,13 @@ impl Function {
     }
 
     /// Launch the kernel with packed arguments on `stream`.
-    pub fn launch(&self, dev: &Device, launch: Launch, args: &KernelArgs, stream: &Stream)
-        -> Result<()> {
+    pub fn launch(
+        &self,
+        dev: &Device,
+        launch: Launch,
+        args: &KernelArgs,
+        stream: &Stream,
+    ) -> Result<()> {
         dev.make_current()?;
         let mut ptrs: Vec<*mut u8> = Vec::with_capacity(args.offsets.len());
         for &off in &args.offsets {
@@ -1441,14 +1573,8 @@ mod tests {
 
     #[test]
     fn arch_flags() {
-        assert_eq!(
-            GpuArch::Sm(10, 0).nvrtc_flag(),
-            "--gpu-architecture=sm_100"
-        );
-        assert_eq!(
-            GpuArch::Sm(10, 3).nvrtc_flag(),
-            "--gpu-architecture=sm_103"
-        );
+        assert_eq!(GpuArch::Sm(10, 0).nvrtc_flag(), "--gpu-architecture=sm_100");
+        assert_eq!(GpuArch::Sm(10, 3).nvrtc_flag(), "--gpu-architecture=sm_103");
         assert_eq!(
             GpuArch::Sm(10, 3).nvrtc_ptx_flag().unwrap(),
             "--gpu-architecture=compute_103"

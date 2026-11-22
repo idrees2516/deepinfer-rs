@@ -66,7 +66,11 @@ impl Kernels {
         k: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(m > 0 && n > 0 && k > 0, InvalidArgument, "gemm needs m/n/k > 0");
+        ensure!(
+            m > 0 && n > 0 && k > 0,
+            InvalidArgument,
+            "gemm needs m/n/k > 0"
+        );
         let f = self.f("di_gemm_bf16_nt_kernel")?;
         f.launch(
             self.device(),
@@ -97,7 +101,11 @@ impl Kernels {
         k: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(m > 0 && n > 0 && k > 0, InvalidArgument, "gemm needs m/n/k > 0");
+        ensure!(
+            m > 0 && n > 0 && k > 0,
+            InvalidArgument,
+            "gemm needs m/n/k > 0"
+        );
         let f = self.f("di_gemm_f32_nt_kernel")?;
         f.launch(
             self.device(),
@@ -129,8 +137,16 @@ impl Kernels {
         k: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(m > 0 && n > 0 && k > 0, InvalidArgument, "gemm needs m/n/k > 0");
-        ensure!(k % 128 == 0, InvalidArgument, "fp8 gemm requires k % 128 == 0");
+        ensure!(
+            m > 0 && n > 0 && k > 0,
+            InvalidArgument,
+            "gemm needs m/n/k > 0"
+        );
+        ensure!(
+            k % 128 == 0,
+            InvalidArgument,
+            "fp8 gemm requires k % 128 == 0"
+        );
         let f = self.f("di_gemm_fp8_nt_kernel")?;
         f.launch(
             self.device(),
@@ -180,12 +196,23 @@ impl Kernels {
             InvalidArgument,
             "tcgen05 GEMM unavailable (needs CUDA cc >= 10.0)"
         );
-        ensure!(m > 0 && n > 0 && k > 0, InvalidArgument, "gemm needs m/n/k > 0");
-        ensure!(k % 128 == 0, InvalidArgument, "fp8 gemm requires k % 128 == 0");
+        ensure!(
+            m > 0 && n > 0 && k > 0,
+            InvalidArgument,
+            "gemm needs m/n/k > 0"
+        );
+        ensure!(
+            k % 128 == 0,
+            InvalidArgument,
+            "fp8 gemm requires k % 128 == 0"
+        );
         let f = self.f("di_gemm_fp8_nt_sm100a_kernel")?;
         // Raise the dynamic-smem ceiling once per function handle.
         {
-            let mut set = self.sm100_smem_set.lock().expect("sm100 smem flag poisoned");
+            let mut set = self
+                .sm100_smem_set
+                .lock()
+                .expect("sm100 smem flag poisoned");
             if !*set {
                 f.set_max_dynamic_smem(self.device(), SM100_SMEM_BYTES)?;
                 *set = true;
@@ -280,8 +307,16 @@ impl Kernels {
             InvalidArgument,
             "the MFMA path is AMD-only"
         );
-        ensure!(m > 0 && n > 0 && k > 0, InvalidArgument, "gemm needs m/n/k > 0");
-        ensure!(k % 128 == 0, InvalidArgument, "fp8 gemm requires k % 128 == 0");
+        ensure!(
+            m > 0 && n > 0 && k > 0,
+            InvalidArgument,
+            "gemm needs m/n/k > 0"
+        );
+        ensure!(
+            k % 128 == 0,
+            InvalidArgument,
+            "fp8 gemm requires k % 128 == 0"
+        );
         let f = self.f("di_gemm_fp8_nt_mfma_kernel")?;
         f.launch(
             self.device(),
@@ -318,8 +353,16 @@ impl Kernels {
         g: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(g > 0 && n > 0 && k > 0 && k % 128 == 0, InvalidArgument, "grouped gemm bad shape");
-        ensure!(m_total % 128 == 0, InvalidArgument, "m_total must be 128-aligned");
+        ensure!(
+            g > 0 && n > 0 && k > 0 && k % 128 == 0,
+            InvalidArgument,
+            "grouped gemm bad shape"
+        );
+        ensure!(
+            m_total % 128 == 0,
+            InvalidArgument,
+            "m_total must be 128-aligned"
+        );
         let f = self.f("di_gemm_fp8_grouped_nt_kernel")?;
         f.launch(
             self.device(),
@@ -375,8 +418,16 @@ impl Kernels {
             "g*cap overflows the i32 row space"
         );
         if dtype == GemmDType::Fp8 {
-            ensure!(k % 128 == 0, InvalidArgument, "fp8 gemm requires k % 128 == 0");
-            ensure!(a_sf.is_some() && b_sf.is_some(), InvalidArgument, "fp8 needs scale buffers");
+            ensure!(
+                k % 128 == 0,
+                InvalidArgument,
+                "fp8 gemm requires k % 128 == 0"
+            );
+            ensure!(
+                a_sf.is_some() && b_sf.is_some(),
+                InvalidArgument,
+                "fp8 needs scale buffers"
+            );
         }
         let m_tiles = cap.div_ceil(BM);
         let grid_y = g

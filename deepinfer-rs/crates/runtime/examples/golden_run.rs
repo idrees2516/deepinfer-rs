@@ -180,7 +180,10 @@ fn main() {
         j.str("name", &p.name);
         j.str("arch", &p.arch.as_str());
         j.num("sm_count", p.sm_count as f64);
-        j.num("total_mem_gb", p.total_mem as f64 / (1024.0 * 1024.0 * 1024.0));
+        j.num(
+            "total_mem_gb",
+            p.total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
         if gpu.backend() == Backend::Cuda {
             if let Some((ma, mi)) = gpu.nvrtc_version() {
                 j.str("nvrtc", &format!("{ma}.{mi}"));
@@ -287,7 +290,11 @@ fn main() {
         };
         checks.push(Check {
             name: "rollback_bit_exact",
-            status: if before == after { Status::Pass } else { Status::Fail },
+            status: if before == after {
+                Status::Pass
+            } else {
+                Status::Fail
+            },
             metric: 0.0,
             detail: format!("hashes {before} / {after}"),
         });
@@ -322,8 +329,10 @@ fn main() {
             let d1 = dev.alloc(m * n * 4).unwrap();
             let d2 = dev.alloc(m * n * 4).unwrap();
             let s = dev.stream().unwrap();
-            k.gemm_fp8_nt(&aq_b, &asf_b, &bq_b, &bsf_b, &d1, m, n, kk, &s).unwrap();
-            k.gemm_fp8_nt_sm100(&aq_b, &asf_b, &bq_b, &bsf_b, &d2, m, n, kk, &s).unwrap();
+            k.gemm_fp8_nt(&aq_b, &asf_b, &bq_b, &bsf_b, &d1, m, n, kk, &s)
+                .unwrap();
+            k.gemm_fp8_nt_sm100(&aq_b, &asf_b, &bq_b, &bsf_b, &d2, m, n, kk, &s)
+                .unwrap();
             s.synchronize().unwrap();
             let mut g1 = vec![0.0f32; m * n];
             let mut g2 = vec![0.0f32; m * n];
@@ -368,9 +377,114 @@ fn main() {
         }
         checks.push(Check {
             name,
-            status: if worst < 5e-2 { Status::Pass } else { Status::Fail },
+            status: if worst < 5e-2 {
+                Status::Pass
+            } else {
+                Status::Fail
+            },
             metric: worst as f64,
             detail: format!("worst rel err {worst}"),
+        });
+    }
+
+    // 5b) DSpark speculative serving surface: host draft -> chunked
+    //     serve_verify vs sequential decodes -> rollback exactness.
+    {
+        let name = "serve_spec_decode";
+        let cfg = ModelConfig::v41_tiny();
+        let mut gpu = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+        let prompt: Vec<u32> = (0..6u32).map(|t| (t * 61) % 250).collect();
+        gpu.serve_configure(2, 64, 4).unwrap();
+        gpu.serve_attach(1).unwrap();
+        gpu.serve_attach(2).unwrap();
+        let anchor = gpu.serve_prefill_out(1, &prompt).unwrap();
+        let _ = gpu.serve_prefill(2, &prompt).unwrap();
+        // Draft chain from the anchor's hidden state.
+        let mut chain = Vec::new();
+        let h = anchor.hidden.clone();
+        let mut last = *prompt.last().unwrap();
+        for _ in 0..3 {
+            let d = gpu.draft_step(last, &h).unwrap();
+            last = d.token;
+            chain.push(d.token);
+        }
+        // Chunked verification vs sequential decodes on the twin slot
+        // (same prompt): decoding chain[j] on slot 2 yields rows[j].
+        let rows = gpu.serve_verify(1, &chain).unwrap();
+        let mut seq_rows = Vec::new();
+        for &c in &chain {
+            let r = gpu.serve_decode(&[(2, c)]).unwrap();
+            seq_rows.push(r.into_iter().next().unwrap());
+        }
+        let mut worst = 0.0f32;
+        for (a, b) in rows.iter().zip(seq_rows.iter()) {
+            worst = worst.max(rel_err(a, b));
+        }
+        // Rollback the chain: the re-decode of the first draft must
+        // reproduce the pre-rollback row exactly (slot-keyed rewrite).
+        gpu.serve_rollback(1, chain.len()).unwrap();
+        let after = gpu.serve_decode(&[(1, chain[0])]).unwrap();
+        let after = after.into_iter().next().unwrap();
+        let direct = {
+            let mut m = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+            let _ = m.prefill(7, &prompt).unwrap();
+            m.decode_step(7, chain[0]).unwrap()
+        };
+        worst = worst.max(rel_err(&after, &direct));
+        checks.push(Check {
+            name,
+            status: if worst < 5e-2 {
+                Status::Pass
+            } else {
+                Status::Fail
+            },
+            metric: worst as f64,
+            detail: format!("draft 3, worst rel err {worst}"),
+        });
+    }
+
+    // 5c) GPU prefix cache: block-granular page sharing. A warm re-
+    //     prefill of the same 130-token prompt must hit the radix tree
+    //     and match the cold logits; a rollback below the frozen
+    //     prefix (copy-on-write) must keep the cached snapshot exact
+    //     for a third sequence.
+    {
+        let name = "serve_prefix_cache";
+        let cfg = ModelConfig::v41_tiny();
+        let mut gpu = DeviceModel::random_init(&cfg, 42, &dev, Precision::F32).unwrap();
+        let prompt: Vec<u32> = (0..130u32).map(|t| (t * 37 + 5) % 250).collect();
+        gpu.serve_configure(3, 256, 16).unwrap();
+        gpu.serve_prefix_configure(1 << 18).unwrap();
+        gpu.serve_attach(1).unwrap();
+        let cold = gpu.serve_prefill(1, &prompt).unwrap();
+        let st = gpu.serve_prefix_stats();
+        gpu.serve_attach(2).unwrap();
+        let warm = gpu.serve_prefill(2, &prompt).unwrap();
+        let st2 = gpu.serve_prefix_stats();
+        // Copy-on-write: sequence 2 rewinds below the frozen prefix and
+        // appends divergent tokens; sequence 3 must still restore the
+        // original prefix bit-exactly.
+        gpu.serve_rollback(2, 11).unwrap();
+        let alt: Vec<u32> = vec![200, 150, 99, 3];
+        let _ = gpu.serve_verify(2, &alt).unwrap();
+        gpu.serve_rollback(2, alt.len()).unwrap();
+        let _ = gpu.serve_decode(&[(2, alt[0])]).unwrap();
+        gpu.serve_attach(3).unwrap();
+        let again = gpu.serve_prefill(3, &prompt).unwrap();
+        let worst = rel_err(&cold, &warm).max(rel_err(&cold, &again));
+        let ok = st.nodes == 2
+            && st.cached_tokens == 128
+            && st2.hits == st.hits + 1
+            && st2.reused_tokens >= 128
+            && worst < 5e-2;
+        checks.push(Check {
+            name,
+            status: if ok { Status::Pass } else { Status::Fail },
+            metric: worst as f64,
+            detail: format!(
+                "nodes {} hits {} reused {} worst rel err {worst}",
+                st2.nodes, st2.hits, st2.reused_tokens
+            ),
         });
     }
 
@@ -396,11 +510,14 @@ fn main() {
                     topk_idx.push(((t + kk) % e) as i32);
                 }
             }
-            let topk_w: Vec<f32> =
-                (0..tokens * k).map(|i| 0.125 + (i % 5) as f32 / 40.0).collect();
+            let topk_w: Vec<f32> = (0..tokens * k)
+                .map(|i| 0.125 + (i % 5) as f32 / 40.0)
+                .collect();
             let mut bufs = Vec::new();
             for r in 0..devs.len() {
-                let xq: Vec<u8> = (0..tokens * hidden).map(|i| ((i + r * 17) % 251) as u8).collect();
+                let xq: Vec<u8> = (0..tokens * hidden)
+                    .map(|i| ((i + r * 17) % 251) as u8)
+                    .collect();
                 let xsf = vec![0x80u8; tokens * (hidden / 128)];
                 bufs.push((
                     devs[r].alloc_from(&xq).unwrap(),
@@ -423,7 +540,8 @@ fn main() {
             }
             for r in 0..devs.len() {
                 let (_, _, _, _, counters, meta2, drops, aq, asf, _, _) = &bufs[r];
-                ep.group(&kern[r], r, counters, aq, asf, meta2, drops).unwrap();
+                ep.group(&kern[r], r, counters, aq, asf, meta2, drops)
+                    .unwrap();
             }
             for r in 0..devs.len() {
                 let y_host: Vec<f32> = (0..e * cap * hidden)
@@ -464,7 +582,11 @@ fn main() {
         let err = run(&devs[..world]);
         checks.push(Check {
             name,
-            status: if err < 1e-4 { Status::Pass } else { Status::Fail },
+            status: if err < 1e-4 {
+                Status::Pass
+            } else {
+                Status::Fail
+            },
             metric: err,
             detail: format!("world {world}, worst abs err {err}"),
         });
@@ -562,7 +684,13 @@ fn write_artifact(path: &str, report: &str, checks: &[Check], mode: &str) {
         }
         _ => {
             for c in checks {
-                println!("{} {} (metric {:.6}) {}", c.status.as_str(), c.name, c.metric, c.detail);
+                println!(
+                    "{} {} (metric {:.6}) {}",
+                    c.status.as_str(),
+                    c.name,
+                    c.metric,
+                    c.detail
+                );
             }
         }
     }

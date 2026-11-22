@@ -212,7 +212,11 @@ mod tests {
                 Internal,
                 "draft_step not deterministic"
             );
-            ensure!(d1.logits == d2.logits, Internal, "draft logits not deterministic");
+            ensure!(
+                d1.logits == d2.logits,
+                Internal,
+                "draft logits not deterministic"
+            );
             ensure!(d1.logits.len() == vocab, Internal, "logits length");
             ensure!((d1.token as usize) < vocab, Internal, "token outside vocab");
             ensure!(

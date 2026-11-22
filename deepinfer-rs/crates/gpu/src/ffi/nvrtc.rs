@@ -31,8 +31,7 @@ pub(crate) type FnGetCubin = unsafe extern "C" fn(Program, *mut std::ffi::c_char
 pub(crate) type FnGetPtxSize = unsafe extern "C" fn(Program, *mut usize) -> NvrtcResult;
 pub(crate) type FnGetPtx = unsafe extern "C" fn(Program, *mut std::ffi::c_char) -> NvrtcResult;
 pub(crate) type FnDestroyProgram = unsafe extern "C" fn(*mut Program) -> NvrtcResult;
-pub(crate) type FnGetErrorString =
-    unsafe extern "C" fn(NvrtcResult) -> *const std::ffi::c_char;
+pub(crate) type FnGetErrorString = unsafe extern "C" fn(NvrtcResult) -> *const std::ffi::c_char;
 
 /// NVRTC entry points bound to one open `libnvrtc`.
 pub struct Nvrtc {
@@ -95,7 +94,9 @@ impl Nvrtc {
             format!("NVRTC error {code}")
         } else {
             // SAFETY: static NUL-terminated.
-            unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+            unsafe { std::ffi::CStr::from_ptr(p) }
+                .to_string_lossy()
+                .into_owned()
         }
     }
 }

@@ -172,10 +172,7 @@ impl MoeWeights {
         // uniform distribution (documented; never NaN).
         let sum: f32 = selected.iter().map(|&e| nobias[e as usize]).sum();
         let topk_weights: Vec<f32> = if sum > 0.0 && sum.is_finite() {
-            selected
-                .iter()
-                .map(|&e| nobias[e as usize] / sum)
-                .collect()
+            selected.iter().map(|&e| nobias[e as usize] / sum).collect()
         } else {
             vec![1.0 / selected.len() as f32; selected.len()]
         };
@@ -263,7 +260,11 @@ fn sigmoid(z: f32) -> f32 {
 
 /// Validates the structural invariants of a [`MoeConfig`].
 pub(crate) fn validate_config(cfg: &MoeConfig) -> Result<()> {
-    ensure!(cfg.hidden >= 1, InvalidArgument, "MoeConfig: hidden must be >= 1");
+    ensure!(
+        cfg.hidden >= 1,
+        InvalidArgument,
+        "MoeConfig: hidden must be >= 1"
+    );
     ensure!(
         cfg.intermediate >= 1,
         InvalidArgument,
@@ -404,10 +405,7 @@ mod tests {
             assert_eq!(r.topk_idx.len(), cfg.num_activated);
             assert_eq!(r.topk_weights.len(), cfg.num_activated);
             let sum: f32 = r.topk_weights.iter().sum();
-            assert!(
-                (sum - 1.0).abs() < 1e-5,
-                "weights sum to {sum}, expected 1"
-            );
+            assert!((sum - 1.0).abs() < 1e-5, "weights sum to {sum}, expected 1");
             assert!(
                 r.topk_weights.iter().all(|&v| v >= 0.0 && v.is_finite()),
                 "weights must be finite and non-negative"
@@ -450,7 +448,10 @@ mod tests {
         let r = w.route(&cfg, &x).unwrap();
         assert_eq!(r.topk_idx, vec![4, 5, 6, 7], "all of group 1 selected");
         // Weights: sigmoids of all four experts of group 1, renormalized.
-        let s: Vec<f64> = [4, 5, 6, 7].iter().map(|&e| sigmoid64(w.gate[e * 2] as f64)).collect();
+        let s: Vec<f64> = [4, 5, 6, 7]
+            .iter()
+            .map(|&e| sigmoid64(w.gate[e * 2] as f64))
+            .collect();
         let tot: f64 = s.iter().sum();
         for j in 0..4 {
             assert!((r.topk_weights[j] as f64 - s[j] / tot).abs() < 1e-6);
@@ -480,7 +481,10 @@ mod tests {
         assert!(validate_config(&cfg).is_err(), "k=3 not divisible by g=2");
         cfg.num_activated = 4;
         cfg.num_routed = 7;
-        assert!(validate_config(&cfg).is_err(), "num_routed=7 not divisible by g=2");
+        assert!(
+            validate_config(&cfg).is_err(),
+            "num_routed=7 not divisible by g=2"
+        );
     }
 
     #[test]
@@ -496,7 +500,11 @@ mod tests {
         let a = w.route(&cfg_no_bias, &x).unwrap();
         let b = w.route(&cfg_no_bias, &x).unwrap();
         assert_eq!(a, b);
-        assert_eq!(a.topk_idx, vec![0, 1], "tie must pick lower expert id first");
+        assert_eq!(
+            a.topk_idx,
+            vec![0, 1],
+            "tie must pick lower expert id first"
+        );
     }
 
     #[test]

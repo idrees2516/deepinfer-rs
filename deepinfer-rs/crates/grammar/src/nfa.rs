@@ -36,7 +36,9 @@ impl ClassSet {
 
     /// All 256 bytes.
     pub fn full() -> ClassSet {
-        ClassSet { bits: [u64::MAX; 4] }
+        ClassSet {
+            bits: [u64::MAX; 4],
+        }
     }
 
     /// Adds a single byte.
@@ -85,7 +87,9 @@ impl ClassSet {
 
     /// Iterates member bytes in ascending order.
     pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
-        (0..=255u16).filter(move |&b| self.contains(b as u8)).map(|b| b as u8)
+        (0..=255u16)
+            .filter(move |&b| self.contains(b as u8))
+            .map(|b| b as u8)
     }
 }
 
@@ -341,9 +345,7 @@ mod tests {
             s.add_range(b'c', b'd');
             s
         };
-        let c = b.frag_class(&cls)
-        .unwrap()
-        .unwrap();
+        let c = b.frag_class(&cls).unwrap().unwrap();
         let alt = b.alt(vec![Some(a), Some(c)]).unwrap().unwrap();
         let st = b.star(alt).unwrap();
         let nfa = b.finish(Some(st)).unwrap();

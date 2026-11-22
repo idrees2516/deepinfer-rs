@@ -131,8 +131,7 @@ pub fn low_latency_dispatch(
         for (j, &(t, ki, w)) in placed[g].iter().enumerate() {
             let row = g * capacity + j;
             let base = t as usize * hidden;
-            recv_x[row * hidden..(row + 1) * hidden]
-                .copy_from_slice(&decoded[base..base + hidden]);
+            recv_x[row * hidden..(row + 1) * hidden].copy_from_slice(&decoded[base..base + hidden]);
             slots.push((t, ki));
             slot_topk_idx.push((first_local + g) as u32);
             slot_topk_weights.push(w);

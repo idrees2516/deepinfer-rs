@@ -95,9 +95,12 @@ pub fn fused_attention_out_fp8(
         .ok_or_else(|| Error::DimensionMismatch("s_q*h overflows".into()))?;
     let groups = d_qk / OUT_CAST_GROUP;
     let mut data = vec![0u8; attn.len()];
-    let mut sf = vec![0u8; rows
-        .checked_mul(groups)
-        .ok_or_else(|| Error::DimensionMismatch("row*group count overflows".into()))?];
+    let mut sf =
+        vec![
+            0u8;
+            rows.checked_mul(groups)
+                .ok_or_else(|| Error::DimensionMismatch("row*group count overflows".into()))?
+        ];
     for r in 0..rows {
         fp8cache::quantize_e4m3_e8m0_groups(
             &attn[r * d_qk..(r + 1) * d_qk],
@@ -124,20 +127,47 @@ mod tests {
         let q = random_vec(&mut rng, s_q * h * d, 1.0);
         let kv = random_vec(&mut rng, s_kv * d, 1.0);
         let indices: Vec<i32> = (0..s_q * topk)
-            .map(|_| if rng.next_f32() < 0.2 { -1 } else { rng.uniform_usize(0, s_kv) as i32 })
+            .map(|_| {
+                if rng.next_f32() < 0.2 {
+                    -1
+                } else {
+                    rng.uniform_usize(0, s_kv) as i32
+                }
+            })
             .collect();
         let sm = 1.0 / (d as f32).sqrt();
         let rope = Rope::new(8, RopeStyle::Interleaved, 10_000.0, None, 64).unwrap();
         let positions: Vec<u32> = (0..s_q as u32).collect();
         let (data, sf) = fused_attention_out_fp8(
-            &q, &kv, &indices, s_q, h, d, s_kv, topk, sm, Some(&[0.25, -0.1]), None,
+            &q,
+            &kv,
+            &indices,
+            s_q,
+            h,
+            d,
+            s_kv,
+            topk,
+            sm,
+            Some(&[0.25, -0.1]),
+            None,
             Some((&rope, &positions)),
         )
         .unwrap();
         // Manual composition.
-        let (mut attn, _, _) =
-            flash_mla_sparse_prefill(&q, &kv, &indices, s_q, h, d, s_kv, topk, sm, Some(&[0.25, -0.1]), None)
-                .unwrap();
+        let (mut attn, _, _) = flash_mla_sparse_prefill(
+            &q,
+            &kv,
+            &indices,
+            s_q,
+            h,
+            d,
+            s_kv,
+            topk,
+            sm,
+            Some(&[0.25, -0.1]),
+            None,
+        )
+        .unwrap();
         let mut row_pos = Vec::new();
         for &p in &positions {
             for _ in 0..h {
@@ -162,7 +192,17 @@ mod tests {
         assert_eq!(sf.len(), s_q * h * (d / 32));
         // Determinism.
         let (data2, sf2) = fused_attention_out_fp8(
-            &q, &kv, &indices, s_q, h, d, s_kv, topk, sm, Some(&[0.25, -0.1]), None,
+            &q,
+            &kv,
+            &indices,
+            s_q,
+            h,
+            d,
+            s_kv,
+            topk,
+            sm,
+            Some(&[0.25, -0.1]),
+            None,
             Some((&rope, &positions)),
         )
         .unwrap();
@@ -185,10 +225,22 @@ mod tests {
         let rope = Rope::new(8, RopeStyle::Interleaved, 10_000.0, None, 64).unwrap();
         let positions: Vec<u32> = (0..s_q as u32).collect();
         let (data, sf) = fused_attention_out_fp8(
-            &q, &kv, &indices, s_q, h, d, s_kv, topk, sm, None, None, Some((&rope, &positions)),
+            &q,
+            &kv,
+            &indices,
+            s_q,
+            h,
+            d,
+            s_kv,
+            topk,
+            sm,
+            None,
+            None,
+            Some((&rope, &positions)),
         )
         .unwrap();
-        let (mut ref_out, _, _) = naive_sparse_prefill(&q, &kv, &indices, s_q, h, d, s_kv, topk, sm, None, None);
+        let (mut ref_out, _, _) =
+            naive_sparse_prefill(&q, &kv, &indices, s_q, h, d, s_kv, topk, sm, None, None);
         let mut row_pos = Vec::new();
         for &p in &positions {
             for _ in 0..h {
@@ -198,8 +250,7 @@ mod tests {
         o_rope_conjugate(&rope, &row_pos, &mut ref_out, s_q * h, d).unwrap();
         for r in 0..s_q * h {
             for j in 0..d {
-                let scale =
-                    deepinfer_core::format::e8m0_to_f32(sf[r * (d / 32) + j / 32]);
+                let scale = deepinfer_core::format::e8m0_to_f32(sf[r * (d / 32) + j / 32]);
                 let deq = deepinfer_core::format::e4m3_to_f32(data[r * d + j]) * scale;
                 assert_close_slice(&[deq], &[ref_out[r * d + j]], 0.05, "fused dequant");
             }
@@ -211,10 +262,52 @@ mod tests {
         let q = vec![0.1f32; 2 * 2 * 32];
         let kv = vec![0.1f32; 5 * 32];
         // d_qk not divisible by 32.
-        assert!(fused_attention_out_fp8(&q[..2 * 2 * 30], &kv[..5 * 30], &[0, 1], 2, 2, 30, 5, 1, 1.0, None, None, None).is_err());
+        assert!(fused_attention_out_fp8(
+            &q[..2 * 2 * 30],
+            &kv[..5 * 30],
+            &[0, 1],
+            2,
+            2,
+            30,
+            5,
+            1,
+            1.0,
+            None,
+            None,
+            None
+        )
+        .is_err());
         // Wrong o_rope position count.
         let rope = Rope::new(8, RopeStyle::Interleaved, 10_000.0, None, 64).unwrap();
-        assert!(fused_attention_out_fp8(&q, &kv, &[0, 1], 2, 2, 32, 5, 1, 1.0, None, None, Some((&rope, &[0u32]))).is_err());
-        assert!(fused_attention_out_fp8(&q, &kv, &[0, 1], 2, 2, 32, 5, 1, 1.0, None, None, Some((&rope, &[0u32, 1]))).is_ok());
+        assert!(fused_attention_out_fp8(
+            &q,
+            &kv,
+            &[0, 1],
+            2,
+            2,
+            32,
+            5,
+            1,
+            1.0,
+            None,
+            None,
+            Some((&rope, &[0u32]))
+        )
+        .is_err());
+        assert!(fused_attention_out_fp8(
+            &q,
+            &kv,
+            &[0, 1],
+            2,
+            2,
+            32,
+            5,
+            1,
+            1.0,
+            None,
+            None,
+            Some((&rope, &[0u32, 1]))
+        )
+        .is_ok());
     }
 }

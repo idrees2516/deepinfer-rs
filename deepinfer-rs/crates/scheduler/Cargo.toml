@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "deepinfer-scheduler (implementation pending)"
+description = "Continuous-batching scheduler and two-thread zero-overhead asynchronous engine (vLLM-style chunked prefill, preemption, batch-invariant admission) — pure-Rust CPU-reference port of DeepInfer"
 
 [lints]
 workspace = true

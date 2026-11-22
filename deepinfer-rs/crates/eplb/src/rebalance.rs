@@ -317,7 +317,13 @@ mod tests {
     use deepinfer_core::prop::prop;
     use deepinfer_core::rng::Philox;
 
-    fn cfg(logical: usize, replicas: usize, groups: usize, nodes: usize, gpus: usize) -> EplbConfig {
+    fn cfg(
+        logical: usize,
+        replicas: usize,
+        groups: usize,
+        nodes: usize,
+        gpus: usize,
+    ) -> EplbConfig {
         EplbConfig {
             num_logical: logical,
             num_replicas: replicas,
@@ -374,7 +380,10 @@ mod tests {
             assert_eq!(copies.len(), n);
             let total: usize = copies.iter().map(|&c| c as usize).sum();
             assert_eq!(total, n + replicas, "copy count must be exact");
-            assert!(copies.iter().all(|&c| c >= 1), "every expert keeps >= 1 copy");
+            assert!(
+                copies.iter().all(|&c| c >= 1),
+                "every expert keeps >= 1 copy"
+            );
             let ratio = |e: usize| weight[e] / copies[e] as f64;
             let max_ratio = (0..n).map(ratio).fold(f64::NEG_INFINITY, f64::max);
             // Experts that were actually cloned (greedy picks) must end
@@ -382,7 +391,10 @@ mod tests {
             let picked: Vec<usize> = (0..n).filter(|&e| copies[e] > 1).collect();
             if replicas > 0 {
                 assert!(!picked.is_empty(), "replicas must be placed somewhere");
-                let min_picked = picked.iter().map(|&e| ratio(e)).fold(f64::INFINITY, f64::min);
+                let min_picked = picked
+                    .iter()
+                    .map(|&e| ratio(e))
+                    .fold(f64::INFINITY, f64::min);
                 assert!(
                     max_ratio <= 2.0 * min_picked + 1e-9,
                     "max ratio {max_ratio} vs 2*min picked {min_picked}"
@@ -401,9 +413,9 @@ mod tests {
             let replicas = rng.uniform_usize(0, 3 * n);
             let weight = vec![1.0f64; n];
             let copies = get_redundant_experts(&weight, replicas);
-            let (lo, hi) = copies.iter().fold((u32::MAX, 0u32), |(lo, hi), &c| {
-                (lo.min(c), hi.max(c))
-            });
+            let (lo, hi) = copies
+                .iter()
+                .fold((u32::MAX, 0u32), |(lo, hi), &c| (lo.min(c), hi.max(c)));
             assert!(hi - lo <= 1, "copies spread {copies:?} exceeds 1");
             Ok(())
         });
@@ -438,10 +450,7 @@ mod tests {
         assert!(c.is_hierarchical());
         let maps = rebalance_experts(&[1.0, 1.0, 4.0, 2.0], &c).unwrap();
         assert_eq!(maps.phy2log, vec![2, 3, 0, 1]);
-        assert_eq!(
-            maps.log2phy,
-            vec![vec![2], vec![3], vec![0], vec![1]]
-        );
+        assert_eq!(maps.log2phy, vec![vec![2], vec![3], vec![0], vec![1]]);
         assert!(maps.is_consistent(&c));
 
         // Same topology with one replica: copies=[1,1,2,1]; group loads
@@ -451,10 +460,7 @@ mod tests {
         let c2 = cfg(4, 1, 2, 2, 4);
         let maps2 = rebalance_experts(&[1.0, 1.0, 4.0, 2.0], &c2).unwrap();
         assert_eq!(maps2.phy2log, vec![2, 3, 2, 0, 1]);
-        assert_eq!(
-            maps2.log2phy,
-            vec![vec![3], vec![4], vec![0, 2], vec![1]]
-        );
+        assert_eq!(maps2.log2phy, vec![vec![3], vec![4], vec![0, 2], vec![1]]);
         assert_eq!(maps2.logcnt, vec![1, 1, 2, 1]);
         assert!(maps2.is_consistent(&c2));
     }

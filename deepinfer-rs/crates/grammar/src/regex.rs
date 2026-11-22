@@ -40,7 +40,7 @@ struct Cur<'a> {
     pos: usize,
 }
 
-impl<'a> Cur<'a> {
+impl Cur<'_> {
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.pos).copied()
     }
@@ -425,8 +425,7 @@ fn parse_item(cur: &mut Cur<'_>, max_count: u32, depth: usize, max_depth: usize)
             other => {
                 return Err(Error::Grammar(format!(
                     "unexpected quantifier '{}' at offset {}",
-                    other as char,
-                    cur.pos
+                    other as char, cur.pos
                 )))
             }
         };
@@ -500,10 +499,7 @@ fn parse_atom(cur: &mut Cur<'_>, max_count: u32, depth: usize, max_depth: usize)
             );
             Ok(inner)
         }
-        b')' => Err(Error::Grammar(format!(
-            "unmatched ')' at offset {start}"
-        )),
-        ),
+        b')' => Err(Error::Grammar(format!("unmatched ')' at offset {start}"))),
         b'^' | b'$' => {
             // Anchors are no-ops under full-match semantics (documented).
             cur.pos += 1;
@@ -648,14 +644,17 @@ mod tests {
         assert!(m("a\\tb", "a\tb"));
         assert!(m("a\\rb", "a\rb"));
         assert!(m("a\\\\b", "a\\b"));
-        assert!(m("\\.\\*\\+\\?\\(\\)\\[\\]\\{\\}\\|\\^\\$\\-\\/", ".*+?()[]{}|^$-/"));
+        assert!(m(
+            "\\.\\*\\+\\?\\(\\)\\[\\]\\{\\}\\|\\^\\$\\-\\/",
+            ".*+?()[]{}|^$-/"
+        ));
         assert!(m("\\x41\\x42", "AB"));
         assert!(m("\\u0041", "A"));
         assert!(m("\\u00e9", "é")); // 2-byte UTF-8
         assert!(m("\\u20ac", "€")); // 3-byte UTF-8
-        // The braced form is EBNF-only; in regex `\u{41}` must be a
-        // compile error (stray `{` after the escape is a quantifier
-        // position with nothing to repeat... actually `u` then `{41}`).
+                                    // The braced form is EBNF-only; in regex `\u{41}` must be a
+                                    // compile error (stray `{` after the escape is a quantifier
+                                    // position with nothing to repeat... actually `u` then `{41}`).
         assert!(compile_regex_nfa("\\u{41}", &GrammarLimits::default()).is_err());
         assert!(m("a\\wb", "a_b"));
         assert!(m("a\\sb", "a b"));
@@ -778,7 +777,7 @@ mod tests {
         pub fn parse(pat: &str) -> Na {
             let b = pat.as_bytes();
             let mut pos = 0usize;
-            
+
             alt(b, &mut pos)
         }
 
@@ -898,7 +897,7 @@ mod tests {
                     }
                     let mut ranges = Vec::new();
                     let mut first = true;
-                    while *pos < b.len() && !(b[*pos] == b']' && !first) {
+                    while *pos < b.len() && (b[*pos] != b']' || first) {
                         let lo = class_byte(b, pos);
                         if *pos + 1 < b.len() && b[*pos] == b'-' && b[*pos + 1] != b']' {
                             *pos += 1;
@@ -988,9 +987,7 @@ mod tests {
                 match ast {
                     Na::Empty => s.is_empty(),
                     Na::Lit(bytes) => s == bytes.as_slice(),
-                    Na::Class(ranges, neg) => {
-                        s.len() == 1 && in_class(ranges, *neg, s[0])
-                    }
+                    Na::Class(ranges, neg) => s.len() == 1 && in_class(ranges, *neg, s[0]),
                     Na::Seq(items) => seq_match(items, 0, s, k),
                     Na::Alt(branches) => branches.iter().any(|b| m(b, s, k)),
                     Na::Rep(inner, lo, hi) => rep_match(inner, *lo, *hi, s, 0, k),
@@ -1002,8 +999,7 @@ mod tests {
                 }
                 // Try every split of s between items[idx] and the rest.
                 for split in 0..=s.len() {
-                    if m(&items[idx], &s[..split], k) && seq_match(items, idx + 1, &s[split..], k)
-                    {
+                    if m(&items[idx], &s[..split], k) && seq_match(items, idx + 1, &s[split..], k) {
                         return true;
                     }
                 }
@@ -1032,9 +1028,10 @@ mod tests {
                 // recursion finite.
                 for split in 0..=s.len() {
                     if m(inner, &s[..split], k.min(k.saturating_sub(1)))
-                        && rep_match(inner, lo, hi, &s[split..], done + 1, k) {
-                            return true;
-                        }
+                        && rep_match(inner, lo, hi, &s[split..], done + 1, k)
+                    {
+                        return true;
+                    }
                 }
                 false
             }

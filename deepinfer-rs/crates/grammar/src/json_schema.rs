@@ -285,9 +285,7 @@ fn pos_range_ast(lo: u64, hi: u64) -> Ast {
         ]));
     }
     // Highest length: [10^(H-1), hi].
-    let hi_bottom = 10u64
-        .checked_pow((hi_s.len() - 1) as u32)
-        .unwrap_or(1);
+    let hi_bottom = 10u64.checked_pow((hi_s.len() - 1) as u32).unwrap_or(1);
     branches.push(same_len_range(&digits_of(hi_bottom.max(1)), &hi_s));
     alt(branches)
 }
@@ -765,7 +763,10 @@ fn array_fragment(
     obj: &HashMap<String, &Json>,
 ) -> Result<Option<Fragment>> {
     let min_items = obj.get("minItems").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let max_items = obj.get("maxItems").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let max_items = obj
+        .get("maxItems")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
     let prefix = obj.get("prefixItems").and_then(|v| v.as_arr());
     let n_prefix = prefix.map(|p| p.len()).unwrap_or(0) as u32;
     let items = obj.get("items");
@@ -999,9 +1000,7 @@ fn object_fragment(
                     let key_ast = if props.is_empty() {
                         string_ast(0, None)
                     } else {
-                        exclude_keys_ast(
-                            &props.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
-                        )
+                        exclude_keys_ast(&props.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>())
                     };
                     let key_frag = lower_ast_no_rules(b, &key_ast, ctx.limits)?;
                     let parts: Vec<Option<Fragment>> = vec![

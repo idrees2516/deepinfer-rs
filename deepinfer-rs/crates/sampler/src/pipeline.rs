@@ -72,7 +72,12 @@ impl Sampler {
     /// token; params must pass [`SamplingParams::validate`] against
     /// `logits.len()`; at least one finite logit must survive masking.
     /// Masked-out and non-finite (`±∞`/`NaN`) logits are never returned.
-    pub fn sample(&self, logits: &[f32], mask: Option<&TokenMask>, rng: &mut Philox) -> Result<u32> {
+    pub fn sample(
+        &self,
+        logits: &[f32],
+        mask: Option<&TokenMask>,
+        rng: &mut Philox,
+    ) -> Result<u32> {
         ensure!(
             !logits.is_empty(),
             InvalidArgument,
@@ -244,7 +249,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn draw_n(s: &Sampler, logits: &[f32], rng: &mut Philox, n: usize) -> Vec<u32> {
-        (0..n).map(|_| s.sample(logits, None, rng).unwrap()).collect()
+        (0..n)
+            .map(|_| s.sample(logits, None, rng).unwrap())
+            .collect()
     }
 
     fn seen_set(s: &Sampler, logits: &[f32], rng: &mut Philox, n: usize) -> BTreeSet<u32> {
@@ -406,7 +413,9 @@ mod tests {
         // Mask allowing only -inf logits: no valid distribution.
         let mut m2 = TokenMask::zeros(3);
         m2.set(0);
-        assert!(g.sample(&[f32::NEG_INFINITY, 1.0, 2.0], Some(&m2), &mut rng).is_err());
+        assert!(g
+            .sample(&[f32::NEG_INFINITY, 1.0, 2.0], Some(&m2), &mut rng)
+            .is_err());
     }
 
     #[test]

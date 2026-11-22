@@ -11,4 +11,6 @@ workspace = true
 
 [dependencies]
 deepinfer-core = { workspace = true }
+
+[dev-dependencies]
 deepinfer-fp8 = { workspace = true }

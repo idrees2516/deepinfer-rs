@@ -27,7 +27,12 @@ pub(crate) fn small_cfg(cache: CacheFormat, max_pages: usize) -> MlaConfig {
 
 /// Builds a paged cache holding `rows` appended to one fresh sequence
 /// (pages allocated in order, so physical index == logical position).
-pub(crate) fn build_cache(format: CacheFormat, rows: &[Vec<f32>], seq: u32, max_pages: usize) -> MlaPagedCache {
+pub(crate) fn build_cache(
+    format: CacheFormat,
+    rows: &[Vec<f32>],
+    seq: u32,
+    max_pages: usize,
+) -> MlaPagedCache {
     let mut cache = MlaPagedCache::new(format, 64, max_pages);
     for row in rows {
         cache.append(seq, row).unwrap();
@@ -124,7 +129,13 @@ pub(crate) fn naive_sparse_prefill(
             })
             .collect();
         let remapped: Vec<usize> = (0..topk)
-            .map(|t| if invalid[t] { 0 } else { indices[i * topk + t] as usize })
+            .map(|t| {
+                if invalid[t] {
+                    0
+                } else {
+                    indices[i * topk + t] as usize
+                }
+            })
             .collect();
         // focused_kv = kv2[indices]
         let focused: Vec<&[f32]> = remapped.iter().map(|&j| &kv[j * d..(j + 1) * d]).collect();
@@ -196,10 +207,7 @@ pub(crate) fn naive_dense_prefill(
             let exps: Vec<f32> = scores.iter().map(|&s| (s - m).exp()).collect();
             let sum: f32 = exps.iter().sum();
             for j in 0..d {
-                out[obase + j] = (0..limit)
-                    .map(|k| exps[k] * kv[k * d + j])
-                    .sum::<f32>()
-                    / sum;
+                out[obase + j] = (0..limit).map(|k| exps[k] * kv[k * d + j]).sum::<f32>() / sum;
             }
         }
     }

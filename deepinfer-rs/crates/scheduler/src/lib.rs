@@ -104,17 +104,38 @@ pub struct Request {
     /// Monotonic arrival index driving FCFS admission (assigned by
     /// `add_request`).
     pub arrival_order: u64,
+    /// Speculation depth: the number of draft tokens a step may verify
+    /// for this request (0 = plain autoregressive decode). Billed
+    /// against the token budget as `spec_len + 1` rows per decode step —
+    /// the honest target cost of one DSpark round (draft-chain
+    /// verification plus the bonus decode).
+    pub spec_len: usize,
 }
 
 impl Request {
-    /// A request with the given prompt and generation limit.
+    /// A request with the given prompt and generation limit (plain
+    /// decode, `spec_len = 0`).
     pub fn new(prompt: Vec<u32>, max_tokens: usize) -> Request {
         Request {
             id: 0,
             prompt,
             max_tokens,
             arrival_order: 0,
+            spec_len: 0,
         }
+    }
+
+    /// Sets the speculation depth (draft tokens verified per step;
+    /// 0 disables speculative decoding for this request).
+    pub fn with_spec_len(mut self, spec_len: usize) -> Request {
+        self.spec_len = spec_len;
+        self
+    }
+
+    /// The per-step token-budget charge while decoding: at least one
+    /// row, plus one per draft position when speculating.
+    pub fn decode_cost(&self) -> usize {
+        self.spec_len + 1
     }
 }
 
@@ -169,6 +190,12 @@ pub enum BatchPlan {
 struct ReqState {
     req: Request,
     phase: Phase,
+    /// Prefix-cache reuse scheduled for this request while it waits:
+    /// the number of leading prompt tokens whose KV state the engine
+    /// will restore instead of recomputing (0 = cold prefill). Consumed
+    /// by the admission path, which starts the first chunk at this
+    /// offset (see [`Scheduler::skip_prefill`]).
+    reuse: usize,
 }
 
 /// Continuous-batching scheduler (single-threaded, deterministic).
@@ -207,6 +234,7 @@ impl Scheduler {
         self.states.push(ReqState {
             req,
             phase: Phase::Waiting,
+            reuse: 0,
         });
         id
     }
@@ -226,14 +254,82 @@ impl Scheduler {
             .all(|s| matches!(s.phase, Phase::Finished { .. }))
     }
 
+    /// Aborts a not-yet-finished request: it transitions to
+    /// [`Phase::Finished`] with [`StopReason::Aborted`] immediately (any
+    /// in-flight step result for it is ignored by [`Scheduler::report_tokens`]).
+    /// Returns `true` when the request was active and is now aborted;
+    /// `false` for unknown or already-finished requests. Called by the
+    /// serving layer when a client disconnects or a deadline expires.
+    pub fn abort_request(&mut self, id: u64) -> bool {
+        let Some(state) = self.states.iter_mut().find(|s| s.req.id == id) else {
+            return false;
+        };
+        if matches!(state.phase, Phase::Finished { .. }) {
+            return false;
+        }
+        state.phase = Phase::Finished {
+            reason: StopReason::Aborted,
+        };
+        self.finished.push((id, StopReason::Aborted));
+        true
+    }
+
     /// Finished requests `(id, reason)` in completion order.
     pub fn finished(&self) -> &[(u64, StopReason)] {
         &self.finished
     }
 
+    /// Takes the finished-request list (clears it) — the serving loop's
+    /// drain call, so long-running deployments do not accumulate
+    /// finished records.
+    pub fn take_finished(&mut self) -> Vec<(u64, StopReason)> {
+        std::mem::take(&mut self.finished)
+    }
+
+    /// Removes `Finished` request records from the state table (call
+    /// after [`Scheduler::take_finished`] handled them). Keeps `id`
+    /// allocation monotonic, so ids never collide.
+    pub fn reap_finished(&mut self) {
+        self.states
+            .retain(|s| !matches!(s.phase, Phase::Finished { .. }));
+    }
+
+    /// Requests currently in [`Phase::Waiting`] (queue-depth metric).
+    pub fn num_waiting(&self) -> usize {
+        self.states
+            .iter()
+            .filter(|s| matches!(s.phase, Phase::Waiting))
+            .count()
+    }
+
+    /// Schedules prefix-cache reuse for a waiting request: the first
+    /// `n` prompt tokens will not be recomputed — the engine restores
+    /// their cached state before prefilling only the suffix (the
+    /// admission path starts the first chunk at offset `n`). Called by
+    /// the serving coordinator after a prefix-cache hit. Requires
+    /// `0 <= n < prompt_len` so at least one token always prefills (the
+    /// prompt-completion contract needs a final forward).
+    ///
+    /// Returns `true` when the reuse was recorded; `false` when the
+    /// request is unknown or no longer waiting (already admitted —
+    /// the caller must not assume any reuse in that case).
+    pub fn skip_prefill(&mut self, id: u64, n: usize) -> bool {
+        let Some(state) = self.states.iter_mut().find(|s| s.req.id == id) else {
+            return false;
+        };
+        if !matches!(state.phase, Phase::Waiting) || n >= state.req.prompt.len() {
+            return false;
+        }
+        state.reuse = n;
+        true
+    }
+
     /// The current phase of a request (diagnostics/tests).
     pub fn phase(&self, id: u64) -> Option<&Phase> {
-        self.states.iter().find(|s| s.req.id == id).map(|s| &s.phase)
+        self.states
+            .iter()
+            .find(|s| s.req.id == id)
+            .map(|s| &s.phase)
     }
 
     /// The scheduler's step counter (increments on every `schedule`).
@@ -261,15 +357,14 @@ impl Scheduler {
         });
 
         let mut decode_reqs: Vec<u64> = Vec::new();
+        let mut decode_cost = 0usize;
         for s in &self.states {
             if let Phase::Decoding { .. } = s.phase {
                 decode_reqs.push(s.req.id);
+                decode_cost = decode_cost.saturating_add(s.req.decode_cost());
             }
         }
-        let mut budget = self
-            .cfg
-            .max_batch_tokens
-            .saturating_sub(decode_reqs.len());
+        let mut budget = self.cfg.max_batch_tokens.saturating_sub(decode_cost);
         let mut prefill_reqs: Vec<(u64, usize, usize)> = Vec::new();
         let mut running = self
             .states
@@ -301,7 +396,8 @@ impl Scheduler {
             }
         }
 
-        // 2. Admit waiting requests (FCFS).
+        // 2. Admit waiting requests (FCFS). The first chunk starts at
+        //    the request's prefix-reuse offset (0 for cold prefills).
         for idx in 0..self.states.len() {
             if !matches!(self.states[idx].phase, Phase::Waiting) {
                 continue;
@@ -309,8 +405,9 @@ impl Scheduler {
             if running >= self.cfg.max_running_requests {
                 break;
             }
+            let start = self.states[idx].reuse;
             let prompt_len = self.states[idx].req.prompt.len();
-            let want = self.cfg.chunked_prefill_size.min(prompt_len).max(1);
+            let want = self.cfg.chunked_prefill_size.min(prompt_len - start).max(1);
             let allowed = if nothing_running {
                 // Starvation guard for the head request.
                 want.max(1)
@@ -325,7 +422,7 @@ impl Scheduler {
             }
             budget = budget.saturating_sub(allowed);
             running += 1;
-            prefill_reqs.push((self.states[idx].req.id, 0, allowed));
+            prefill_reqs.push((self.states[idx].req.id, start, allowed));
         }
 
         if decode_reqs.is_empty() && prefill_reqs.is_empty() {
@@ -454,8 +551,7 @@ impl<E: EngineOps + 'static> AsyncEngine<E> {
         let plan_tx_handle = plan_tx.clone();
         let (res_tx, res_rx) = channel::<Result<Vec<(u64, u32)>>>();
         let done = Arc::new(AtomicBool::new(false));
-        let error_slot: Arc<Mutex<Option<deepinfer_core::Error>>> =
-            Arc::new(Mutex::new(None));
+        let error_slot: Arc<Mutex<Option<deepinfer_core::Error>>> = Arc::new(Mutex::new(None));
         let outputs: Arc<Mutex<Vec<(u64, StopReason)>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Engine thread: recv plan -> execute -> send results.
@@ -513,7 +609,10 @@ impl<E: EngineOps + 'static> AsyncEngine<E> {
                         }
                     }
                     let plan = sched.schedule();
-                    if let BatchPlan::Step { ref prefill_reqs, .. } = plan {
+                    if let BatchPlan::Step {
+                        ref prefill_reqs, ..
+                    } = plan
+                    {
                         for &(id, cs, cl) in prefill_reqs {
                             sched.commit_prefill(id, cs, cl);
                         }
@@ -629,16 +728,26 @@ mod tests {
         let a = s.add_request(Request::new(vec![1, 1], 3));
         let b = s.add_request(Request::new(vec![2, 2], 3));
         let p = s.schedule();
-        let BatchPlan::Step { prefill_reqs, .. } = p else { panic!() };
+        let BatchPlan::Step { prefill_reqs, .. } = p else {
+            panic!()
+        };
         assert_eq!(prefill_reqs, vec![(a, 0, 2)]);
         s.commit_prefill(a, 0, 2);
         let p = s.schedule();
-        let BatchPlan::Step { decode_reqs, prefill_reqs } = p else { panic!() };
+        let BatchPlan::Step {
+            decode_reqs,
+            prefill_reqs,
+        } = p
+        else {
+            panic!()
+        };
         assert_eq!(decode_reqs, vec![a]);
         assert_eq!(prefill_reqs, vec![(b, 0, 1)]);
         s.commit_prefill(b, 0, 1);
         let p = s.schedule();
-        let BatchPlan::Step { prefill_reqs, .. } = p else { panic!() };
+        let BatchPlan::Step { prefill_reqs, .. } = p else {
+            panic!()
+        };
         assert_eq!(prefill_reqs, vec![(b, 1, 1)]);
         s.commit_prefill(b, 1, 1);
         assert!(matches!(s.phase(b), Some(Phase::Decoding { .. })));
@@ -655,17 +764,27 @@ mod tests {
         let a = s.add_request(Request::new(vec![1], 2));
         let b = s.add_request(Request::new(vec![2], 2));
         let p = s.schedule();
-        let BatchPlan::Step { prefill_reqs, .. } = p else { panic!() };
+        let BatchPlan::Step { prefill_reqs, .. } = p else {
+            panic!()
+        };
         assert_eq!(prefill_reqs, vec![(a, 0, 1)]);
         s.commit_prefill(a, 0, 1);
         let p = s.schedule();
-        let BatchPlan::Step { decode_reqs, prefill_reqs } = p else { panic!() };
+        let BatchPlan::Step {
+            decode_reqs,
+            prefill_reqs,
+        } = p
+        else {
+            panic!()
+        };
         assert_eq!(decode_reqs, vec![a]);
         assert!(prefill_reqs.is_empty());
         s.report_tokens(&[(a, 0)], 0);
         assert_eq!(s.finished(), &[(a, StopReason::Eos)]);
         let p = s.schedule();
-        let BatchPlan::Step { prefill_reqs, .. } = p else { panic!() };
+        let BatchPlan::Step { prefill_reqs, .. } = p else {
+            panic!()
+        };
         assert_eq!(prefill_reqs, vec![(b, 0, 1)]);
         s.commit_prefill(b, 0, 1);
         s.report_tokens(&[(b, 5)], 0);
@@ -680,13 +799,17 @@ mod tests {
         let a = s.add_request(Request::new(vec![1], 2));
         let b = s.add_request(Request::new(vec![2], 1));
         let p = s.schedule();
-        let BatchPlan::Step { prefill_reqs, .. } = p else { panic!() };
+        let BatchPlan::Step { prefill_reqs, .. } = p else {
+            panic!()
+        };
         assert_eq!(prefill_reqs, vec![(a, 0, 1), (b, 0, 1)]);
         for &(id, cs, cl) in &prefill_reqs {
             s.commit_prefill(id, cs, cl);
         }
         let p = s.schedule();
-        let BatchPlan::Step { decode_reqs, .. } = p else { panic!() };
+        let BatchPlan::Step { decode_reqs, .. } = p else {
+            panic!()
+        };
         assert_eq!(decode_reqs, vec![a, b]);
         s.report_tokens(&[(a, 5), (b, 0)], 0); // b EOS, a continues
         assert_eq!(s.finished(), &[(b, StopReason::Eos)]);
@@ -703,7 +826,9 @@ mod tests {
         let mut s = Scheduler::new(SchedulerConfig::default());
         let a = s.add_request(Request::new(vec![1], 1));
         let p = s.schedule();
-        let BatchPlan::Step { prefill_reqs, .. } = p else { panic!() };
+        let BatchPlan::Step { prefill_reqs, .. } = p else {
+            panic!()
+        };
         let (id, cs, cl) = prefill_reqs[0];
         s.commit_prefill(id, cs, cl);
         s.report_tokens(&[(a, 9)], 0);
@@ -765,7 +890,11 @@ mod tests {
                         *e
                     };
                     // EOS at round 3 for every request.
-                    let tok: u32 = if r == 3 { eos } else { ((id + r as u64) % 7 + 1) as u32 };
+                    let tok: u32 = if r == 3 {
+                        eos
+                    } else {
+                        ((id + r as u64) % 7 + 1) as u32
+                    };
                     out.push((id, tok));
                 }
                 Ok(out)
@@ -811,7 +940,10 @@ mod tests {
                 let BatchPlan::Step { decode_reqs, .. } = plan else {
                     return Ok(Vec::new());
                 };
-                Ok(decode_reqs.iter().map(|&id| (id, (id % 5 + 1) as u32)).collect::<Vec<_>>()
+                Ok(decode_reqs
+                    .iter()
+                    .map(|&id| (id, (id % 5 + 1) as u32))
+                    .collect::<Vec<_>>()
                     .into_iter()
                     .map(|(id, t)| (id, if t == 5 { eos } else { t }))
                     .collect())
@@ -823,10 +955,7 @@ mod tests {
         let out = eng.run(0, 10_000).unwrap();
         // Sequential reference: both hit token 5 -> wait, token (id%5+1):
         // a=2, b=3... never eos. Let both run to length.
-        assert_eq!(
-            out,
-            vec![(a, StopReason::Length), (b, StopReason::Length)]
-        );
+        assert_eq!(out, vec![(a, StopReason::Length), (b, StopReason::Length)]);
     }
 
     #[test]
@@ -835,6 +964,132 @@ mod tests {
         assert_eq!(r.prompt, vec![1, 2, 3]);
         assert_eq!(r.max_tokens, 4);
         assert_eq!(r.id, 0);
+        assert_eq!(r.spec_len, 0);
+        assert_eq!(r.decode_cost(), 1);
+        assert_eq!(Request::new(vec![], 1).with_spec_len(4).decode_cost(), 5);
         assert_eq!(SchedulerConfig::default().max_batch_tokens, 8192);
+    }
+
+    #[test]
+    fn spec_requests_bill_depth_against_the_budget() {
+        // Budget 5, chunk 4. Request a speculates (draft 3 => 4 rows per
+        // decode step); c prefills behind it. Trace:
+        //   #1: both waiting — a prefills 1 token, c 4 (no decode cost
+        //       charged while Waiting); budget left 0.
+        //   #2: a decodes (4 rows) leaving budget 1, so c's last two
+        //       prompt tokens are squeezed to ONE — a plain a (1 row)
+        //       would have left budget 4 and admitted both.
+        let mut s = Scheduler::new(SchedulerConfig {
+            max_running_requests: 8,
+            max_batch_tokens: 5,
+            chunked_prefill_size: 4,
+            batch_invariant: false,
+        });
+        let a = s.add_request(Request::new(vec![1], 5).with_spec_len(3));
+        let c = s.add_request(Request::new(vec![7, 7, 7, 7, 7, 7], 5));
+        let p = s.schedule();
+        let BatchPlan::Step { prefill_reqs, .. } = p else {
+            panic!()
+        };
+        assert_eq!(prefill_reqs, vec![(a, 0, 1), (c, 0, 4)]);
+        s.commit_prefill(a, 0, 1);
+        s.commit_prefill(c, 0, 4);
+        // a is Decoding now: its next decode charges spec_len + 1 = 4.
+        let p = s.schedule();
+        let BatchPlan::Step {
+            decode_reqs,
+            prefill_reqs,
+        } = p
+        else {
+            panic!()
+        };
+        assert_eq!(decode_reqs, vec![a]);
+        assert_eq!(
+            prefill_reqs,
+            vec![(c, 4, 1)],
+            "spec depth must squeeze the prefill budget"
+        );
+        s.commit_prefill(c, 4, 1);
+        // c's last prompt token: budget is 1 again (4 spec rows + this
+        // chunk), so it fits exactly.
+        let p = s.schedule();
+        let BatchPlan::Step { prefill_reqs, .. } = p else {
+            panic!()
+        };
+        assert_eq!(prefill_reqs, vec![(c, 5, 1)]);
+        s.commit_prefill(c, 5, 1);
+        // Both decoding: 4 + 1 = 5 rows exactly meets the budget.
+        let p = s.schedule();
+        let BatchPlan::Step {
+            decode_reqs,
+            prefill_reqs,
+        } = p
+        else {
+            panic!()
+        };
+        assert_eq!(decode_reqs, vec![a, c]);
+        assert!(prefill_reqs.is_empty());
+        // A multi-token spec step folds cleanly: a accepts 3 drafts +
+        // bonus in one report.
+        s.report_tokens(&[(a, 5), (a, 6), (a, 7), (a, 8)], 0);
+        assert!(matches!(s.phase(a), Some(Phase::Decoding { generated: 4 })));
+        // Plain counterfactual: with spec_len 0 the second schedule
+        // leaves budget 4 and c's remaining 2 tokens both fit.
+        let mut s2 = Scheduler::new(SchedulerConfig {
+            max_running_requests: 8,
+            max_batch_tokens: 5,
+            chunked_prefill_size: 4,
+            batch_invariant: false,
+        });
+        let a2 = s2.add_request(Request::new(vec![1], 5));
+        let c2 = s2.add_request(Request::new(vec![7, 7, 7, 7, 7, 7], 5));
+        let _ = a2;
+        let p = s2.schedule();
+        let BatchPlan::Step { prefill_reqs, .. } = p else {
+            panic!()
+        };
+        for &(id, cs, cl) in &prefill_reqs {
+            s2.commit_prefill(id, cs, cl);
+        }
+        let p = s2.schedule();
+        let BatchPlan::Step { prefill_reqs, .. } = p else {
+            panic!()
+        };
+        assert_eq!(
+            prefill_reqs,
+            vec![(c2, 4, 2)],
+            "plain decode leaves room for both"
+        );
+        s2.commit_prefill(c2, 4, 2);
+    }
+
+    #[test]
+    fn skip_prefill_starts_admission_at_the_reuse_offset() {
+        let mut s = Scheduler::new(SchedulerConfig {
+            max_running_requests: 8,
+            max_batch_tokens: 64,
+            chunked_prefill_size: 4,
+            batch_invariant: false,
+        });
+        let prompt: Vec<u32> = (0..10).collect();
+        let id = s.add_request(Request::new(prompt, 5));
+        // Cache hit on the first 7 tokens: admission must start at 7.
+        assert!(s.skip_prefill(id, 7));
+        let p = s.schedule();
+        let BatchPlan::Step { prefill_reqs, .. } = p else {
+            panic!()
+        };
+        assert_eq!(prefill_reqs, vec![(id, 7, 3)], "only the suffix prefills");
+        s.commit_prefill(id, 7, 3);
+        assert!(matches!(s.phase(id), Some(Phase::Decoding { .. })));
+
+        // Validation: full-length reuse is refused (a final forward is
+        // mandatory), and non-waiting requests cannot be touched.
+        let id2 = s.add_request(Request::new((0..6).collect(), 5));
+        assert!(!s.skip_prefill(id2, 6));
+        assert!(!s.skip_prefill(id2, 100));
+        assert!(!s.skip_prefill(999, 1));
+        s.commit_prefill(id2, 0, 4); // admit partially
+        assert!(!s.skip_prefill(id2, 2), "already admitted: no reuse");
     }
 }

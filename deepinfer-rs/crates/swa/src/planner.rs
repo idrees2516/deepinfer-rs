@@ -199,10 +199,7 @@ mod tests {
         assert_eq!(d.yoco_prefill_keep_tokens, 140);
         assert_eq!(d.yoco_prefill_truncation_mode, YocoTruncationMode::Full);
         let c = SwaConfig::from_env(&d, 128, 12);
-        assert_eq!(
-            c,
-            cfg(128, 12, 140, YocoTruncationMode::Full)
-        );
+        assert_eq!(c, cfg(128, 12, 140, YocoTruncationMode::Full));
 
         let rep = Env::from_lookup(|k| {
             if k == "DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE" {
@@ -214,21 +211,26 @@ mod tests {
             }
         });
         let c2 = SwaConfig::from_env(&rep.env, 128, 12);
-        assert_eq!(
-            c2,
-            cfg(128, 12, 200, YocoTruncationMode::Compact)
-        );
+        assert_eq!(c2, cfg(128, 12, 200, YocoTruncationMode::Compact));
     }
 
     #[test]
     fn validate_accepts_and_rejects() {
         // Full mode: only the two lower bounds.
         assert!(cfg(128, 12, 1, YocoTruncationMode::Full).validate().is_ok());
-        assert!(cfg(10_000, 500, 3, YocoTruncationMode::Full).validate().is_ok());
+        assert!(cfg(10_000, 500, 3, YocoTruncationMode::Full)
+            .validate()
+            .is_ok());
         // Compact mode: keep >= window + backtrack (boundary inclusive).
-        assert!(cfg(128, 12, 140, YocoTruncationMode::Compact).validate().is_ok());
-        assert!(cfg(128, 12, 139, YocoTruncationMode::Compact).validate().is_err());
-        assert!(cfg(200, 10, 140, YocoTruncationMode::Compact).validate().is_err());
+        assert!(cfg(128, 12, 140, YocoTruncationMode::Compact)
+            .validate()
+            .is_ok());
+        assert!(cfg(128, 12, 139, YocoTruncationMode::Compact)
+            .validate()
+            .is_err());
+        assert!(cfg(200, 10, 140, YocoTruncationMode::Compact)
+            .validate()
+            .is_err());
         // Lower bounds.
         assert!(cfg(0, 0, 10, YocoTruncationMode::Full).validate().is_err());
         assert!(cfg(128, 0, 0, YocoTruncationMode::Full).validate().is_err());
@@ -242,7 +244,10 @@ mod tests {
     fn planner_modes() {
         let full = BoundedReplayPlanner::new(cfg(128, 12, 140, YocoTruncationMode::Full)).unwrap();
         let p = full.plan_prefill(1000);
-        assert_eq!((p.full_len, p.replay_start, p.replay_len()), (1000, 0, 1000));
+        assert_eq!(
+            (p.full_len, p.replay_start, p.replay_len()),
+            (1000, 0, 1000)
+        );
 
         let compact =
             BoundedReplayPlanner::new(cfg(128, 12, 140, YocoTruncationMode::Compact)).unwrap();

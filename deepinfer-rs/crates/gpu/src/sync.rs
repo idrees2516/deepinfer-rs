@@ -60,9 +60,7 @@ impl Device {
         self.make_current()?;
         match (self.gpu().cuda(), self.gpu().hip()) {
             (Some(c), _) => {
-                let f = c
-                    .event_create
-                    .ok_or_else(crate::device::no_events_error)?;
+                let f = c.event_create.ok_or_else(crate::device::no_events_error)?;
                 let mut h: cuda::Handle = std::ptr::null_mut();
                 // SAFETY: out-pointer valid; flags = CU_EVENT_DEFAULT.
                 let r = unsafe { (f)(&mut h, cuda::CU_EVENT_DEFAULT) };
@@ -73,9 +71,7 @@ impl Device {
                 })
             }
             (_, Some(h)) => {
-                let f = h
-                    .event_create
-                    .ok_or_else(crate::device::no_events_error)?;
+                let f = h.event_create.ok_or_else(crate::device::no_events_error)?;
                 let mut ev: hip::Handle = std::ptr::null_mut();
                 // SAFETY: out-pointer valid.
                 let r = unsafe { (f)(&mut ev) };
@@ -100,17 +96,13 @@ impl Event {
         self.dev.make_current()?;
         match (self.dev.gpu().cuda(), self.dev.gpu().hip()) {
             (Some(c), _) => {
-                let f = c
-                    .event_record
-                    .ok_or_else(crate::device::no_events_error)?;
+                let f = c.event_record.ok_or_else(crate::device::no_events_error)?;
                 // SAFETY: event and stream handles valid in the current context.
                 let r = unsafe { (f)(self.handle, stream.raw()) };
                 ensure!(r == 0, Internal, "cuEventRecord: {}", c.error_string(r));
             }
             (_, Some(h)) => {
-                let f = h
-                    .event_record
-                    .ok_or_else(crate::device::no_events_error)?;
+                let f = h.event_record.ok_or_else(crate::device::no_events_error)?;
                 // SAFETY: see above.
                 let r = unsafe { (f)(self.handle, stream.raw()) };
                 ensure!(r == 0, Internal, "hipEventRecord: {}", h.error_string(r));
@@ -133,7 +125,12 @@ impl Event {
                     .ok_or_else(crate::device::no_events_error)?;
                 // SAFETY: event handle valid.
                 let r = unsafe { (f)(self.handle) };
-                ensure!(r == 0, Internal, "cuEventSynchronize: {}", c.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "cuEventSynchronize: {}",
+                    c.error_string(r)
+                );
             }
             (_, Some(h)) => {
                 let f = h
@@ -141,7 +138,12 @@ impl Event {
                     .ok_or_else(crate::device::no_events_error)?;
                 // SAFETY: see above.
                 let r = unsafe { (f)(self.handle) };
-                ensure!(r == 0, Internal, "hipEventSynchronize: {}", h.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "hipEventSynchronize: {}",
+                    h.error_string(r)
+                );
             }
             _ => unreachable!("one backend is always loaded"),
         }
@@ -194,7 +196,12 @@ impl Stream {
                     .ok_or_else(crate::device::no_events_error)?;
                 // SAFETY: see above.
                 let r = unsafe { (f)(self.raw(), event.handle, 0) };
-                ensure!(r == 0, Internal, "hipStreamWaitEvent: {}", h.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "hipStreamWaitEvent: {}",
+                    h.error_string(r)
+                );
             }
             _ => unreachable!("one backend is always loaded"),
         }
@@ -290,9 +297,7 @@ impl CaptureGuard<'_> {
 
     fn finish(&mut self) -> Result<GraphExec> {
         if !self.active {
-            return Err(deepinfer_core::Error::internal(
-                "capture already finished",
-            ));
+            return Err(deepinfer_core::Error::internal("capture already finished"));
         }
         self.active = false;
         self.dev.make_current()?;
@@ -304,7 +309,12 @@ impl CaptureGuard<'_> {
                     .ok_or_else(crate::device::no_graphs_error)?;
                 // SAFETY: stream handle valid; out-pointer valid.
                 let r = unsafe { (end)(self.stream.raw(), &mut graph) };
-                ensure!(r == 0, Internal, "cuStreamEndCapture: {}", c.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "cuStreamEndCapture: {}",
+                    c.error_string(r)
+                );
                 let inst = c
                     .graph_instantiate
                     .ok_or_else(crate::device::no_graphs_error)?;
@@ -333,7 +343,12 @@ impl CaptureGuard<'_> {
                     .ok_or_else(crate::device::no_graphs_error)?;
                 // SAFETY: see above.
                 let r = unsafe { (end)(self.stream.raw(), &mut graph) };
-                ensure!(r == 0, Internal, "hipStreamEndCapture: {}", h.error_string(r));
+                ensure!(
+                    r == 0,
+                    Internal,
+                    "hipStreamEndCapture: {}",
+                    h.error_string(r)
+                );
                 let inst = h
                     .graph_instantiate
                     .ok_or_else(crate::device::no_graphs_error)?;
@@ -425,17 +440,13 @@ impl GraphExec {
         self.dev.make_current()?;
         match (self.dev.gpu().cuda(), self.dev.gpu().hip()) {
             (Some(c), _) => {
-                let f = c
-                    .graph_launch
-                    .ok_or_else(crate::device::no_graphs_error)?;
+                let f = c.graph_launch.ok_or_else(crate::device::no_graphs_error)?;
                 // SAFETY: exec and stream handles valid in the current context.
                 let r = unsafe { (f)(self.handle, stream.raw()) };
                 ensure!(r == 0, Internal, "cuGraphLaunch: {}", c.error_string(r));
             }
             (_, Some(h)) => {
-                let f = h
-                    .graph_launch
-                    .ok_or_else(crate::device::no_graphs_error)?;
+                let f = h.graph_launch.ok_or_else(crate::device::no_graphs_error)?;
                 // SAFETY: see above.
                 let r = unsafe { (f)(self.handle, stream.raw()) };
                 ensure!(r == 0, Internal, "hipGraphLaunch: {}", h.error_string(r));

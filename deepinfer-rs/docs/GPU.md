@@ -315,14 +315,24 @@ backpressure.
   position-keyed). Detach returns pages to the free list.
 * The single-sequence engine (arenas + CUDA-graph decode capture) is
   untouched and shares weights, the JIT library, and the eager kernels
-  with the serve engine; MTP drafting stays on the single-sequence path
-  (documented; the serve batch loop re-enters through prefill for
-  verification).
+  with the serve engine.
+* **DSpark speculative serving** (host-drafted, device-verified): the
+  serve engine exposes `serve_verify` (one chunked multi-row forward
+  per draft chain — the same `di_serve_*` family with `sq = chain`),
+  `serve_decode_out` / `serve_prefill_out` (logits **plus** the
+  residual hidden anchor readback that feeds the host-side MTP draft
+  step — `DeviceModel::draft_step` reads one embedding row back per
+  draft, the only D2H traffic), and `serve_rollback`. The server's
+  engine thread drafts on the host, verifies on the device, rolls
+  rejected tails back (logical-length truncation, O(1)) and batches
+  every round's bonus decode into one `serve_decode` launch per step.
 
 Golden: `serve_engine_multi_sequence` (auto-skipped without a GPU)
 compares two interleaved sequences against the single-sequence device
 path — itself CPU-validated — through prefill, four interleaved decode
-steps, an exact rollback, and a detach/re-attach cycle.
+steps, an exact rollback, and a detach/re-attach cycle;
+`serve_spec_decode_surface` exercises the spec path (draft → chunked
+verify vs sequential decodes → rollback exactness).
 
 ## On-hardware golden runs (the acceptance battery)
 
@@ -347,66 +357,21 @@ against a recorded artifact (same machine/driver) and fails on any
 regression. Without a GPU the harness prints the capability report and
 exits cleanly — the auto-skip contract of the test suite.
 
-## Running on hardware
+## Serving on hardware
 
-## Paged device cache and multi-sequence serving (implemented)
-
-`DeviceModel` grows a second cache engine alongside the flat arenas:
-
-* `serve_configure(max_seqs, max_len, pages_per_layer)` allocates, per
-  self-decoder layer, five paged pools (kv / k_raw / k_norm / k_u8 /
-  feat) of `pages_per_layer` x 64 rows plus the batch-sized serve
-  workspace (activations for `max_seqs` decode rows, score matrices for
-  the prefill chunk, split-KV partials, masked-MoE staging).
-* Page ids are global: one shared free list, one physical id addressing
-  the same logical page in every layer's pools (identical geometry).
-* One batched decode step = **one launch per operator per layer** across
-  all sequences: the `di_serve_*` kernels take `grid.z = slots` (or fold
-  the slot into `blockIdx`), read the per-slot geometry from a device
-  cell block that `di_serve_fanout_kernel` expands from a single small
-  host upload (`{active, pos, len, sq, sqnb}` per slot), and translate
-  every row through `tbl[r / 64] * 64 + r % 64`. No varying scalar is a
-  kernel argument — the same graph-safety rule as the decode family.
-* Prefill runs through the same kernels with one slot and `sq = chunk`
-  (512-token chunks, aligned-contiguous MoE); decode runs with
-  `sq = 1` per slot and the masked-capacity MoE (`cap = batch`), both
-  graph-safe.
-* Rollback truncates the logical length; page tables keep their entries
-  and re-appended rows overwrite their slots (the arena semantics,
-  position-keyed). Detach returns pages to the free list.
-* The single-sequence engine (arenas + CUDA-graph decode capture) is
-  untouched and shares weights, the JIT library, and the eager kernels
-  with the serve engine; MTP drafting stays on the single-sequence path
-  (documented; the serve batch loop re-enters through prefill for
-  verification).
-
-Golden: `serve_engine_multi_sequence` (auto-skipped without a GPU)
-compares two interleaved sequences against the single-sequence device
-path — itself CPU-validated — through prefill, four interleaved decode
-steps, an exact rollback, and a detach/re-attach cycle.
-
-## On-hardware golden runs (the acceptance battery)
-
-`crates/runtime/examples/golden_run.rs` is the machine-facing acceptance
-harness:
-
-```bash
-cargo run --release -p deepinfer-runtime --example golden_run -- --list
-cargo run --release -p deepinfer-runtime --example golden_run -- --record golden-<site>.json
-cargo run --release -p deepinfer-runtime --example golden_run -- --verify golden-<site>.json
-```
-
-`--record` writes a JSON artifact with the capability report (backend,
-device, arch, SM count, memory, NVRTC version, tcgen05-family and graph
-flags) plus one entry per check: the F32 model vs the CPU golden, the FP8
-Auto smoke, CUDA-graph replay determinism and rollback exactness (SHA
-hashes of the logits), the tcgen05-vs-portable GEMM agreement (Blackwell
-only), the paged serve engine vs the single-sequence path, the
-symmetric-buffer EP protocol (world 1, and multi-rank when >= 2 devices
-are visible), and decode/prefill timings. `--verify` re-runs the battery
-against a recorded artifact (same machine/driver) and fails on any
-regression. Without a GPU the harness prints the capability report and
-exits cleanly — the auto-skip contract of the test suite.
+The `deepinfer-server` binary (`crates/server`) exposes the model over
+an OpenAI-compatible HTTP API (SSE streaming, continuous batching,
+grammar-constrained decoding, **DSpark speculative decoding**,
+Prometheus metrics — zero external
+dependencies). `--gpu` selects the paged serve engine through
+`GpuTokenEngine`: `prepare` sizes the page pools from the scheduler's
+batch width (`DEEPINFER_SERVE_PAGES` overrides), `attach`/`detach` map
+onto `serve_attach`/`serve_detach`, one batched decode step drives the
+`serve_decode_out` batch flush (plain decodes and spec bonus tokens
+share a single launch), and speculative rounds run
+`serve_verify` + `serve_rollback` per request with host-side MTP
+drafting (`DEEPINFER_SERVER_SPEC_DRAFT_LEN`, default 5). See
+`docs/UZU-COMPARISON.md` and the `deepinfer-server` crate docs.
 
 ## Running on hardware
 
@@ -418,3 +383,65 @@ DEEPINFER_JIT_DEBUG=1 cargo test ...            # trace JIT compiles
 Requirements: NVIDIA driver >= 550 (R580+ for B300) with `libnvrtc`
 (CUDA 12.4+; 12.9+ for `sm_103` cubins), or ROCm 6/7 with `libamdhip64` +
 `libhiprtc`. Nothing needs to be installed to *build*.
+
+## GPU prefix caching (implemented)
+
+The paged serve engine grows a **block-granular radix tree over the
+shared page pools** — the vLLM automatic-prefix-caching / SGLang
+RadixAttention analogue for this engine (`runtime/src/prefix_cache.rs`
++ the serve.rs integration):
+
+* **Reference-counted page sharing.** Every page carries a lease count
+  (`PagedState::refs`); a page is in the free list iff its count is 0.
+  Lease holders are attached sequences *and* radix-tree nodes, so a
+  page referenced by a live sequence and the tree is freed only when
+  both release it — the exact upgrade the shared-free-list layout was
+  designed for. `serve_detach` drops leases instead of blindly freeing.
+* **One tree node per 64-token block**, keyed by a chained FNV-1a hash
+  of the token blocks (the vLLM hash-chain scheme) and verified against
+  the exact block tokens on every walk (hash collisions cannot alias
+  two prompts silently). A node holds its block's leased page, the
+  `k_sf` lightning-scale bytes that *complete* inside its block (a byte
+  belongs to the block where its `quant_block`-row window closes, so
+  concatenating a path's segments reproduces the scale prefix exactly),
+  and a device snapshot of the SWA rings at the block's end — the only
+  state the pools do not hold.
+* **Restore** (inside `serve_prefill`/`serve_prefill_out` on a fresh
+  sequence): match the deepest ring-bearing path, adopt its pages into
+  the new sequence's page table (leases bumped, one table upload),
+  write the scale prefix, and device-to-device copy the ring snapshot —
+  pointer writes and D2D copies replacing a compute-bound prefill. The
+  restored state is bit-identical to a cold prefill at the same
+  boundary (the golden test asserts the logits agree).
+* **Insert** happens after every committed prefill chunk and decode
+  step — never after speculative-verify chunks (their rows are
+  reversible). Blocks another sequence already cached are skipped.
+  Ring-allocation failure degrades the node to a walk-through (not a
+  match endpoint) instead of failing the step.
+* **Copy-on-write.** Tree-leased pages are frozen: a rollback that
+  re-enters the frozen region (spec rejection rewinding deep, or the
+  scheduler's prefill rewind) triggers full-page D2D copies into fresh
+  private pages before any rewrite, so snapshots never see overwritten
+  content. Identical rewrites (the rewind re-prefilling the same
+  prompt) are detected against the cached tokens and skip the copy.
+* **Eviction.** LRU over leaves, bounded by a token budget converted to
+  page-units (`serve_prefix_configure`; the cost counts the ring
+  snapshots honestly at `ring_bytes / page_bytes`). The allocation path
+  runs a pressure valve: when the free list runs dry, tree leaves are
+  evicted before a grant fails — live sequences always outrank cached
+  prefixes.
+* **Surface.** `serve_prefix_configure` / `serve_prefix_stats` /
+  `serve_prefix_reset`; the server wires its `prefix_cache_tokens`
+  budget through `GpuTokenEngine::with_prefix_tokens` and exports the
+  counters as the existing `deepinfer_prefix_cache_*` metrics (plus
+  `..._evictions_total`). The CPU golden engine keeps its
+  snapshot-based index (`server/src/prefix.rs`) — the two never mix.
+
+Golden: `serve_prefix_cache_reuse` and `serve_prefix_cache_pressure_valve`
+(auto-skipped without a GPU) cover the cold/warm/CoW/reset cycle and
+the pressure valve; the `golden_run --record/--verify` battery gained a
+`serve_prefix_cache` check.
+
+Known follow-up (tracked): the SWA rings are snapshotted per node
+rather than paged into the pools — a hybrid vLLM-style paged ring would
+remove the per-node ring cost and make the budget purely page-based.

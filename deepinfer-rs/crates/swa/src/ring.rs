@@ -250,8 +250,7 @@ mod tests {
             let mut next_pos = 0usize;
             for step in 0..80 {
                 if rng.next_f32() < 0.6 {
-                    let row: Vec<f32> =
-                        (0..dim).map(|k| (next_pos * 16 + k) as f32).collect();
+                    let row: Vec<f32> = (0..dim).map(|k| (next_pos * 16 + k) as f32).collect();
                     cache.push(&row)?;
                     model.push_back((next_pos, row));
                     next_pos += 1;

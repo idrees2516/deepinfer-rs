@@ -491,8 +491,7 @@ fn parse_item(lex: &mut Lexer<'_>, max_count: u32, depth: usize, max_depth: usiz
             other => {
                 return Err(Error::Grammar(format!(
                     "unexpected quantifier '{}' at offset {}",
-                    other as char,
-                    lex.pos
+                    other as char, lex.pos
                 )))
             }
         };
@@ -579,7 +578,9 @@ pub(crate) fn parse_ebnf(text: &str, limits: &GrammarLimits) -> Result<EbnfGramm
         );
         lex.skip_trivia()?;
         ensure!(
-            lex.peek() == Some(b':') && lex.peek_at(1) == Some(b':') && lex.peek_at(2) == Some(b'='),
+            lex.peek() == Some(b':')
+                && lex.peek_at(1) == Some(b':')
+                && lex.peek_at(2) == Some(b'='),
             Grammar,
             "expected '::=' after rule name '{name}' at offset {}",
             lex.pos
@@ -838,17 +839,19 @@ mod tests {
         compile_ebnf_nfa(text, &GrammarLimits::default()).unwrap()
     }
 
-    
-#[test]
-fn diag_plus_repro() {
-    let nfa = compile(r#"root ::= "c"+;"#);
-    eprintln!("start={} nodes={}", nfa.start, nfa.nodes.len());
-    for (i, n) in nfa.nodes.iter().enumerate() {
-        eprintln!("node {i}: accept={} eps={:?} edges={:?}", n.accept, n.eps, n.edges);
+    #[test]
+    fn diag_plus_repro() {
+        let nfa = compile(r#"root ::= "c"+;"#);
+        eprintln!("start={} nodes={}", nfa.start, nfa.nodes.len());
+        for (i, n) in nfa.nodes.iter().enumerate() {
+            eprintln!(
+                "node {i}: accept={} eps={:?} edges={:?}",
+                n.accept, n.eps, n.edges
+            );
+        }
+        assert!(!accepted(&nfa, b""));
+        assert!(accepted(&nfa, b"c"));
     }
-    assert!(!accepted(&nfa, b""));
-    assert!(accepted(&nfa, b"c"));
-}
 
     #[test]
     fn simple_alternation_and_plus() {
@@ -883,7 +886,10 @@ fn diag_plus_repro() {
         };
         let nfa = compile_ebnf_nfa(text, &lim).unwrap();
         assert!(accepted(&nfa, br#"{}"#));
-        assert!(accepted(&nfa, br#"{"a": [1, true, null], "b": {"c": "d"}}"#));
+        assert!(accepted(
+            &nfa,
+            br#"{"a": [1, true, null], "b": {"c": "d"}}"#
+        ));
         assert!(accepted(&nfa, br#"{"n": -12.5}"#));
         assert!(!accepted(&nfa, br#"{"a" 1}"#));
         assert!(!accepted(&nfa, br#"{"a": }"#));
@@ -920,11 +926,7 @@ fn diag_plus_repro() {
     fn non_terminating_recursion_errors() {
         assert!(compile_ebnf_nfa(r#"root ::= root;"#, &GrammarLimits::default()).is_err());
         assert!(compile_ebnf_nfa(r#"root ::= "x" root;"#, &GrammarLimits::default()).is_err());
-        assert!(compile_ebnf_nfa(
-            r#"a ::= b; b ::= a;"#,
-            &GrammarLimits::default()
-        )
-        .is_err());
+        assert!(compile_ebnf_nfa(r#"a ::= b; b ::= a;"#, &GrammarLimits::default()).is_err());
     }
 
     #[test]
@@ -933,11 +935,7 @@ fn diag_plus_repro() {
         assert!(accepted(&nfa, b"a\nb\t\"c\"A"));
         assert!(!accepted(&nfa, b"a\nb\t\"c\"a"));
         // Unsupported escapes are a hard error (sound rejection).
-        assert!(compile_ebnf_nfa(
-            r#"root ::= '\x';"#,
-            &GrammarLimits::default()
-        )
-        .is_err());
+        assert!(compile_ebnf_nfa(r#"root ::= '\x';"#, &GrammarLimits::default()).is_err());
     }
 
     #[test]
@@ -1012,19 +1010,31 @@ fn diag_plus_repro() {
     #[test]
     fn parse_errors_carry_positions() {
         let cases = [
-            (r#"root ::= "a" "#.to_string() + r#"; other ::= ;"#, "expected an expression"),
+            (
+                r#"root ::= "a" "#.to_string() + r#"; other ::= ;"#,
+                "expected an expression",
+            ),
             (r#"root ::= unknown;"#.to_string(), "unknown rule"),
             (r#"root ::= "a"#.to_string(), "unterminated literal"),
             (r#"root ::= "a\q";"#.to_string(), "unsupported escape"),
             (r#"root ::= ( "a" ;"#.to_string(), "expected ')'"),
             (r#"root ::= "a"{4,2};"#.to_string(), "m > n"),
-            (r#"root ::= "a"; root ::= "b";"#.to_string(), "duplicate rule"),
+            (
+                r#"root ::= "a"; root ::= "b";"#.to_string(),
+                "duplicate rule",
+            ),
             (r#"root ::= "a"**;"#.to_string(), "second quantifier"),
             (r#"root ::= [a"#.to_string(), "unterminated character class"),
             (r#"root ::= [z-a];"#.to_string(), "invalid class range"),
             (r#"root ::= 5;"#.to_string(), "unexpected byte"),
-            (r#"root ::= "a" (* unterminated"#.to_string(), "unterminated comment"),
-            (r#"root ::= [ab"#.to_string(), "unterminated character class"),
+            (
+                r#"root ::= "a" (* unterminated"#.to_string(),
+                "unterminated comment",
+            ),
+            (
+                r#"root ::= [ab"#.to_string(),
+                "unterminated character class",
+            ),
         ];
         for (text, needle) in cases {
             let err = compile_ebnf_nfa(text.as_str(), &GrammarLimits::default());

@@ -957,3 +957,78 @@ See docs/GPU.md for the full contract, precision policy and upgrade paths.
   acceptance battery with JSON artifacts.
 * **AMD MFMA FP8** (opt-in, `DEEPINFER_AMD_MFMA=1`):
   `Kernels::gemm_fp8_nt_mfma` on gfx940-class Instincts.
+
+
+## deepinfer-server  (deps: core, runtime, scheduler, sampler, grammar)
+
+The production serving layer — an **OpenAI-compatible HTTP API** over the
+continuous-batching scheduler, with zero external dependencies (the
+HTTP/1.1 + SSE stack is hand-rolled on `std::net`; JSON is the workspace
+parser). `#![forbid(unsafe_code)]` like every other host crate.
+
+```text
+deepinfer-server (accept loop, connection workers)
+├── http.rs     HTTP/1.1: bounded parser, keep-alive, chunked/SSE writer
+├── api.rs      routes: /health /v1/models /v1/chat/completions
+│               /v1/completions /metrics /admin/shutdown
+├── engine.rs   ServingLoop: coordinator thread (scheduler + event
+│               fan-out) + engine thread (TokenEngine: model +
+│               per-request sampling/grammar/spec rounds); optimistic
+│               prefill commits; one-plan-in-flight gate; slot
+│               recycling; prefix-cache restore/insert; the prefill
+│               rewind guard; adaptive spec depth; vocab-cap masking
+├── prefix.rs   PromptCache: LRU-bounded radix tree over token ids →
+│               Arc<PrefixState> snapshots (RadixAttention/APC)
+├── spec.rs     DSpark rounds under batching: grammar-masked drafting,
+│               verification-row masking, DFA state snapshots
+├── chat.rs     DeepSeek chat template + streaming UTF-8 delta decoder
+├── config.rs   JSON config file + DEEPINFER_SERVER_* env overrides
+└── metrics.rs  Prometheus counters + TTFT/latency histograms +
+               deepinfer_spec_* and deepinfer_prefix_cache_* series
+```
+
+Contracts:
+
+* **Bit-fidelity to `generate()`**: the served greedy stream must equal
+  the offline `generate()` on the same tokenized prompt (CI test).
+* **One plan in flight**: the coordinator never schedules step N+1
+  before folding step N's results (optimistic prefill commits follow
+  the AsyncEngine pattern); regression-tested.
+* **Per-request error isolation**: capacity/range failures fail their
+  request only; other model errors degrade the engine (503 health).
+* **Cancellation**: subscriber drop, stop-string match, or deadline →
+  abort → slot teardown (`DeepSeekModel::free_seq` rebuilds the paged
+  caches from the surviving sequences' shadows).
+* **TokenEngine** unifies the CPU golden path (`CpuTokenEngine` over
+  `DeepSeekModel`) and the GPU paged-serve path (`GpuTokenEngine` over
+  `DeviceModel::serve_*`).
+
+Resolved (formerly a known gap): DSpark speculative decoding now runs
+on the batched serve path — per-request draft → verify → rollback →
+emit rounds each step, with per-sequence cache rollback on rejection,
+grammar-aware speculation, and adaptive draft depth (vLLM-DSD-style
+acceptance EMA). Greedy parity is CI-pinned: spec serve == plain
+serve == `generate()`, with grammars and under batching.
+
+Additional serving contracts (2026 serving-efficiency upgrade):
+
+* **Prefix cache bit-identity**: `DeepSeekModel::restore_prefix` +
+  suffix prefill equals a cold prefill of the same prefix + the same
+  suffix prefill, bit-for-bit (the CPU multi-token kernel is not
+  chunk-invariant — the DSA indexer's chunk-relative quantization —
+  so cached vs cold runs at *different* chunk boundaries are
+  token-equivalent, not bit-identical; documented).
+* **Prefill rewind guard**: a scheduler-evicted prefill restarting at
+  a lower offset rolls the surplus engine rows back before
+  re-prefilling (no double-append; the engine's `prefilled` view is
+  the source of truth).
+* **Byte-mode serving**: `--tokenizer byte` caps the sampling surface
+  to the tokenizer's alphabet (plain sampling, spec drafting and
+  verification rows all masked); the vocabulary byte table is padded
+  with empty bytes above the tokenizer's vocabulary.
+* **Exact token bytes**: `Tokenizer::decode_token_bytes` returns the
+  true bytes of a single token (a lone `0xFF` byte token masks as
+  `0xFF`, never U+FFFD) — the grammar masks are byte-exact.
+* **Token-budget admission**: prompts longer than
+  `DEEPINFER_SERVER_MAX_PROMPT_TOKENS` fail with a descriptive 400
+  before scheduler admission.

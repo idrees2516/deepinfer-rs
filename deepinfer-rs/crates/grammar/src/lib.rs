@@ -128,7 +128,10 @@ impl Grammar {
     fn from_nfa(nfa: nfa::Nfa, limits: &GrammarLimits) -> Result<Grammar> {
         let dfa = dfa::determinize(&nfa, limits.max_dfa_states)?;
         let dfa = dfa::prune_live(dfa);
-        Ok(Grammar { dfa, limits: *limits })
+        Ok(Grammar {
+            dfa,
+            limits: *limits,
+        })
     }
 
     /// The initial state.
@@ -157,8 +160,6 @@ impl Grammar {
         self.dfa.len()
     }
 
-
-
     /// Whether the full byte string `bytes` is accepted (test/diagnostic
     /// helper).
     pub fn accepts(&self, bytes: &[u8]) -> bool {
@@ -171,11 +172,7 @@ impl Grammar {
         }
         self.is_accepting(s)
     }
-
-
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -231,10 +228,7 @@ mod tests {
 
     #[test]
     fn ebnf_compile_and_accepts() {
-        let g = Grammar::compile_ebnf(
-            "root ::= \"(\" root \")\" | \"x\" ;",
-        )
-        .unwrap();
+        let g = Grammar::compile_ebnf("root ::= \"(\" root \")\" | \"x\" ;").unwrap();
         assert!(g.accepts(b"x"));
         assert!(g.accepts(b"(((x)))"));
         assert!(!g.accepts(b"((x)"));

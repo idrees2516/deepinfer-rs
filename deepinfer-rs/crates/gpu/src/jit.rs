@@ -19,8 +19,8 @@ use std::path::PathBuf;
 use deepinfer_core::{ensure, Error, Result};
 
 use crate::device::{Backend, Device, GpuArch, Module};
-use crate::ffi::nvrtc::Nvrtc;
 use crate::ffi::hiprtc::HipRtc;
+use crate::ffi::nvrtc::Nvrtc;
 use crate::hash::hex_digest;
 
 /// A compiled, ready-to-load kernel image.
@@ -97,7 +97,15 @@ pub fn compile_and_load_with_arch(
     extra_options: &[String],
 ) -> Result<Module> {
     let arch_tag = arch_flag.trim_start_matches("--gpu-architecture=");
-    let image = compile_with_arch(device, source, kernel_name, arch_tag, arch_flag, ptx_flag, extra_options)?;
+    let image = compile_with_arch(
+        device,
+        source,
+        kernel_name,
+        arch_tag,
+        arch_flag,
+        ptx_flag,
+        extra_options,
+    )?;
     device.load_module(image.bytes())
 }
 
@@ -186,7 +194,12 @@ fn compile_cuda_with_arch(
             std::ptr::null(),
         )
     };
-    ensure!(r == 0, Internal, "nvrtcCreateProgram: {}", rtc.error_string(r));
+    ensure!(
+        r == 0,
+        Internal,
+        "nvrtcCreateProgram: {}",
+        rtc.error_string(r)
+    );
 
     let run_compile = |flag: &str| -> Result<(u32, String)> {
         let mut flags: Vec<String> = vec![
@@ -319,7 +332,12 @@ fn compile_cuda(
             std::ptr::null(),
         )
     };
-    ensure!(r == 0, Internal, "nvrtcCreateProgram: {}", rtc.error_string(r));
+    ensure!(
+        r == 0,
+        Internal,
+        "nvrtcCreateProgram: {}",
+        rtc.error_string(r)
+    );
 
     let run_compile = |flags: &[String]| -> Result<(u32, String)> {
         let cflags: Vec<CString> = flags.iter().map(|f| cstring(f)).collect::<Result<_>>()?;
@@ -358,7 +376,9 @@ fn compile_cuda(
         debug_log(&format!("{kernel_name} nvrtc log: {log}"));
     }
 
-    let want_ptx = flags.iter().any(|f| f.starts_with("--gpu-architecture=compute_"));
+    let want_ptx = flags
+        .iter()
+        .any(|f| f.starts_with("--gpu-architecture=compute_"));
     let bytes = if want_ptx {
         get_blob_nvrtc(rtc, prog, kernel_name, true)?
     } else {
@@ -378,7 +398,12 @@ fn get_blob_nvrtc(rtc: &Nvrtc, prog: *mut c_void, kernel_name: &str, ptx: bool) 
     } else {
         unsafe { (rtc.get_cubin_size)(prog, &mut size) }
     };
-    ensure!(r == 0, Internal, "nvrtcGet*CUBINSize: {}", rtc.error_string(r));
+    ensure!(
+        r == 0,
+        Internal,
+        "nvrtcGet*CUBINSize: {}",
+        rtc.error_string(r)
+    );
     let mut buf = vec![0u8; size + 1];
     // SAFETY: buffer of `size+1` writable bytes; vendor writes at most `size`.
     let r = if ptx {
@@ -430,10 +455,7 @@ fn compile_hip(
     };
     ensure!(r == 0, Internal, "hiprtcCreateProgram failed");
 
-    let mut flags: Vec<String> = vec![
-        "-D__HIP_PLATFORM_AMD__".to_string(),
-        arch.hiprtc_flag(),
-    ];
+    let mut flags: Vec<String> = vec!["-D__HIP_PLATFORM_AMD__".to_string(), arch.hiprtc_flag()];
     flags.extend(extra.iter().cloned());
     let cflags: Vec<CString> = flags.iter().map(|f| cstring(f)).collect::<Result<_>>()?;
     let ptrs: Vec<*const std::ffi::c_char> = cflags.iter().map(|f| f.as_ptr()).collect();

@@ -158,7 +158,10 @@ fn greedy_pick(row: &[f32]) -> Option<u32> {
 /// non-empty length, each with at least one finite entry (non-finite
 /// entries never win, matching the sampler). The outcome carries a clone
 /// of `target_logits`.
-pub fn verify_greedy(drafts: &[DraftToken], target_logits: &[Vec<f32>]) -> Result<VerificationOutcome> {
+pub fn verify_greedy(
+    drafts: &[DraftToken],
+    target_logits: &[Vec<f32>],
+) -> Result<VerificationOutcome> {
     validate_target_logits(drafts, target_logits)?;
     let mut accepted = 0usize;
     while accepted < drafts.len() {
@@ -262,7 +265,9 @@ mod tests {
     }
 
     fn mild(vocab: usize) -> Vec<f32> {
-        (0..vocab).map(|i| ((i * 13 + 5) as f32 * 0.17 % 2.0) - 1.0).collect()
+        (0..vocab)
+            .map(|i| ((i * 13 + 5) as f32 * 0.17 % 2.0) - 1.0)
+            .collect()
     }
 
     #[test]
@@ -349,15 +354,15 @@ mod tests {
         assert_eq!(backtrack_steps(&[], &out), 0);
 
         // Row-count violations.
-        assert!(
-            verify_greedy(&drafts, &rows[..3]).is_err(),
-            "too few rows"
-        );
+        assert!(verify_greedy(&drafts, &rows[..3]).is_err(), "too few rows");
         assert!(
             verify_greedy(&[drafts[0].clone()], &rows).is_err(),
             "too many rows"
         );
-        assert!(verify_greedy(&[], &[]).is_err(), "zero rows for zero drafts");
+        assert!(
+            verify_greedy(&[], &[]).is_err(),
+            "zero rows for zero drafts"
+        );
     }
 
     #[test]
@@ -397,12 +402,7 @@ mod tests {
     fn stochastic_low_temperature_approaches_greedy() {
         let drafts = [dt(3, 0.6), dt(4, 0.6), dt(5, 0.6)];
         // Target agrees with every draft token; continuation is 7.
-        let rows = vec![
-            spiked(3, 8),
-            spiked(4, 8),
-            spiked(5, 8),
-            spiked(7, 8),
-        ];
+        let rows = vec![spiked(3, 8), spiked(4, 8), spiked(5, 8), spiked(7, 8)];
         let out = verify_stochastic(&drafts, &rows, &mut Philox::new(5, 5), 0.01).unwrap();
         assert_eq!(out.accepted, 3);
         assert_eq!(out.next_token, 7);

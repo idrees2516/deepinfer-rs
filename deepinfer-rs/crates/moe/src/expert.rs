@@ -64,9 +64,8 @@ impl MoeWeights {
         );
         let mut y = vec![0.0f32; need];
         for (si, ew) in self.shared.iter().enumerate() {
-            let i = infer_intermediate(ew, h).map_err(|e| {
-                Error::DimensionMismatch(format!("shared expert {si}: {e}"))
-            })?;
+            let i = infer_intermediate(ew, h)
+                .map_err(|e| Error::DimensionMismatch(format!("shared expert {si}: {e}")))?;
             ensure!(
                 ew.w_gate_up.len() == 2 * i * h,
                 DimensionMismatch,
@@ -300,7 +299,7 @@ mod tests {
         assert!(w.expert_forward(0, &[0.0; 3], 1).is_err()); // x len
         assert!(w.expert_forward(0, &[f32::NAN; 4], 1).is_err()); // NaN
         assert!(w.expert_forward(0, &[0.0; 8], 1).is_err()); // tokens mismatch
-        // Malformed weights: w_down inconsistent with w_gate_up.
+                                                             // Malformed weights: w_down inconsistent with w_gate_up.
         let mut bad = w.clone();
         bad.routed[0].w_down.push(0.0);
         assert!(bad.expert_forward(0, &[0.0; 4], 1).is_err());

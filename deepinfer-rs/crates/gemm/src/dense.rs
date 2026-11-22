@@ -49,8 +49,18 @@ pub fn fp8_gemm_nt(
     let asf_len = prod(m, kb, "m*k_blocks")?;
     let bsf_len = prod(nb, kb, "n_blocks*k_blocks")?;
     let mn = prod(m, n, "m*n")?;
-    ensure!(a.len() == mk, DimensionMismatch, "a has {} bytes, expected m*k = {mk}", a.len());
-    ensure!(b.len() == nk, DimensionMismatch, "b has {} bytes, expected n*k = {nk}", b.len());
+    ensure!(
+        a.len() == mk,
+        DimensionMismatch,
+        "a has {} bytes, expected m*k = {mk}",
+        a.len()
+    );
+    ensure!(
+        b.len() == nk,
+        DimensionMismatch,
+        "b has {} bytes, expected n*k = {nk}",
+        b.len()
+    );
     ensure!(
         a_sf.len() == asf_len,
         DimensionMismatch,
@@ -64,7 +74,12 @@ pub fn fp8_gemm_nt(
         b_sf.len()
     );
     if let Some(cv) = c {
-        ensure!(cv.len() == mn, DimensionMismatch, "c has {} elements, expected m*n = {mn}", cv.len());
+        ensure!(
+            cv.len() == mn,
+            DimensionMismatch,
+            "c has {} elements, expected m*n = {mn}",
+            cv.len()
+        );
     }
 
     // Pre-dequantize to f32 (exact, order-preserving): the parallel row
@@ -116,10 +131,25 @@ pub fn bf16_gemm_nt(
     let mk = prod(m, k, "m*k")?;
     let nk = prod(n, k, "n*k")?;
     let mn = prod(m, n, "m*n")?;
-    ensure!(a.len() == mk, DimensionMismatch, "a has {} elements, expected m*k = {mk}", a.len());
-    ensure!(b.len() == nk, DimensionMismatch, "b has {} elements, expected n*k = {nk}", b.len());
+    ensure!(
+        a.len() == mk,
+        DimensionMismatch,
+        "a has {} elements, expected m*k = {mk}",
+        a.len()
+    );
+    ensure!(
+        b.len() == nk,
+        DimensionMismatch,
+        "b has {} elements, expected n*k = {nk}",
+        b.len()
+    );
     if let Some(cv) = c {
-        ensure!(cv.len() == mn, DimensionMismatch, "c has {} elements, expected m*n = {mn}", cv.len());
+        ensure!(
+            cv.len() == mn,
+            DimensionMismatch,
+            "c has {} elements, expected m*n = {mn}",
+            cv.len()
+        );
     }
 
     let a_f = Arc::new(a.iter().map(|&v| bf16_to_f32(v)).collect::<Vec<f32>>());
@@ -157,8 +187,18 @@ pub fn f32_gemm_nt(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Result
     let mk = prod(m, k, "m*k")?;
     let nk = prod(n, k, "n*k")?;
     let mn = prod(m, n, "m*n")?;
-    ensure!(a.len() == mk, DimensionMismatch, "a has {} elements, expected m*k = {mk}", a.len());
-    ensure!(b.len() == nk, DimensionMismatch, "b has {} elements, expected n*k = {nk}", b.len());
+    ensure!(
+        a.len() == mk,
+        DimensionMismatch,
+        "a has {} elements, expected m*k = {mk}",
+        a.len()
+    );
+    ensure!(
+        b.len() == nk,
+        DimensionMismatch,
+        "b has {} elements, expected n*k = {nk}",
+        b.len()
+    );
     let mut out = vec![0.0f32; mn];
     for i in 0..m {
         for j in 0..n {
@@ -235,8 +275,13 @@ mod tests {
     fn fp8_gemm_nt_matches_dequantized_reference() -> Result<()> {
         // m, n in {8, 16, 130} (130 exercises the ceil(n/128) b-scale path),
         // k a multiple of 128.
-        let cases: [(usize, usize, usize); 5] =
-            [(8, 8, 128), (16, 16, 128), (130, 16, 128), (16, 130, 256), (8, 16, 384)];
+        let cases: [(usize, usize, usize); 5] = [
+            (8, 8, 128),
+            (16, 16, 128),
+            (130, 16, 128),
+            (16, 130, 256),
+            (8, 16, 384),
+        ];
         for &(m, n, k) in &cases {
             let mut rng = Philox::new(0xC0FFEE, (m * 131 + n * 7 + k) as u64);
             let a = random_matrix(&mut rng, m, k, 1.0);

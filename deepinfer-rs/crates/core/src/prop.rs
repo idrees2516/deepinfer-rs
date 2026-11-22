@@ -45,7 +45,10 @@ pub fn assert_close_slice(a: &[f32], b: &[f32], tol: f32, ctx: &str) {
         }
     }
     if let Some((i, d)) = worst {
-        panic!("not close [{ctx}] at index {i}: {} vs {} (|diff| = {d} > tol {tol})", a[i], b[i]);
+        panic!(
+            "not close [{ctx}] at index {i}: {} vs {} (|diff| = {d} > tol {tol})",
+            a[i], b[i]
+        );
     }
 }
 

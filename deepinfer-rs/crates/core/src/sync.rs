@@ -41,9 +41,7 @@ impl ThreadPool {
             });
         }
         ThreadPool {
-            inner: Arc::new(PoolInner {
-                tx: Mutex::new(tx),
-            }),
+            inner: Arc::new(PoolInner { tx: Mutex::new(tx) }),
         }
     }
 

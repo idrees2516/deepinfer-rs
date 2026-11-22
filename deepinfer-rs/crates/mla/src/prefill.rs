@@ -356,9 +356,8 @@ mod tests {
         let (out, max_l, lse) =
             flash_mla_sparse_prefill(&q, &kv, &indices, s_q, h, d, s_kv, topk, sm, None, None)
                 .unwrap();
-        let (nout, nmax, nlse) = naive_sparse_prefill(
-            &q, &kv, &indices, s_q, h, d, s_kv, topk, sm, None, None,
-        );
+        let (nout, nmax, nlse) =
+            naive_sparse_prefill(&q, &kv, &indices, s_q, h, d, s_kv, topk, sm, None, None);
         assert_close_slice(&out, &nout, 1e-4, "sparse out");
         assert_close_slice(&max_l, &nmax, 1e-4, "sparse max_logits");
         assert_close_slice(&lse, &nlse, 1e-4, "sparse lse");
@@ -370,15 +369,37 @@ mod tests {
         let (s_q, h, d, s_kv, topk) = (3usize, 2, 16, 10, 6);
         let q = random_vec(&mut rng, s_q * h * d, 1.0);
         let kv = random_vec(&mut rng, s_kv * d, 1.0);
-        let indices: Vec<i32> = (0..s_q * topk).map(|_| rng.uniform_usize(0, s_kv) as i32).collect();
+        let indices: Vec<i32> = (0..s_q * topk)
+            .map(|_| rng.uniform_usize(0, s_kv) as i32)
+            .collect();
         let tl = [4i32, 0, 6];
         let sm = 0.3f32;
         let (out, max_l, lse) = flash_mla_sparse_prefill(
-            &q, &kv, &indices, s_q, h, d, s_kv, topk, sm, None, Some(&tl),
+            &q,
+            &kv,
+            &indices,
+            s_q,
+            h,
+            d,
+            s_kv,
+            topk,
+            sm,
+            None,
+            Some(&tl),
         )
         .unwrap();
         let (nout, nmax, nlse) = naive_sparse_prefill(
-            &q, &kv, &indices, s_q, h, d, s_kv, topk, sm, None, Some(&tl),
+            &q,
+            &kv,
+            &indices,
+            s_q,
+            h,
+            d,
+            s_kv,
+            topk,
+            sm,
+            None,
+            Some(&tl),
         );
         assert_close_slice(&out, &nout, 1e-4, "topk_length out");
         assert_close_slice(&max_l, &nmax, 1e-4, "topk_length max");
@@ -388,7 +409,8 @@ mod tests {
             assert!(max_l[h + hi] == f32::NEG_INFINITY);
             assert!(lse[h + hi] == f32::INFINITY);
             assert!(out[(h + hi) * d..][..d].iter().all(|&v| v == 0.0));
-        }    }
+        }
+    }
 
     #[test]
     fn sparse_prefill_edge_cases() {
@@ -397,7 +419,17 @@ mod tests {
         let kv = random_vec(&mut Philox::new(1, 2), s_kv * d, 1.0);
         // All invalid.
         let (out, max_l, lse) = flash_mla_sparse_prefill(
-            &q, &kv, &[-1, -1, 99, -1], s_q, h, d, s_kv, 2, 1.0, None, None,
+            &q,
+            &kv,
+            &[-1, -1, 99, -1],
+            s_q,
+            h,
+            d,
+            s_kv,
+            2,
+            1.0,
+            None,
+            None,
         )
         .unwrap();
         assert!(out.iter().all(|&v| v == 0.0));
@@ -411,10 +443,8 @@ mod tests {
         assert!(max_l.iter().all(|&v| v == f32::NEG_INFINITY));
         assert!(lse.iter().all(|&v| v == f32::INFINITY));
         // s_kv = 0: every index invalid.
-        let (out, max_l, lse) = flash_mla_sparse_prefill(
-            &q, &[], &[0, 0], s_q, h, d, 0, 1, 1.0, None, None,
-        )
-        .unwrap();
+        let (out, max_l, lse) =
+            flash_mla_sparse_prefill(&q, &[], &[0, 0], s_q, h, d, 0, 1, 1.0, None, None).unwrap();
         assert!(out.iter().all(|&v| v == 0.0));
         assert!(max_l.iter().all(|&v| v == f32::NEG_INFINITY));
         assert!(lse.iter().all(|&v| v == f32::INFINITY));
@@ -428,10 +458,9 @@ mod tests {
         // q = [1, 0]; kv = [[1,0],[0,1]]; sm_scale = 1; sink = 0.5.
         let q = vec![1.0f32, 0.0];
         let kv = vec![1.0f32, 0.0, 0.0, 1.0];
-        let (out, max_l, lse) = flash_mla_sparse_prefill(
-            &q, &kv, &[0, 1], 1, 1, 2, 2, 2, 1.0, Some(&[0.5]), None,
-        )
-        .unwrap();
+        let (out, max_l, lse) =
+            flash_mla_sparse_prefill(&q, &kv, &[0, 1], 1, 1, 2, 2, 2, 1.0, Some(&[0.5]), None)
+                .unwrap();
         let e1 = (-1.0f32).exp();
         let sum = 1.0 + e1;
         let lse_expect = 1.0f32 + sum.ln();
@@ -461,13 +490,54 @@ mod tests {
         assert!(r(&indices, Some(&[3, 4]), None).is_err()); // > topk
         assert!(r(&indices, None, Some(&[0.1])).is_err()); // sink len
         assert!(r(&indices, None, Some(&[f32::NAN, 0.0, 0.0])).is_err()); // sink NaN
-        // Bad q / kv / sm_scale.
-        assert!(flash_mla_sparse_prefill(&q[..q.len() - 1], &kv, &indices, 2, 3, 4, 5, 3, 1.0, None, None).is_err());
-        assert!(flash_mla_sparse_prefill(&q, &kv[..kv.len() - 1], &indices, 2, 3, 4, 5, 3, 1.0, None, None).is_err());
-        assert!(flash_mla_sparse_prefill(&q, &kv, &indices, 2, 3, 4, 5, 3, f32::INFINITY, None, None).is_err());
+                                                                          // Bad q / kv / sm_scale.
+        assert!(flash_mla_sparse_prefill(
+            &q[..q.len() - 1],
+            &kv,
+            &indices,
+            2,
+            3,
+            4,
+            5,
+            3,
+            1.0,
+            None,
+            None
+        )
+        .is_err());
+        assert!(flash_mla_sparse_prefill(
+            &q,
+            &kv[..kv.len() - 1],
+            &indices,
+            2,
+            3,
+            4,
+            5,
+            3,
+            1.0,
+            None,
+            None
+        )
+        .is_err());
+        assert!(flash_mla_sparse_prefill(
+            &q,
+            &kv,
+            &indices,
+            2,
+            3,
+            4,
+            5,
+            3,
+            f32::INFINITY,
+            None,
+            None
+        )
+        .is_err());
         let mut nq = q.clone();
         nq[0] = f32::NAN;
-        assert!(flash_mla_sparse_prefill(&nq, &kv, &indices, 2, 3, 4, 5, 3, 1.0, None, None).is_err());
+        assert!(
+            flash_mla_sparse_prefill(&nq, &kv, &indices, 2, 3, 4, 5, 3, 1.0, None, None).is_err()
+        );
     }
 
     #[test]
@@ -477,11 +547,29 @@ mod tests {
         let q = random_vec(&mut rng, s_q * h * d, 1.0);
         let kv = random_vec(&mut rng, s_kv * d, 1.0);
         let indices: Vec<i32> = (0..s_q * topk)
-            .map(|_| if rng.next_f32() < 0.2 { -1 } else { rng.uniform_usize(0, s_kv) as i32 })
+            .map(|_| {
+                if rng.next_f32() < 0.2 {
+                    -1
+                } else {
+                    rng.uniform_usize(0, s_kv) as i32
+                }
+            })
             .collect();
         let run = || {
-            flash_mla_sparse_prefill(&q, &kv, &indices, s_q, h, d, s_kv, topk, 0.2, Some(&[0.3, -0.2]), None)
-                .unwrap()
+            flash_mla_sparse_prefill(
+                &q,
+                &kv,
+                &indices,
+                s_q,
+                h,
+                d,
+                s_kv,
+                topk,
+                0.2,
+                Some(&[0.3, -0.2]),
+                None,
+            )
+            .unwrap()
         };
         let a = run();
         let b = run();
@@ -505,7 +593,12 @@ mod tests {
             let mut out = vec![0.0f32; q.len()];
             flash_mla_dense_prefill(&q, &kv, s_q, h, d, s_kv, q_offset, sm, &mut out).unwrap();
             let nout = naive_dense_prefill(&q, &kv, s_q, h, d, s_kv, q_offset, sm);
-            assert_close_slice(&out, &nout, 1e-4, "dense (s_q {s_q}, s_kv {s_kv}, off {q_offset})");
+            assert_close_slice(
+                &out,
+                &nout,
+                1e-4,
+                "dense (s_q {s_q}, s_kv {s_kv}, off {q_offset})",
+            );
         }
     }
 
@@ -525,7 +618,9 @@ mod tests {
         // Shape validation.
         let mut out3 = vec![0.0f32; out2.len() - 1];
         assert!(flash_mla_dense_prefill(&q, &kv, 2, 2, 4, 3, 0, 1.0, &mut out3).is_err());
-        assert!(flash_mla_dense_prefill(&q[..q.len() - 1], &kv, 2, 2, 4, 3, 0, 1.0, &mut out2).is_err());
+        assert!(
+            flash_mla_dense_prefill(&q[..q.len() - 1], &kv, 2, 2, 4, 3, 0, 1.0, &mut out2).is_err()
+        );
         assert!(flash_mla_dense_prefill(&q, &kv, 2, 2, 4, 3, 0, f32::NAN, &mut out2).is_err());
         // s_q = 0: vacuous.
         assert!(flash_mla_dense_prefill(&[], &kv, 0, 2, 4, 3, 0, 1.0, &mut []).is_ok());
@@ -549,7 +644,11 @@ mod tests {
                 })
                 .collect();
             let tl: Option<Vec<i32>> = if topk > 0 && rng.next_f32() < 0.5 {
-                Some((0..s_q).map(|_| rng.uniform_usize(0, topk + 1) as i32).collect())
+                Some(
+                    (0..s_q)
+                        .map(|_| rng.uniform_usize(0, topk + 1) as i32)
+                        .collect(),
+                )
             } else {
                 None
             };

@@ -64,9 +64,9 @@ pub(crate) fn align_up(n: usize, alignment: usize) -> deepinfer_core::Result<usi
     if alignment <= 1 {
         return Ok(n);
     }
-    n.div_ceil(alignment)
-        .checked_mul(alignment)
-        .ok_or_else(|| Error::CapacityExceeded(format!("align_up({n}, {alignment}) overflows usize")))
+    n.div_ceil(alignment).checked_mul(alignment).ok_or_else(|| {
+        Error::CapacityExceeded(format!("align_up({n}, {alignment}) overflows usize"))
+    })
 }
 
 #[cfg(test)]

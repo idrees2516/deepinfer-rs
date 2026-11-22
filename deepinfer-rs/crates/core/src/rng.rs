@@ -84,12 +84,7 @@ impl Philox {
         for r in 0..PHILOX_ROUNDS {
             let (hi0, lo0) = mulhilo32(PHILOX_M0, ctr[0]);
             let (hi1, lo1) = mulhilo32(PHILOX_M1, ctr[2]);
-            ctr = [
-                hi1 ^ ctr[1] ^ key[0],
-                lo1,
-                hi0 ^ ctr[3] ^ key[1],
-                lo0,
-            ];
+            ctr = [hi1 ^ ctr[1] ^ key[0], lo1, hi0 ^ ctr[3] ^ key[1], lo0];
             if r + 1 < PHILOX_ROUNDS {
                 key[0] = key[0].wrapping_add(PHILOX_W0);
                 key[1] = key[1].wrapping_add(PHILOX_W1);

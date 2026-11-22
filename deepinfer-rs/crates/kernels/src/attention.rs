@@ -92,7 +92,11 @@ impl Kernels {
         cache_rows: usize,
         stream: &Stream,
     ) -> Result<usize> {
-        ensure!(d == 512, InvalidArgument, "fp4 decode requires D == 512 (FlashMLA V4.1 rows)");
+        ensure!(
+            d == 512,
+            InvalidArgument,
+            "fp4 decode requires D == 512 (FlashMLA V4.1 rows)"
+        );
         self.mla_decode_partial_impl(
             "di_mla_decode_fp4_partial_kernel",
             q,
@@ -142,14 +146,22 @@ impl Kernels {
         if fmt == CacheFormat::Fp4Group16 {
             ensure!(d == 512, InvalidArgument, "fp4 rows require D == 512");
         }
-        ensure!(topk > 0 || (b * s_q) == 0, InvalidArgument, "topk must be > 0");
+        ensure!(
+            topk > 0 || (b * s_q) == 0,
+            InvalidArgument,
+            "topk must be > 0"
+        );
         let splits = ceil_div(topk, DECODE_CHUNK).max(1);
         let block = 8 * self.warp_size();
         let f = self.f(kernel)?;
         f.launch(
             self.device(),
             Launch {
-                grid: (splits as u32, ceil_div(h, 8) as u32, (b * s_q).max(1) as u32),
+                grid: (
+                    splits as u32,
+                    ceil_div(h, 8) as u32,
+                    (b * s_q).max(1) as u32,
+                ),
                 block: (block, 1, 1),
                 shared: 0,
             },
@@ -235,7 +247,11 @@ impl Kernels {
         fmt: CacheFormat,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(h >= 1 && d >= 1 && s_q >= 1, InvalidArgument, "prefill needs positive dims");
+        ensure!(
+            h >= 1 && d >= 1 && s_q >= 1,
+            InvalidArgument,
+            "prefill needs positive dims"
+        );
         ensure!(
             d % self.warp_size() as usize == 0,
             InvalidArgument,
@@ -290,7 +306,11 @@ impl Kernels {
         fmt: CacheFormat,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(h >= 1 && d >= 1 && s_q >= 1, InvalidArgument, "prefill needs positive dims");
+        ensure!(
+            h >= 1 && d >= 1 && s_q >= 1,
+            InvalidArgument,
+            "prefill needs positive dims"
+        );
         ensure!(
             d % self.warp_size() as usize == 0,
             InvalidArgument,
@@ -335,7 +355,11 @@ impl Kernels {
         max_rows: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ensure!(capacity > 0 && row_bytes > 0 && max_rows > 0, InvalidArgument, "gather needs positive geometry");
+        ensure!(
+            capacity > 0 && row_bytes > 0 && max_rows > 0,
+            InvalidArgument,
+            "gather needs positive geometry"
+        );
         self.launch1d(
             "di_gather_rows_kernel",
             max_rows * row_bytes,
@@ -379,10 +403,16 @@ impl Kernels {
         let shared = d
             .checked_mul(4)
             .and_then(|v| v.checked_add(2 * block * 4))
-            .ok_or_else(|| deepinfer_core::Error::CapacityExceeded("swa smem size overflows".into()))?;
+            .ok_or_else(|| {
+                deepinfer_core::Error::CapacityExceeded("swa smem size overflows".into())
+            })?;
         // 32 KB ov + 2 KB red is the realistic budget; larger hidden needs
         // a multi-CTA variant (not needed for the reference configs).
-        ensure!(shared <= 64 * 1024, CapacityExceeded, "swa smem {shared} B exceeds 64 KB");
+        ensure!(
+            shared <= 64 * 1024,
+            CapacityExceeded,
+            "swa smem {shared} B exceeds 64 KB"
+        );
         let f = self.f("di_swa_attention_dev_kernel")?;
         f.launch(
             self.device(),

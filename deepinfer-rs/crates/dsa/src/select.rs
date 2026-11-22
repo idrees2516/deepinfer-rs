@@ -93,7 +93,11 @@ pub fn select_top_k(
         cfg.topk_tokens
     );
     if let Some(w) = cfg.extrapolation_window {
-        ensure!(w >= 1, InvalidArgument, "extrapolation_window must be >= 1 (got {w})");
+        ensure!(
+            w >= 1,
+            InvalidArgument,
+            "extrapolation_window must be >= 1 (got {w})"
+        );
     }
     ensure!(
         s_kv <= i32::MAX as usize,
@@ -189,7 +193,11 @@ mod tests {
     #[test]
     fn mscale_values() {
         // 0.1 * ln(2048) + 1 = 1.7624619...
-        assert!((mscale(2048) - 1.762_461_9).abs() < 1e-6, "{}", mscale(2048));
+        assert!(
+            (mscale(2048) - 1.762_461_9).abs() < 1e-6,
+            "{}",
+            mscale(2048)
+        );
         assert_eq!(mscale(1), 1.0); // ln(1) = 0
         assert!((mscale(2) - (1.0 + 0.1 * 2f64.ln() as f32)).abs() < 1e-7);
     }
@@ -198,7 +206,18 @@ mod tests {
     fn hand_case_two_stage_selection() {
         // blocks of 4, preselect 2, topk 3 over 10 keys.
         let cfg = small_cfg(4, 3, 2, None);
-        let scores = [5.0f32, 1.0, 1.0, 1.0, 9.0, 8.0, 0.0, 0.0, 7.0, f32::NEG_INFINITY];
+        let scores = [
+            5.0f32,
+            1.0,
+            1.0,
+            1.0,
+            9.0,
+            8.0,
+            0.0,
+            0.0,
+            7.0,
+            f32::NEG_INFINITY,
+        ];
         let sel = select_top_k(&scores, 1, 10, &cfg).unwrap();
         // Block [0,4): 5@0, 1@1 (ties -> lower positions).
         // Block [4,8): 9@4, 8@5. Block [8,10): 7@8 (-inf never selected).
@@ -258,7 +277,7 @@ mod tests {
     fn extrapolation_window_restricts_candidates() {
         let cfg = small_cfg(64, 3, 8, Some(2));
         let mut scores = vec![0.0f32; 36]; // [6, 6]
-        // Row i: only positions within [i+1-2, i] are candidates.
+                                           // Row i: only positions within [i+1-2, i] are candidates.
         for (i, row) in scores.chunks_mut(6).enumerate() {
             row[0] = 100.0; // highest everywhere, must be excluded for windows not covering 0
             row[i] = 60.0;

@@ -125,10 +125,7 @@ impl MlaWeights {
         let n_heads = cfg.n_heads.clamp(1, 128);
         let rope_dim = cfg.rope_dim.clamp(2, 512) & !1;
         let head_dim = cfg.head_dim.clamp(rope_dim.saturating_add(2).max(4), 1024);
-        let o_groups = if cfg.o_groups >= 1
-            && cfg.o_groups <= 64
-            && n_heads % cfg.o_groups == 0
-        {
+        let o_groups = if cfg.o_groups >= 1 && cfg.o_groups <= 64 && n_heads % cfg.o_groups == 0 {
             cfg.o_groups
         } else {
             1
@@ -324,11 +321,7 @@ impl MlaWeights {
             if let Some(qn) = &self.q_norm {
                 deepinfer_core::norm::rmsnorm(&mut lora, qn, V41_RMS_EPS);
             }
-            mat_vec(
-                &self.q_b_proj,
-                &lora,
-                &mut out[t * row..(t + 1) * row],
-            );
+            mat_vec(&self.q_b_proj, &lora, &mut out[t * row..(t + 1) * row]);
         }
         Ok(())
     }
@@ -425,7 +418,11 @@ impl MlaWeights {
                 let wg = &self.wv_proj[g * dm.o_lora * r..(g + 1) * dm.o_lora * r];
                 mat_vec(wg, xg, &mut lora[g * dm.o_lora..(g + 1) * dm.o_lora]);
             }
-            mat_vec(&self.wo_proj, &lora, &mut out[t * dm.hidden..(t + 1) * dm.hidden]);
+            mat_vec(
+                &self.wo_proj,
+                &lora,
+                &mut out[t * dm.hidden..(t + 1) * dm.hidden],
+            );
         }
         Ok(())
     }
@@ -452,10 +449,19 @@ mod tests {
         assert_eq!(a.wo_proj, b.wo_proj);
         assert_eq!(a.kv_norm, b.kv_norm);
         assert_eq!(a.q_a_proj.len(), cfg.q_lora_rank * cfg.hidden_size);
-        assert_eq!(a.q_b_proj.len(), cfg.n_heads * cfg.head_dim * cfg.q_lora_rank);
+        assert_eq!(
+            a.q_b_proj.len(),
+            cfg.n_heads * cfg.head_dim * cfg.q_lora_rank
+        );
         assert_eq!(a.kv_a_proj.len(), cfg.head_dim * cfg.hidden_size);
-        assert_eq!(a.wv_proj.len(), cfg.o_groups * cfg.o_lora_rank * (cfg.n_heads / cfg.o_groups) * cfg.head_dim);
-        assert_eq!(a.wo_proj.len(), cfg.hidden_size * cfg.o_groups * cfg.o_lora_rank);
+        assert_eq!(
+            a.wv_proj.len(),
+            cfg.o_groups * cfg.o_lora_rank * (cfg.n_heads / cfg.o_groups) * cfg.head_dim
+        );
+        assert_eq!(
+            a.wo_proj.len(),
+            cfg.hidden_size * cfg.o_groups * cfg.o_lora_rank
+        );
         assert_eq!(a.kv_norm, vec![1.0f32; cfg.head_dim - cfg.rope_dim]);
         assert!(a.q_norm.is_none());
         assert!(a.attn_sink.is_none());
@@ -582,7 +588,9 @@ mod tests {
         let nan_hidden = vec![f32::NAN; cfg.hidden_size];
         assert!(w.project_q(&nan_hidden, 1, &mut q).is_err());
         assert!(w.project_kv(&nan_hidden, 1, &mut kv).is_err());
-        assert!(w.project_o(&vec![f32::INFINITY; cfg.n_heads * cfg.head_dim], 1, &mut o).is_err());
+        assert!(w
+            .project_o(&vec![f32::INFINITY; cfg.n_heads * cfg.head_dim], 1, &mut o)
+            .is_err());
     }
 
     #[test]
@@ -593,7 +601,9 @@ mod tests {
         // Empty kv_norm -> no derivable head_dim.
         let mut bad = w.clone();
         bad.kv_norm = Vec::new();
-        assert!(bad.project_q(&[0.0; 32], 1, &mut vec![0.0; 4 * 64]).is_err());
+        assert!(bad
+            .project_q(&[0.0; 32], 1, &mut vec![0.0; 4 * 64])
+            .is_err());
         // kv_a_proj not divisible by head_dim.
         let mut bad = w.clone();
         bad.kv_a_proj.push(0.1);
@@ -601,11 +611,15 @@ mod tests {
         // o_groups that does not divide n_heads (wo len implies 3 groups).
         let mut bad = w.clone();
         bad.wo_proj = vec![0.01f32; cfg.hidden_size * 3 * cfg.o_lora_rank];
-        assert!(bad.project_o(&vec![0.0; 4 * 64], 1, &mut [0.0; 32]).is_err());
+        assert!(bad
+            .project_o(&vec![0.0; 4 * 64], 1, &mut [0.0; 32])
+            .is_err());
         // q_norm length mismatch.
         let mut bad = w.clone();
         bad.q_norm = Some(vec![1.0f32; cfg.q_lora_rank + 1]);
-        assert!(bad.project_q(&[0.0; 32], 1, &mut vec![0.0; 4 * 64]).is_err());
+        assert!(bad
+            .project_q(&[0.0; 32], 1, &mut vec![0.0; 4 * 64])
+            .is_err());
     }
 
     #[test]

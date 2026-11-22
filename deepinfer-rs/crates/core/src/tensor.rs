@@ -3,9 +3,7 @@
 use crate::dtype::DType;
 use crate::ensure;
 use crate::error::{Error, Result};
-use crate::format::{
-    bf16_to_f32, e2m1_to_f32, e4m3_to_f32, e5m2_to_f32, e8m0_to_f32, f16_to_f32,
-};
+use crate::format::{bf16_to_f32, e2m1_to_f32, e4m3_to_f32, e5m2_to_f32, e8m0_to_f32, f16_to_f32};
 use std::sync::Arc;
 
 /// A dense, contiguous, immutable tensor backed by reference-counted bytes.
@@ -158,7 +156,12 @@ impl Tensor {
 
     /// Reads one element as `f32` (dequantized).
     pub fn get_f32(&self, index: usize) -> Result<f32> {
-        ensure!(index < self.numel(), OutOfRange, "index {index} >= numel {}", self.numel());
+        ensure!(
+            index < self.numel(),
+            OutOfRange,
+            "index {index} >= numel {}",
+            self.numel()
+        );
         let i = index;
         Ok(match self.dtype {
             DType::F32 => {
@@ -189,7 +192,11 @@ impl Tensor {
     /// 2-D tensor (`[rows, cols]`), sharing the underlying bytes where
     /// possible (contiguous copy for simplicity and safety).
     pub fn rows(&self, row_start: usize, row_end: usize) -> Result<Tensor> {
-        ensure!(!self.shape.is_empty(), InvalidArgument, "rows() needs >= 1 dim");
+        ensure!(
+            !self.shape.is_empty(),
+            InvalidArgument,
+            "rows() needs >= 1 dim"
+        );
         if self.shape.len() == 1 {
             // Treat a 1-D tensor as a column of rows of length 1.
             ensure!(row_end <= self.shape[0], OutOfRange, "row range");
@@ -198,12 +205,20 @@ impl Tensor {
             out.extend_from_slice(&self.data[row_start * s..row_end * s]);
             return Tensor::from_raw(self.dtype, vec![row_end - row_start], out);
         }
-        ensure!(self.shape.len() == 2, InvalidArgument, "rows() on >2-D tensors is not supported");
+        ensure!(
+            self.shape.len() == 2,
+            InvalidArgument,
+            "rows() on >2-D tensors is not supported"
+        );
         let cols = self.shape[1];
-        ensure!(row_end <= self.shape[0] && row_start <= row_end, OutOfRange, "row range {row_start}..{row_end} of {}", self.shape[0]);
+        ensure!(
+            row_end <= self.shape[0] && row_start <= row_end,
+            OutOfRange,
+            "row range {row_start}..{row_end} of {}",
+            self.shape[0]
+        );
         let s = self.dtype.size_in_bytes();
-        let mut out =
-            Vec::with_capacity((row_end.saturating_sub(row_start)) * cols * s);
+        let mut out = Vec::with_capacity((row_end.saturating_sub(row_start)) * cols * s);
         for r in row_start..row_end {
             let start = r * cols * s;
             out.extend_from_slice(&self.data[start..start + cols * s]);

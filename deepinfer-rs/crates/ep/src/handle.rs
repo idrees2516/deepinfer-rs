@@ -68,6 +68,9 @@ mod tests {
         assert_eq!(h.token_slots.len(), h.topk_idx.len());
         assert_eq!(h.token_slots.len(), h.topk_weights.len());
         assert!(h.hook.is_fulfilled());
-        assert_eq!(h.recv_counts_per_expert.iter().sum::<usize>(), h.token_slots.len());
+        assert_eq!(
+            h.recv_counts_per_expert.iter().sum::<usize>(),
+            h.token_slots.len()
+        );
     }
 }

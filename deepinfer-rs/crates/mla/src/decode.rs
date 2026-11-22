@@ -179,7 +179,9 @@ pub fn flash_mla_decode(
                     // Non-negative indices pointing outside the stored
                     // cache are invalid (score -inf), matching the
                     // README's `indices >= s_kv` rule.
-                    let Ok(row) = cache.row_f32(idx) else { continue };
+                    let Ok(row) = cache.row_f32(idx) else {
+                        continue;
+                    };
                     for hi in 0..h {
                         let q_row = &q[(qbase + hi) * d..][..d];
                         let s = dot(q_row, &row) * sm_scale;
@@ -290,8 +292,10 @@ mod tests {
         let sm = 1.0 / (d as f32).sqrt();
         let mut out = vec![0.0f32; q.len()];
         let mut lse = vec![0.0f32; b * h * s_q];
-        flash_mla_decode(&q, &cache, &indices, b, s_q, topk, sm, None, &mut out, &mut lse)
-            .unwrap();
+        flash_mla_decode(
+            &q, &cache, &indices, b, s_q, topk, sm, None, &mut out, &mut lse,
+        )
+        .unwrap();
         let (nout, nlse) = naive_decode(&q, &cache, &indices, b, s_q, topk, h, d, sm, None);
         assert_close_slice(&out, &nout, 1e-4, "decode out (bf16, 4 chunks)");
         assert_close_slice(&lse, &nlse, 1e-4, "decode lse (bf16, 4 chunks)");
@@ -311,8 +315,10 @@ mod tests {
             let sm = 0.25f32;
             let mut out = vec![0.0f32; q.len()];
             let mut lse = vec![0.0f32; b * h * s_q];
-            flash_mla_decode(&q, &cache, &indices, b, s_q, topk, sm, None, &mut out, &mut lse)
-                .unwrap();
+            flash_mla_decode(
+                &q, &cache, &indices, b, s_q, topk, sm, None, &mut out, &mut lse,
+            )
+            .unwrap();
             let (nout, nlse) = naive_decode(&q, &cache, &indices, b, s_q, topk, h, d, sm, None);
             assert_close_slice(&out, &nout, 1e-4, "chunked out (topk {topk})");
             assert_close_slice(&lse, &nlse, 1e-4, "chunked lse (topk {topk})");
@@ -336,8 +342,10 @@ mod tests {
             let sm = 1.0 / (d as f32).sqrt();
             let mut out = vec![0.0f32; q.len()];
             let mut lse = vec![0.0f32; b * h * s_q];
-            flash_mla_decode(&q, &cache, &indices, b, s_q, topk, sm, None, &mut out, &mut lse)
-                .unwrap();
+            flash_mla_decode(
+                &q, &cache, &indices, b, s_q, topk, sm, None, &mut out, &mut lse,
+            )
+            .unwrap();
             // (a) Algorithmic equality: naive over the same dequantized
             //     cache rows.
             let (nout, nlse) = naive_decode(&q, &cache, &indices, b, s_q, topk, h, d, sm, None);
@@ -345,7 +353,9 @@ mod tests {
             assert_close_slice(&lse, &nlse, 1e-4, "{format:?} lse vs dequantized naive");
             // (b) Quantization accuracy: naive over the original f32 rows.
             let (mut oref, mut lref) = (vec![0.0f32; out.len()], vec![0.0f32; lse.len()]);
-            naive_decode_rows(&q, &rows, &indices, b, s_q, topk, h, d, sm, None, &mut oref, &mut lref);
+            naive_decode_rows(
+                &q, &rows, &indices, b, s_q, topk, h, d, sm, None, &mut oref, &mut lref,
+            );
             assert_close_slice(&out, &oref, out_tol, "{format:?} out vs original rows");
             assert_close_slice(&lse, &lref, lse_tol, "{format:?} lse vs original rows");
         }
@@ -390,9 +400,12 @@ mod tests {
                     let exps: Vec<f32> = scores.iter().map(|&s| (s - m).exp()).collect();
                     let sum: f32 = exps.iter().sum();
                     for j in 0..d {
-                        out[obase + j] =
-                            selected.iter().zip(exps.iter()).map(|(r, &e)| e * r[j]).sum::<f32>()
-                                / sum;
+                        out[obase + j] = selected
+                            .iter()
+                            .zip(exps.iter())
+                            .map(|(r, &e)| e * r[j])
+                            .sum::<f32>()
+                            / sum;
                     }
                     lse[li] = m + sum.ln();
                     if let Some(sk) = sink {
@@ -419,8 +432,10 @@ mod tests {
         let sm = 1.0 / (512.0f32).sqrt();
         let mut out = vec![0.0f32; q.len()];
         let mut lse = vec![0.0f32; b * h * s_q];
-        flash_mla_decode(&q, &cache, &indices, b, s_q, topk, sm, None, &mut out, &mut lse)
-            .unwrap();
+        flash_mla_decode(
+            &q, &cache, &indices, b, s_q, topk, sm, None, &mut out, &mut lse,
+        )
+        .unwrap();
         let (nout, nlse) = naive_decode(&q, &cache, &indices, b, s_q, topk, h, 512, sm, None);
         assert_close_slice(&out, &nout, 1e-4, "canonical 512-dim out");
         assert_close_slice(&lse, &nlse, 1e-4, "canonical 512-dim lse");
@@ -437,8 +452,10 @@ mod tests {
         let indices = vec![-1i32, 10_000, -1, -1, -1, -1, -1, -1];
         let mut out = vec![1.0f32; q.len()];
         let mut lse = vec![0.0f32; b * h * s_q];
-        flash_mla_decode(&q, &cache, &indices, b, s_q, 2, 0.5, None, &mut out, &mut lse)
-            .unwrap();
+        flash_mla_decode(
+            &q, &cache, &indices, b, s_q, 2, 0.5, None, &mut out, &mut lse,
+        )
+        .unwrap();
         assert!(out.iter().all(|&v| v == 0.0));
         assert!(lse.iter().all(|&v| v == f32::INFINITY));
         // topk = 0 with valid cache: same edge.
@@ -458,12 +475,17 @@ mod tests {
         }
         let mut out3 = vec![0.0f32; q.len()];
         let mut lse3 = vec![0.0f32; b * h * s_q];
-        flash_mla_decode(&q, &cache, &mixed, b, s_q, 3, 0.5, None, &mut out3, &mut lse3).unwrap();
+        flash_mla_decode(
+            &q, &cache, &mixed, b, s_q, 3, 0.5, None, &mut out3, &mut lse3,
+        )
+        .unwrap();
         for bi in 0..b {
             for hi in 0..h {
                 assert!(lse3[(bi * h + hi) * s_q] != f32::INFINITY);
                 assert!(lse3[(bi * h + hi) * s_q + 1] == f32::INFINITY);
-                assert!(out3[((bi * s_q + 1) * h + hi) * d..][..d].iter().all(|&v| v == 0.0));
+                assert!(out3[((bi * s_q + 1) * h + hi) * d..][..d]
+                    .iter()
+                    .all(|&v| v == 0.0));
             }
         }
     }
@@ -476,8 +498,19 @@ mod tests {
         let indices = vec![0i32, 1];
         let mut out = vec![0.0f32; 2];
         let mut lse = vec![0.0f32; 1];
-        flash_mla_decode(&q, &cache, &indices, 1, 1, 2, 1.0, Some(&[0.5]), &mut out, &mut lse)
-            .unwrap();
+        flash_mla_decode(
+            &q,
+            &cache,
+            &indices,
+            1,
+            1,
+            2,
+            1.0,
+            Some(&[0.5]),
+            &mut out,
+            &mut lse,
+        )
+        .unwrap();
         // scores [1, 0]; softmax [1, e^-1]/(1+e^-1); lse = 1 + ln(1+e^-1).
         let e1 = (-1.0f32).exp();
         let sum = 1.0 + e1;
@@ -485,20 +518,43 @@ mod tests {
         let out_expect = [1.0 / sum, e1 / sum];
         // factor = exp(lse)/(exp(lse)+exp(0.5)) = 1/(1+exp(0.5-lse))
         let factor = 1.0f32 / (1.0 + (0.5f32 - lse_expect).exp());
-        assert!((lse[0] - lse_expect).abs() < 1e-6, "{} vs {lse_expect}", lse[0]);
+        assert!(
+            (lse[0] - lse_expect).abs() < 1e-6,
+            "{} vs {lse_expect}",
+            lse[0]
+        );
         for j in 0..2 {
-            assert!((out[j] - out_expect[j] * factor).abs() < 1e-6, "{j}: {} vs {}", out[j], out_expect[j] * factor);
+            assert!(
+                (out[j] - out_expect[j] * factor).abs() < 1e-6,
+                "{j}: {} vs {}",
+                out[j],
+                out_expect[j] * factor
+            );
         }
         // The sink must not change the returned lse.
         let mut out2 = vec![0.0f32; 2];
         let mut lse2 = vec![0.0f32; 1];
-        flash_mla_decode(&q, &cache, &indices, 1, 1, 2, 1.0, None, &mut out2, &mut lse2).unwrap();
+        flash_mla_decode(
+            &q, &cache, &indices, 1, 1, 2, 1.0, None, &mut out2, &mut lse2,
+        )
+        .unwrap();
         assert_eq!(lse[0], lse2[0]);
         // ... and with no valid index the sink leaves the zero output.
         let mut out3 = vec![7.0f32; 2];
         let mut lse3 = vec![0.0f32; 1];
-        flash_mla_decode(&q, &cache, &[-1, -1], 1, 1, 2, 1.0, Some(&[0.5]), &mut out3, &mut lse3)
-            .unwrap();
+        flash_mla_decode(
+            &q,
+            &cache,
+            &[-1, -1],
+            1,
+            1,
+            2,
+            1.0,
+            Some(&[0.5]),
+            &mut out3,
+            &mut lse3,
+        )
+        .unwrap();
         assert!(out3.iter().all(|&v| v == 0.0));
         assert!(lse3[0] == f32::INFINITY);
     }
@@ -515,8 +571,19 @@ mod tests {
             let mut out = vec![0.0f32; q.len()];
             let mut lse = vec![0.0f32; b * h * s_q];
             let sink = vec![0.1f32; h];
-            flash_mla_decode(&q, &cache, &indices, b, s_q, topk, 0.2, Some(&sink), &mut out, &mut lse)
-                .unwrap();
+            flash_mla_decode(
+                &q,
+                &cache,
+                &indices,
+                b,
+                s_q,
+                topk,
+                0.2,
+                Some(&sink),
+                &mut out,
+                &mut lse,
+            )
+            .unwrap();
             (out, lse)
         };
         let (o1, l1) = run();
@@ -536,26 +603,104 @@ mod tests {
         let mut out = vec![0.0f32; q.len()];
         let mut lse = vec![0.0f32; b * h * s_q];
         // Wrong indices length.
-        assert!(flash_mla_decode(&q, &cache, &indices[..3], b, s_q, topk, 1.0, None, &mut out, &mut lse).is_err());
+        assert!(flash_mla_decode(
+            &q,
+            &cache,
+            &indices[..3],
+            b,
+            s_q,
+            topk,
+            1.0,
+            None,
+            &mut out,
+            &mut lse
+        )
+        .is_err());
         // q not a multiple of b*s_q*head_dim.
-        assert!(flash_mla_decode(&q[..q.len() - 1], &cache, &indices, b, s_q, topk, 1.0, None, &mut out, &mut lse).is_err());
+        assert!(flash_mla_decode(
+            &q[..q.len() - 1],
+            &cache,
+            &indices,
+            b,
+            s_q,
+            topk,
+            1.0,
+            None,
+            &mut out,
+            &mut lse
+        )
+        .is_err());
         // out/lse size mismatches.
         let out_short = vec![0.0f32; out.len() - 1];
         let mut out_short = out_short;
-        assert!(flash_mla_decode(&q, &cache, &indices, b, s_q, topk, 1.0, None, &mut out_short, &mut lse).is_err());
+        assert!(flash_mla_decode(
+            &q,
+            &cache,
+            &indices,
+            b,
+            s_q,
+            topk,
+            1.0,
+            None,
+            &mut out_short,
+            &mut lse
+        )
+        .is_err());
         let mut lse_short = vec![0.0f32; lse.len() - 1];
-        assert!(flash_mla_decode(&q, &cache, &indices, b, s_q, topk, 1.0, None, &mut out, &mut lse_short).is_err());
+        assert!(flash_mla_decode(
+            &q,
+            &cache,
+            &indices,
+            b,
+            s_q,
+            topk,
+            1.0,
+            None,
+            &mut out,
+            &mut lse_short
+        )
+        .is_err());
         // attn_sink length mismatch and non-finite sm_scale.
         let sink_long = vec![0.1f32; h + 1];
-        assert!(flash_mla_decode(&q, &cache, &indices, b, s_q, topk, 1.0, Some(&sink_long), &mut out, &mut lse).is_err());
-        assert!(flash_mla_decode(&q, &cache, &indices, b, s_q, topk, f32::NAN, None, &mut out, &mut lse).is_err());
+        assert!(flash_mla_decode(
+            &q,
+            &cache,
+            &indices,
+            b,
+            s_q,
+            topk,
+            1.0,
+            Some(&sink_long),
+            &mut out,
+            &mut lse
+        )
+        .is_err());
+        assert!(flash_mla_decode(
+            &q,
+            &cache,
+            &indices,
+            b,
+            s_q,
+            topk,
+            f32::NAN,
+            None,
+            &mut out,
+            &mut lse
+        )
+        .is_err());
         // Non-finite q.
         let mut bad_q = q.clone();
         bad_q[3] = f32::NAN;
-        assert!(flash_mla_decode(&bad_q, &cache, &indices, b, s_q, topk, 1.0, None, &mut out, &mut lse).is_err());
+        assert!(flash_mla_decode(
+            &bad_q, &cache, &indices, b, s_q, topk, 1.0, None, &mut out, &mut lse
+        )
+        .is_err());
         // Empty cache with non-empty q.
         let empty = MlaPagedCache::new(CacheFormat::Bf16, 64, 2);
-        assert!(flash_mla_decode(&q, &empty, &indices, b, s_q, topk, 1.0, None, &mut out, &mut lse).is_err());
+        assert!(flash_mla_decode(
+            &q, &empty, &indices, b, s_q, topk, 1.0, None, &mut out, &mut lse
+        )
+        .is_err());
         // Empty cache with everything empty: vacuous Ok.
         assert!(flash_mla_decode(&[], &empty, &[], 0, 0, 0, 1.0, None, &mut [], &mut []).is_ok());
         // Vacuous b == 0 with empty buffers.
@@ -595,8 +740,18 @@ mod tests {
                 &mut out,
                 &mut lse,
             )?;
-            let (nout, nlse) =
-                naive_decode(&q, &cache, &indices, b, s_q, topk, h, d, sm, sink.as_deref());
+            let (nout, nlse) = naive_decode(
+                &q,
+                &cache,
+                &indices,
+                b,
+                s_q,
+                topk,
+                h,
+                d,
+                sm,
+                sink.as_deref(),
+            );
             assert_close_slice(&out, &nout, 1e-4, "prop decode out");
             assert_close_slice(&lse, &nlse, 1e-4, "prop decode lse");
             Ok(())
@@ -622,7 +777,9 @@ mod tests {
                 let sm = 1.0 / (d as f32).sqrt();
                 let mut out = vec![0.0f32; q.len()];
                 let mut lse = vec![0.0f32; b * h * s_q];
-                flash_mla_decode(&q, &cache, &indices, b, s_q, topk, sm, None, &mut out, &mut lse)?;
+                flash_mla_decode(
+                    &q, &cache, &indices, b, s_q, topk, sm, None, &mut out, &mut lse,
+                )?;
                 let mut oref = vec![0.0f32; out.len()];
                 let mut lref = vec![0.0f32; lse.len()];
                 naive_decode_rows(
@@ -664,9 +821,13 @@ mod tests {
             .unwrap();
         let mut cache = MlaPagedCache::new(CacheFormat::Bf16, 64, 8);
         for t in 0..s {
-            cache.append(0, &kv[t * cfg.head_dim..(t + 1) * cfg.head_dim]).unwrap();
+            cache
+                .append(0, &kv[t * cfg.head_dim..(t + 1) * cfg.head_dim])
+                .unwrap();
         }
-        let idx: Vec<i32> = (0..s).map(|t| cache.physical_index(0, t).unwrap()).collect();
+        let idx: Vec<i32> = (0..s)
+            .map(|t| cache.physical_index(0, t).unwrap())
+            .collect();
         let mut indices = Vec::new();
         for _ in 0..s {
             indices.extend_from_slice(&idx);

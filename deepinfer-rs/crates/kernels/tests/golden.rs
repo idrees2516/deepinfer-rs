@@ -91,7 +91,9 @@ fn golden_rope_and_conjugate() {
     let (half, row_len, rows) = (32usize, 512, 16);
     let rope = Rope::new(half * 2, RopeStyle::Interleaved, 10000.0, None, 1024).unwrap();
     let mut rng = Philox::new(12, 2);
-    let x: Vec<f32> = (0..rows * row_len).map(|_| rng.uniform_f32(-2.0, 2.0)).collect();
+    let x: Vec<f32> = (0..rows * row_len)
+        .map(|_| rng.uniform_f32(-2.0, 2.0))
+        .collect();
     let pos: Vec<u32> = (0..rows as u32).map(|i| i * 7 + 3).collect();
     let offset = row_len - half * 2;
     let mut cpu = x.clone();
@@ -162,7 +164,8 @@ fn golden_gemm_fp8_and_grouped() {
     let db = k.device().alloc_from(&bq).unwrap();
     let dbsf = k.device().alloc_from(&bsf).unwrap();
     let dd = k.device().alloc(m * n * 4).unwrap();
-    k.gemm_fp8_nt(&da, &dasf, &db, &dbsf, &dd, m, n, kk, &s).unwrap();
+    k.gemm_fp8_nt(&da, &dasf, &db, &dbsf, &dd, m, n, kk, &s)
+        .unwrap();
     s.synchronize().unwrap();
     let out = download_f32(&k, &dd, m * n);
     let e = rel_err(&out, &ref_dense);
@@ -187,8 +190,10 @@ fn golden_gemm_fp8_and_grouped() {
     let ddg = k.device().alloc(m_total * n * 4).unwrap();
     let offs: Vec<i32> = (0..=groups).map(|g| (g * seg) as i32).collect();
     let doffs = k.device().alloc_from(&offs).unwrap();
-    k.gemm_fp8_grouped_nt(&dap, &dasfp, &db, &dbsf, &doffs, &ddg, m_total, n, kk, groups, &s)
-        .unwrap();
+    k.gemm_fp8_grouped_nt(
+        &dap, &dasfp, &db, &dbsf, &doffs, &ddg, m_total, n, kk, groups, &s,
+    )
+    .unwrap();
     s.synchronize().unwrap();
     let outg = download_f32(&k, &ddg, m_total * n);
     let eg = rel_err(&outg, &ref_grouped);
@@ -321,7 +326,9 @@ fn golden_mla_decode_all_formats() {
     use deepinfer_fp8::{quantize_kv_cache_v41_fp4, quantize_kv_cache_v41_fp8};
     let (b, s_q, h, d, s_kv, topk) = (2usize, 1, 8, 512, 300, 256);
     let mut rng = Philox::new(16, 6);
-    let rows: Vec<Vec<f32>> = (0..s_kv).map(|_| (0..d).map(|_| rng.normal_f32()).collect()).collect();
+    let rows: Vec<Vec<f32>> = (0..s_kv)
+        .map(|_| (0..d).map(|_| rng.normal_f32()).collect())
+        .collect();
     let q: Vec<f32> = (0..b * s_q * h * d).map(|_| rng.normal_f32()).collect();
     let mut indices = vec![0i32; b * s_q * topk];
     for (i, v) in indices.iter_mut().enumerate() {
@@ -331,11 +338,17 @@ fn golden_mla_decode_all_formats() {
     let sm = 1.0f32 / (d as f32).sqrt();
     let sink: Vec<f32> = (0..h).map(|i| 0.05 * i as f32).collect();
 
-    for fmt in [CacheFormat::F32, CacheFormat::Fp8Group32, CacheFormat::Fp4Group16] {
+    for fmt in [
+        CacheFormat::F32,
+        CacheFormat::Fp8Group32,
+        CacheFormat::Fp4Group16,
+    ] {
         // Device bytes + host-visible dequantized rows.
         let (dev_bytes, dq_rows): (Vec<u8>, Vec<Vec<f32>>) = match fmt {
             CacheFormat::F32 => (
-                rows.iter().flat_map(|r| r.iter().copied()).collect::<Vec<f32>>()
+                rows.iter()
+                    .flat_map(|r| r.iter().copied())
+                    .collect::<Vec<f32>>()
                     .iter()
                     .flat_map(|v| v.to_le_bytes())
                     .collect(),
@@ -375,7 +388,8 @@ fn golden_mla_decode_all_formats() {
                 (bytes, dq)
             }
         };
-        let (ref_out, ref_lse) = naive_decode(&q, &dq_rows, &indices, b, s_q, h, d, topk, sm, Some(&sink));
+        let (ref_out, ref_lse) =
+            naive_decode(&q, &dq_rows, &indices, b, s_q, h, d, topk, sm, Some(&sink));
 
         let dq = upload_f32(&k, &q);
         let dcache = k.device().alloc_from(&dev_bytes).unwrap();
@@ -393,8 +407,21 @@ fn golden_mla_decode_all_formats() {
                 &dq, &dcache, &d_idx, &dpm, &dpl, &dpo, b, s_q, h, d, topk, sm, fmt, s_kv, &s,
             )
             .unwrap();
-        k.mla_decode_combine(&dpm, &dpl, &dpo, Some(&dsink), &d_out, &dlse, b, s_q, h, d, splits, &s)
-            .unwrap();
+        k.mla_decode_combine(
+            &dpm,
+            &dpl,
+            &dpo,
+            Some(&dsink),
+            &d_out,
+            &dlse,
+            b,
+            s_q,
+            h,
+            d,
+            splits,
+            &s,
+        )
+        .unwrap();
         s.synchronize().unwrap();
         let out = download_f32(&k, &d_out, q.len());
         let e = rel_err(&out, &ref_out);
@@ -464,7 +491,11 @@ fn golden_select_top_k_exact() {
     let mut rng = Philox::new(18, 8);
     let mut scores = vec![0.0f32; s_q * s_kv];
     for (i, v) in scores.iter_mut().enumerate() {
-        *v = if i % 97 == 0 { f32::NEG_INFINITY } else { rng.normal_f32() };
+        *v = if i % 97 == 0 {
+            f32::NEG_INFINITY
+        } else {
+            rng.normal_f32()
+        };
     }
     let cfg = LightningIndexerConfig {
         block_size: 64,
@@ -521,7 +552,9 @@ fn golden_moe_dispatch_combine_roundtrip() {
     let cap_rows = tokens * kk + e * 128;
     let perm = k.device().alloc(cap_rows * hidden * 4).unwrap();
     let m_total = k
-        .moe_dispatch(&dx, &d_idx, &counts, &offsets, &rankc, &perm, &map, tokens, hidden, kk, e, 128, &s)
+        .moe_dispatch(
+            &dx, &d_idx, &counts, &offsets, &rankc, &perm, &map, tokens, hidden, kk, e, 128, &s,
+        )
         .unwrap();
     // "Expert compute" stand-in: double every permuted row (host round trip
     // keeps the test self-contained).
